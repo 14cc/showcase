@@ -1,31 +1,8 @@
 /*
- * carplay_bt40.m — iPadPlay v40+ss
+ * carplay_bt.m - Bluetooth and iAP2 transport for Showcase
  *
- * v40+ss3 = v40 + undeclared 0x4301 attempt (kept as harmless fallback)
- *
- * Strategy: Identification unchanged from working v40. 0x4300/0x4301 cannot
- * be declared on iOS 18 (both cause IdentificationRejected). 0x4301 is sent
- * undeclared after 0x4E0E — may be ignored by iPhone but costs nothing.
- * The REAL fix is likely on the AirPlay/Bonjour side (features, flags, etc).
- *
- * The theory (from CarPlay Simulator RE): the iPhone waits for a higher-layer
- * CarPlay start-session message carrying the receiver's IP, port 7000,
- * device ID, public key, and source version before it connects to AirPlay.
- *
- * Changes from v40:
- *   1. Added send_carplay_start_session() — sends 0x4301 with WirelessAttributes
- *      group (SSID, passphrase, channel, IPv6 address) + port + deviceid + pk + srcvers.
- *   2. Triggered after 0x4E0E (DeviceTransportIdentifierNotification).
- *   3. Also handles inbound 0x4300 (CarPlayAvailability) even though undeclared.
- *   4. Identification adds 0x4300 to msgs_recv (+2 bytes) but NOT 0x4301 to msgs_sent.
- *
- * Compile:
- *   clang -fobjc-arc -o /tmp/carplay_bt40 /tmp/carplay_bt40.m \
- *         -L/usr/lib -lBTstack -framework Foundation -framework Security
- *   ldid -S/tmp/cp23_ent.xml /tmp/carplay_bt40
- *
- * Run:
- *   sh /tmp/reset.sh && sleep 2 && /tmp/carplay_bt40
+ * Handles BTstack discovery, iAP2 identification, Apple authentication,
+ * Personal Hotspot credentials, and the Bluetooth-to-Wi-Fi handoff.
  */
 
 #import <Foundation/Foundation.h>
@@ -44,8 +21,8 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <time.h>
-#include <dlfcn.h>
 #include <dispatch/dispatch.h>
+#include "baa_broker.h"
 
 /* ══════════════════════════════════════════════════
  *  Configuration — populated from argv at startup.
@@ -57,6 +34,8 @@ static char kWifiSSID[64]      = "RoadLink-CarPlay";
 static char kWifiPassword[64]  = "roadlink1234";
 static const uint8_t kWifiSecurityType = 2;   /* 0=None, 1=WEP, 2=WPA/WPA2 */
 #define BT_READY_PATH "/tmp/showcase_bt_ready"
+#define BT_DOWN_PATH  "/tmp/showcase_bt_down"
+#define BT_ID_PATH    "/tmp/showcase_bt_id"
 
 #ifndef SHOWCASE_SEND_WIFI_CHANNEL
 #define SHOWCASE_SEND_WIFI_CHANNEL 0
@@ -121,6 +100,7 @@ extern const void *btstack_set_system_bluetooth_enabled;
 extern const void *hci_write_local_name, *hci_write_class_of_device;
 extern const void *hci_write_extended_inquiry_response, *hci_write_simple_pairing_mode;
 extern const void *hci_accept_connection_request;
+extern const void *hci_disconnect;
 extern const void *hci_io_capability_request_reply, *hci_user_confirmation_request_reply;
 extern const void *rfcomm_register_service, *rfcomm_accept_connection;
 extern const void *sdp_register_service_record;
@@ -134,6 +114,7 @@ static uint8_t did_sdp_rec[256];
 static int setup_done = 0;
 static uint16_t active_cid = 0;
 static uint16_t rfcomm_mtu = 1007;
+static volatile sig_atomic_t bluetooth_handoff_requested = 0;
 static int iap2_detected = 0, link_established = 0, detect_count = 0;
 static uint8_t my_initial_psn = 0, my_next_psn = 0, peer_psn = 0;
 
@@ -142,7 +123,6 @@ static uint8_t local_bd_addr[6] = {0};
 static int have_local_addr = 0;
 
 /* ── BAA state ── */
-static SecKeyRef baa_private_key = NULL;
 static uint8_t *baa_leaf_der = NULL, *baa_inter_der = NULL;
 static int baa_leaf_len = 0, baa_inter_len = 0, baa_ready = 0;
 
@@ -270,37 +250,23 @@ static void pb_grp_end(PB *pb, int lo) {
 }
 
 /* ═══════════════════════════════════════════════
- *  BAA cert issuance
+ *  Preheated BAA certificate from the entitled local broker
  * ═══════════════════════════════════════════════ */
 static void issue_baa_cert(void) {
-    printf("[BAA] Issuing certificate...\n");
-    void *di = dlopen("/System/Library/PrivateFrameworks/DeviceIdentity.framework/DeviceIdentity", RTLD_NOW);
-    if (!di) di = dlopen("/System/Library/PrivateFrameworks/MobileActivation.framework/MobileActivation", RTLD_NOW);
-    if (!di) { printf("[BAA] Cannot load framework!\n"); return; }
-    typedef void (^DIBlock)(id, id, id);
-    typedef void (*DIFunc)(id, id, DIBlock);
-    DIFunc fn = (DIFunc)dlsym(di, "DeviceIdentityIssueClientCertificateWithCompletion");
-    if (!fn) { printf("[BAA] No issuance func!\n"); return; }
-
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    fn(nil, [NSDictionary dictionary], ^(id k, id c, id e) {
-        if (e) { NSLog(@"[BAA] Error: %@", e); dispatch_semaphore_signal(sem); return; }
-        NSArray *ca = (NSArray *)c;
-        if ([ca count] < 2) { dispatch_semaphore_signal(sem); return; }
-        baa_private_key = (SecKeyRef)CFBridgingRetain(k);
-        CFDataRef d1 = SecCertificateCopyData((__bridge SecCertificateRef)ca[0]);
-        baa_leaf_len = (int)CFDataGetLength(d1);
-        baa_leaf_der = malloc(baa_leaf_len); memcpy(baa_leaf_der, CFDataGetBytePtr(d1), baa_leaf_len);
-        CFRelease(d1);
-        CFDataRef d2 = SecCertificateCopyData((__bridge SecCertificateRef)ca[1]);
-        baa_inter_len = (int)CFDataGetLength(d2);
-        baa_inter_der = malloc(baa_inter_len); memcpy(baa_inter_der, CFDataGetBytePtr(d2), baa_inter_len);
-        CFRelease(d2);
+    printf("[BAA] Loading preheated certificate from Showcase...\n");
+    int rc = -1;
+    for (int attempt = 0; attempt < 30 && rc != 0; attempt++) {
+        rc = baa_broker_get_certs(&baa_leaf_der, &baa_leaf_len,
+                                  &baa_inter_der, &baa_inter_len);
+        if (rc != 0) usleep(100000);
+    }
+    if (rc == 0) {
         baa_ready = 1;
-        printf("[BAA] Leaf=%d Inter=%d — ready\n", baa_leaf_len, baa_inter_len);
-        dispatch_semaphore_signal(sem);
-    });
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
+        printf("[BAA] Leaf=%d Inter=%d — preheated and ready\n",
+               baa_leaf_len, baa_inter_len);
+    } else {
+        printf("[BAA] Could not retrieve preheated certificate (rc=%d)\n", rc);
+    }
 }
 
 /* ═══════════════════════════════════════════════
@@ -483,19 +449,20 @@ static void send_auth_cert(void) {
 }
 
 static void send_auth_response(uint8_t *chal, int clen) {
-    if(!baa_private_key) return;
+    uint8_t *sig = NULL;
+    int sigLen = 0;
+    int rc = baa_broker_sign(chal, (uint32_t)clen, &sig, &sigLen);
+    if (rc != 0) {
+        printf("[AA03] BAA broker sign FAIL: %d\n", rc);
+        return;
+    }
     @autoreleasepool {
-        NSData *cd=[NSData dataWithBytes:chal length:clen];
-        CFErrorRef err=NULL;
-        NSData *sig=(__bridge_transfer NSData*)SecKeyCreateSignature(
-            baa_private_key,kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
-            (__bridge CFDataRef)cd,&err);
-        if(!sig){NSLog(@"[AA03] Sign FAIL: %@",err); return;}
-        printf("[AA03] Sig: %lu bytes\n",(unsigned long)[sig length]);
+        printf("[AA03] Sig: %d bytes\n", sigLen);
         PB pb; pb_init(&pb,256);
-        pb_blob(&pb,0x0000,[sig bytes],(int)[sig length]);
+        pb_blob(&pb,0x0000,sig,sigLen);
         send_control_msg(0xAA03,pb.buf,pb.off); pb_free(&pb);
     }
+    free(sig);
 }
 
 /* ═══════════════════════════════════════════════
@@ -833,9 +800,16 @@ static void send_detect(void) {
     bt_send_rfcomm(active_cid,iap2_detect,6);
     printf("[DET] #%d\n",detect_count);
 }
+
 static void alarm_handler(int sig) {
     (void)sig;
     if(active_cid&&!iap2_detected&&detect_count<10){send_detect();alarm(1);}
+}
+
+static void bluetooth_handoff_signal_handler(int sig) {
+    (void)sig;
+    /* Async-signal-safe: the BTstack run-loop timer consumes this flag. */
+    bluetooth_handoff_requested = 1;
 }
 
 /* ═══════════════════════════════════════════════
@@ -1233,6 +1207,24 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
             printf("[BT] Local BD_ADDR: %02X:%02X:%02X:%02X:%02X:%02X\n",
                 local_bd_addr[0],local_bd_addr[1],local_bd_addr[2],
                 local_bd_addr[3],local_bd_addr[4],local_bd_addr[5]);
+            char address[18];
+            int addressLength = snprintf(
+                address, sizeof(address),
+                "%02X:%02X:%02X:%02X:%02X:%02X",
+                local_bd_addr[0], local_bd_addr[1], local_bd_addr[2],
+                local_bd_addr[3], local_bd_addr[4], local_bd_addr[5]);
+            int addressFd = open(
+                BT_ID_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (addressFd >= 0) {
+                ssize_t written = write(
+                    addressFd, address, (size_t)addressLength);
+                close(addressFd);
+                printf("[BT] AirPlay Bluetooth ID %s (%s)\n", address,
+                       written == addressLength ? "published" : "short write");
+            } else {
+                printf("[BT] WARN: could not publish Bluetooth ID: %s\n",
+                       strerror(errno));
+            }
         }
     }
 
@@ -1256,6 +1248,10 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         break;
     case 0x04: {
         bd_addr_t a;memcpy(a,&pkt[2],6);
+        if (bluetooth_handoff_requested) {
+            printf("[HANDOFF] ignoring Bluetooth reconnect after Wi-Fi handoff\n");
+            break;
+        }
 #ifdef SHOWCASE_ROOTLESS
         print_hci_addr("[CP] CONN REQ from ", &pkt[2]);
         printf(" (daemon auto-accept)\n");
@@ -1356,6 +1352,9 @@ int main(int argc, char *argv[]) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
     unlink(BT_READY_PATH);
+    unlink(BT_DOWN_PATH);
+    unlink(BT_ID_PATH);
+    signal(SIGUSR1, bluetooth_handoff_signal_handler);
     parse_args(argc, argv);
     @autoreleasepool {
         printf("[CP] Showcase / carplay_bt\n");

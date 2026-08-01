@@ -92,11 +92,17 @@ need_file "$REPO_ROOT/source/carplay_bt.m"
 need_file "$REPO_ROOT/source/carplay_services.m"
 need_file "$REPO_ROOT/source/carplay_pair.c"
 need_file "$REPO_ROOT/source/carplay_pair.h"
+need_file "$REPO_ROOT/source/baa_broker.h"
+need_file "$REPO_ROOT/source/vendor/monocypher/monocypher.c"
+need_file "$REPO_ROOT/source/vendor/monocypher/monocypher-ed25519.c"
+need_file "$REPO_ROOT/source/vendor/libtommath/tommath.c"
 need_file "$REPO_ROOT/source/Info.plist"
 need_file "$REPO_ROOT/source/ent_app.xml"
 need_file "$REPO_ROOT/source/ent_bt.xml"
 need_file "$REPO_ROOT/source/ent_btdaemon.xml"
 need_file "$REPO_ROOT/source/ent_svc.xml"
+need_file "$REPO_ROOT/icon/generated/Icon-OEM-104.png"
+need_file "$REPO_ROOT/icon/generated/Icon-OEM-120.png"
 
 command -v install_name_tool >/dev/null || {
   echo "Missing install_name_tool. Run this script on macOS."
@@ -134,6 +140,7 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/carplay_services.m" \
    "$REPO_ROOT/source/carplay_pair.c" \
    "$REPO_ROOT/source/carplay_pair.h" \
+   "$REPO_ROOT/source/baa_broker.h" \
    "$REPO_ROOT/source/Info.plist" \
    "$REPO_ROOT/source/ent_app.xml" \
    "$REPO_ROOT/source/ent_bt.xml" \
@@ -141,6 +148,8 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/ent_svc.xml" \
    "$WORK/send/"
 cp "$BTSTACK_DYLIB" "$WORK/send/libBTstack.dylib"
+COPYFILE_DISABLE=1 tar --format ustar -C "$REPO_ROOT/source" \
+  -cf "$WORK/send/crypto-vendor.tar" vendor
 if [ -x "$BTSTACK_SOURCE_BUILD" ]; then
   COPYFILE_DISABLE=1 tar --format ustar -C "$BTSTACK_SOURCE_DIR" \
     -cf "$WORK/send/btstack-rootless.tar" .
@@ -156,6 +165,7 @@ sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
 cd '$REMOTE_BASE'
+tar -xf crypto-vendor.tar
 
 if [ -f btstack-rootless.tar ]; then
     rm -rf btstack-rootless
@@ -166,27 +176,25 @@ if [ -f btstack-rootless.tar ]; then
         btstack-rootless/build_btdaemon.sh
 fi
 
-clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -isysroot '$SDK_REMOTE' \
+clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o Showcase Showcase.m \
-    -framework UIKit -framework AVFoundation \
-    -framework CoreMedia -framework Foundation \
+    -framework UIKit -framework AVFoundation -framework AudioToolbox \
+    -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
 
-clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -isysroot '$SDK_REMOTE' \
+clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o carplay_bt carplay_bt.m \
     ./libBTstack.dylib \
     -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
 
-clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -isysroot '$SDK_REMOTE' -I/var/jb/usr/include \
+clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o carplay_services carplay_services.m carplay_pair.c \
+    vendor/monocypher/monocypher.c \
+    vendor/monocypher/monocypher-ed25519.c \
+    vendor/libtommath/tommath.c \
     -framework Foundation -framework Security \
-    /var/jb/usr/lib/libcrypto.3.dylib \
-    -Wl,-undefined,dynamic_lookup \
-    || clang -fobjc-arc -DSHOWCASE_ROOTLESS=1 -isysroot '$SDK_REMOTE' -I/var/jb/usr/include -L/var/jb/usr/lib \
-        -o carplay_services carplay_services.m carplay_pair.c \
-        -framework Foundation -framework Security -lcrypto \
-        -Wl,-undefined,dynamic_lookup
+    -Wl,-undefined,dynamic_lookup
 "
 
 for bin in Showcase carplay_bt carplay_services; do
@@ -220,12 +228,6 @@ sed 's#/usr/bin/BTdaemon#/var/jb/usr/bin/BTdaemon#g' \
 patch_load_command "$WORK/rootfs/var/jb/Applications/Showcase.app/CarDisplaySim" \
   "/usr/lib/libBTstack.dylib" \
   "/var/jb/usr/lib/libBTstack.dylib"
-patch_load_command "$WORK/rootfs/var/jb/Applications/Showcase.app/CarPlay Simulator" \
-  "/usr/lib/libcrypto.3.dylib" \
-  "/var/jb/usr/lib/libcrypto.3.dylib"
-patch_load_command "$WORK/rootfs/var/jb/Applications/Showcase.app/CarPlay Simulator" \
-  "@rpath/libcrypto.3.dylib" \
-  "/var/jb/usr/lib/libcrypto.3.dylib"
 install_name_tool -id "/var/jb/usr/lib/libBTstack.dylib" \
   "$WORK/rootfs/var/jb/usr/lib/libBTstack.dylib"
 
@@ -262,7 +264,6 @@ tar xf rootfs.tar
 cd rootfs
 find . -name '._*' -delete
 find . -name '.DS_Store' -delete
-find . -path ./DEBIAN -prune -o -type f -exec md5sum {} \; > DEBIAN/md5sums
 
 as_root chown root:wheel .
 as_root chown -R root:wheel var DEBIAN
@@ -281,6 +282,8 @@ as_root ldid -S'$REMOTE_BASE/ent_svc.xml' 'var/jb/Applications/Showcase.app/CarP
 as_root ldid -S'$REMOTE_BASE/ent_btdaemon.xml' var/jb/usr/bin/BTdaemon
 as_root ldid -S var/jb/usr/lib/libBTstack.dylib
 
+find . -path ./DEBIAN -prune -o -type f -exec md5sum {} \; |
+  as_root tee DEBIAN/md5sums >/dev/null
 as_root chmod 0644 DEBIAN/md5sums
 
 as_root dpkg-deb -Zgzip -z9 -b . '../$DEB_NAME'

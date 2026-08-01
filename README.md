@@ -1,8 +1,8 @@
 # Showcase
 
-Showcase turns a jailbroken cellular iPad into a software wireless CarPlay receiver. The iPhone pairs through Settings, joins the iPad hotspot, sends the encrypted CarPlay video stream, and receives touch input from the iPad.
+Showcase turns an older jailbroken Apple device into a software wireless CarPlay receiver. The iPhone pairs through Settings, joins the receiver's hotspot, sends the encrypted CarPlay video stream, and receives touch input from the receiver.
 
-The first public beta ships in two package architectures. Rootful users get the iOS 12-14 build. Rootless users get the iOS 15-17 build for Dopamine and palera1n rootless.
+Showcase beta 3 ships in rootful and rootless package layouts. Both use iOS 12 as the deployment minimum.
 
 ## Install
 
@@ -22,10 +22,10 @@ https://aminerostane.com/articles/showcase
 
 | Item | Requirement |
 | --- | --- |
-| iPad | Cellular iPad with Personal Hotspot |
+| Receiver | Cellular iPhone or iPad with Personal Hotspot |
 | Tested rootful receiver | iPad Air 1 cellular, A1475, iPad4,2, iOS 12.5.8, checkra1n |
-| Community rootless target | Cellular iPads on iOS 15-17, Dopamine or palera1n rootless |
-| Runtime packages | `libssl3`, `uikittools` |
+| Tested rootless receiver | iPhone 7, iPhone9,3, iOS 15.8.4, Dopamine rootless |
+| Runtime packages | Rootful uses `uikittools`; rootless uses `uikittools` and `ldid` |
 
 Sileo, Cydia, and Zebra install runtime packages through normal APT dependency resolution. Manual dependency installation is only needed when sideloading a `.deb` with `dpkg -i`.
 
@@ -39,6 +39,17 @@ The package bundles `BTdaemon`, `libBTstack.dylib`, and the BTstack launch daemo
 - AirPlay pair-setup, pair-verify, auth-setup, RTSP control, timing, event channel, and screen stream setup.
 - H.264 screen stream decryption with ChaCha20-Poly1305.
 - Single-finger touch forwarding over the encrypted event channel.
+- BAA certificate preheating while the receiver still has internet access.
+- Stream sizing derived from the receiver's native aspect ratio, memory, processor count, and decode budget.
+- Sender-timeline H.264 presentation with an adaptive jitter budget and stale-frame recovery after transport stalls.
+- Stream telemetry for arrival rate, bitrate, frame gaps, presentation delay, and UI enqueue time.
+- Receiver audio for navigation, calls, radio, Apple Music, and third-party media apps.
+- A named vehicle app with the Showcase icon and a clean CarPlay sidebar.
+- Three-finger pause controls that dim the video and block CarPlay input while open.
+- Persistent controller pairing, CarPlay screen-resource handoff, and fresh-keyframe recovery after backgrounding.
+- A Bluetooth compatibility report when BTstack cannot control the receiver hardware.
+
+Showcase embeds Monocypher and LibTomMath for CarPlay cryptography. Users no longer need an OpenSSL package or repository.
 
 ## Source Layout
 
@@ -52,7 +63,7 @@ icon/         app icons
 
 ## Build From Source
 
-Showcase builds on the jailbroken iPad. The build script expects SSH access through a local forwarded port.
+Showcase builds on the jailbroken receiver. The build script expects SSH access through a local forwarded port and pins the deployment target to iOS 12.0.
 
 ```sh
 iproxy 2222 <ipad-sshd-port>
@@ -65,7 +76,7 @@ For a jailbreak SSH daemon on port 22, run this command.
 iproxy 2222 22
 ```
 
-The script compiles the three binaries on-device, signs them with `ldid`, installs `/Applications/Showcase.app`, and refreshes SpringBoard.
+The script compiles the three binaries on-device, signs them with `ldid`, installs the rootful app under `/Applications`, and refreshes SpringBoard. Use the package scripts below for rootless builds.
 
 ## Build The Deb
 
@@ -89,6 +100,7 @@ For Sileo, Cydia, and Zebra, publish the generated `packaging/repo/` contents to
 
 ```text
 /var/mobile/Library/Showcase/logs/app.log
+/var/mobile/Library/Showcase/logs/baa_broker.log
 /var/mobile/Library/Showcase/logs/btdaemon.log
 /var/mobile/Library/Showcase/logs/carplay_bt.log
 /var/mobile/Library/Showcase/logs/carplay_services.log

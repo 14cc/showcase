@@ -1,20 +1,8 @@
 /*
- * carplay_services_v5.m — AirPlay receiver + mDNS for wireless CarPlay
+ * carplay_services.m - Wireless CarPlay protocol service for Showcase
  *
- * v5 changes (over v4):
- *  1. Added _raop._tcp mDNS service (CRITICAL — iPhone needs BOTH services)
- *  2. Fixed features bitmask for the software BAA-backed auth path.
- *  3. Added missing _airplay._tcp TXT fields: vv, acl, protovers
- *  4. Changed model from RoadLink1,1 to AppleTV3,2 (recognized model)
- *  5. Changed pi from MAC format to UUID format
- *  6. Removed non-standard 'seed' TXT field
- *  7. Added _raop._tcp TXT record (txtvers, ch, cn, da, et, md, etc.)
- *
- * Compile:
- *   clang -fobjc-arc -isysroot /tmp/iPhoneOS10.3.sdk \
- *         -o /tmp/carplay_services /tmp/carplay_services_v5.m \
- *         -framework Foundation
- *   ldid -S/tmp/ap_ent.xml /tmp/carplay_services
+ * Provides mDNS, AirPlay RTSP, pairing, BAA authentication, timing, video,
+ * audio, event commands, and HID transport.
  */
 
 #import <Foundation/Foundation.h>
@@ -33,14 +21,79 @@
 #include <net/if.h>
 #include <ifaddrs.h>
 #include <sys/time.h>
+#include <sys/select.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <dlfcn.h>
 #include <CommonCrypto/CommonCrypto.h>
 #include <Security/Security.h>
 #include <sys/un.h>
+#include <sys/sysctl.h>
+#include <sys/ioctl.h>
 #include <signal.h>
+#include <time.h>
+#include <float.h>
+#include <stdarg.h>
+#include <pthread.h>
+#include <mach/mach_time.h>
 #include "carplay_pair.h"
+#include "baa_broker.h"
+#include "vendor/monocypher/monocypher.h"
+
+/*
+ * Prefix every service log line with a monotonic timestamp.  The line-state
+ * tracking matters because several packet dumps are emitted by many short
+ * printf calls.
+ */
+static pthread_mutex_t g_service_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_service_log_at_line_start = true;
+
+int showcase_service_log_printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    va_list copied;
+    va_copy(copied, args);
+    int length = vsnprintf(NULL, 0, format, copied);
+    va_end(copied);
+    if (length < 0) {
+        va_end(args);
+        return length;
+    }
+
+    char *rendered = malloc((size_t)length + 1);
+    if (!rendered) {
+        va_end(args);
+        return -1;
+    }
+    vsnprintf(rendered, (size_t)length + 1, format, args);
+    va_end(args);
+
+    pthread_mutex_lock(&g_service_log_lock);
+    const char *cursor = rendered;
+    const char *end = rendered + length;
+    while (cursor < end) {
+        if (g_service_log_at_line_start) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            fprintf(stdout, "[%lld.%06lld] ",
+                    (long long)now.tv_sec,
+                    (long long)(now.tv_nsec / 1000));
+            g_service_log_at_line_start = false;
+        }
+        const char *newline = memchr(cursor, '\n', (size_t)(end - cursor));
+        size_t chunk = newline ? (size_t)(newline - cursor + 1)
+                               : (size_t)(end - cursor);
+        fwrite(cursor, 1, chunk, stdout);
+        cursor += chunk;
+        if (newline) g_service_log_at_line_start = true;
+    }
+    pthread_mutex_unlock(&g_service_log_lock);
+    free(rendered);
+    return length;
+}
+
+#define printf showcase_service_log_printf
 
 /* ── Forward declarations for IPC status events
  * (defined fully below near the IPC machinery, but used earlier in
@@ -50,6 +103,17 @@
 #define STATUS_PAIR_VERIFY_COMPLETE 0x03
 #define STATUS_STREAM_SETUP         0x04
 static void app_send_status(uint8_t code);
+
+#define MSG_AUDIO_CONFIG 0x08
+#define MSG_AUDIO_PACKET 0x09
+#define MSG_BT_HANDOFF 0x0A
+#define MSG_AUDIO_RENDER 0x0B
+#define MSG_AUDIO_CONTROL 0x0C
+
+#define AUDIO_CONTROL_PAUSE  0
+#define AUDIO_CONTROL_RESUME 1
+#define AUDIO_CONTROL_FLUSH  2
+#define AUDIO_CONTROL_STOP   3
 
 /* ── Configuration ── */
 #define AIRPLAY_PORT 7000
@@ -62,16 +126,40 @@ static void app_send_status(uint8_t code);
  * Settings → General → CarPlay on the iPhone). Set via --name argv. */
 static char g_instance_name[32] = "RoadLink";
 static char g_raop_name[64]     = DEVICE_ID_RAW "@" "RoadLink";
+static uint16_t g_display_width = 800;
+static uint16_t g_display_height = 480;
+static uint16_t g_display_fps = 60;
+static int g_screen_receive_buffer = 512 * 1024;
+static bool g_baa_broker_mode = false;
 
 static void parse_args(int argc, char *argv[]) {
-    for (int i = 1; i + 1 < argc; i += 2) {
-        if (!strcmp(argv[i], "--name") || !strcmp(argv[i], "-n")) {
+    for (int i = 1; i < argc; i++) {
+        if ((!strcmp(argv[i], "--name") || !strcmp(argv[i], "-n")) &&
+            i + 1 < argc) {
             strncpy(g_instance_name, argv[i+1], sizeof(g_instance_name) - 1);
             g_instance_name[sizeof(g_instance_name) - 1] = '\0';
             snprintf(g_raop_name, sizeof(g_raop_name),
                      "%s@%s", DEVICE_ID_RAW, g_instance_name);
+            i++;
+        } else if (!strcmp(argv[i], "--width") && i + 1 < argc) {
+            long value = strtol(argv[++i], NULL, 10);
+            if (value >= 640 && value <= UINT16_MAX)
+                g_display_width = (uint16_t)value;
+        } else if (!strcmp(argv[i], "--height") && i + 1 < argc) {
+            long value = strtol(argv[++i], NULL, 10);
+            if (value >= 360 && value <= UINT16_MAX)
+                g_display_height = (uint16_t)value;
+        } else if (!strcmp(argv[i], "--fps") && i + 1 < argc) {
+            long value = strtol(argv[++i], NULL, 10);
+            if (value >= 30 && value <= 60)
+                g_display_fps = (uint16_t)value;
+        } else if (!strcmp(argv[i], "--screen-rcvbuf") && i + 1 < argc) {
+            long value = strtol(argv[++i], NULL, 10);
+            if (value >= 128 * 1024 && value <= 4 * 1024 * 1024)
+                g_screen_receive_buffer = (int)value;
+        } else if (!strcmp(argv[i], "--baa-broker")) {
+            g_baa_broker_mode = true;
         }
-        /* (other flags ignored; carplay_services only needs --name) */
     }
 }
 /* SRV hostname: NULL = use iPad's real hostname (RoadLink-CarPlay.local.)
@@ -126,8 +214,12 @@ static const uint8_t ed25519_pk[32] = {
  *
  * Bit 26 (0x04000000) = MFi-SAP v1 auth (auth-setup with raw 33-byte format).
  * Bit 22 (0x00400000) = AudioUnencrypted. */
-#define FEATURES_WITH_HK   "0x44540380,0x61"
-#define FEATURES_NO_HK     "0x44540380,0x21"
+/*
+ * Match Apple's CarPlay Simulator advertisement exactly. Codec support is
+ * negotiated through /info audioFormats; bit 20 is not an AAC-LC flag.
+ */
+#define FEATURES_WITH_HK   "0x4040280,0x61"
+#define FEATURES_NO_HK     "0x4040280,0x21"
 
 /* HK ON — bit 38 (HKPairingAndEncrypt). The newer Apple SDK unconditionally
  * sets this bit. iOS 18 may require it for CarPlay connections.
@@ -136,54 +228,286 @@ static bool g_useHK = true;
 
 /* Global pairing context — initialized in main(), used by pair handlers */
 static pair_ctx_t *g_pair = NULL;
+#define PAIRING_STORE_DIR  "/var/mobile/Library/Showcase"
+#define PAIRING_STORE_PATH PAIRING_STORE_DIR "/paired-controllers.plist"
+#define BT_ID_PATH "/tmp/showcase_bt_id"
+
+static bool ensure_pair_context(void) {
+    if (g_pair) return true;
+    g_pair = pair_ctx_create(ed25519_sk, ed25519_pk, NULL);
+    if (!g_pair) return false;
+
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:@PAIRING_STORE_PATH];
+        if (!data) {
+            printf("[PAIR] No saved controller registry yet\n");
+            return true;
+        }
+        NSError *error = nil;
+        id value = [NSPropertyListSerialization
+            propertyListWithData:data
+                         options:NSPropertyListImmutable
+                          format:NULL
+                           error:&error];
+        if (![value isKindOfClass:[NSArray class]]) {
+            printf("[PAIR] Saved controller registry is invalid: %s\n",
+                   error.localizedDescription.UTF8String ?: "unexpected root");
+            return true;
+        }
+        for (id entry in (NSArray *)value) {
+            if (![entry isKindOfClass:[NSDictionary class]]) continue;
+            NSData *identifier = entry[@"identifier"];
+            NSData *publicKey = entry[@"publicKey"];
+            if (![identifier isKindOfClass:[NSData class]] ||
+                ![publicKey isKindOfClass:[NSData class]] ||
+                publicKey.length != 32)
+                continue;
+            pair_ctx_add_peer(g_pair, identifier.bytes, identifier.length,
+                              publicKey.bytes);
+        }
+        printf("[PAIR] Restored %zu paired controller(s)\n",
+               pair_ctx_peer_count(g_pair));
+    }
+    return true;
+}
+
+static void save_pairing_registry(void) {
+    if (!g_pair) return;
+    @autoreleasepool {
+        NSMutableArray *entries = [NSMutableArray array];
+        size_t count = pair_ctx_peer_count(g_pair);
+        for (size_t i = 0; i < count; i++) {
+            uint8_t identifier[128], publicKey[32];
+            size_t identifierLength = 0;
+            if (pair_ctx_get_peer(g_pair, i, identifier, sizeof(identifier),
+                                  &identifierLength, publicKey) != 0)
+                continue;
+            [entries addObject:@{
+                @"identifier": [NSData dataWithBytes:identifier
+                                               length:identifierLength],
+                @"publicKey": [NSData dataWithBytes:publicKey length:32]
+            }];
+        }
+        NSError *error = nil;
+        NSData *plist = [NSPropertyListSerialization
+            dataWithPropertyList:entries
+                          format:NSPropertyListBinaryFormat_v1_0
+                         options:0
+                           error:&error];
+        mkdir("/var/mobile/Library", 0755);
+        mkdir(PAIRING_STORE_DIR, 0755);
+        if (!plist || ![plist writeToFile:@PAIRING_STORE_PATH
+                                  options:NSDataWritingAtomic
+                                    error:&error]) {
+            printf("[PAIR] ERROR: Could not persist controller registry: %s\n",
+                   error.localizedDescription.UTF8String ?: "serialization failed");
+            return;
+        }
+        chmod(PAIRING_STORE_PATH, 0600);
+        chown(PAIRING_STORE_PATH, 501, 501);
+        printf("[PAIR] Persisted %zu paired controller(s)\n", entries.count);
+    }
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * BAA Certificate (for auth-setup MFi-SAP response)
  * ═══════════════════════════════════════════════════════════════ */
-static SecKeyRef  g_baa_key = NULL;
 static uint8_t   *g_baa_leaf_der = NULL;
 static int        g_baa_leaf_len = 0;
 static uint8_t   *g_baa_inter_der = NULL;
 static int        g_baa_inter_len = 0;
 static bool       g_baa_ready = false;
+static SecKeyRef  g_baa_broker_key = NULL;
 
-static void issue_baa_cert(void) {
-    printf("[BAA] Issuing certificate for auth-setup...\n");
-    void *di = dlopen("/System/Library/PrivateFrameworks/DeviceIdentity.framework/DeviceIdentity", RTLD_NOW);
-    if (!di) di = dlopen("/System/Library/PrivateFrameworks/MobileActivation.framework/MobileActivation", RTLD_NOW);
-    if (!di) { printf("[BAA] Cannot load DeviceIdentity framework!\n"); return; }
+static void load_baa_from_broker(void) {
+    printf("[BAA] Loading preheated certificate from Showcase...\n");
+    int rc = -1;
+    for (int attempt = 0; attempt < 30 && rc != 0; attempt++) {
+        rc = baa_broker_get_certs(&g_baa_leaf_der, &g_baa_leaf_len,
+                                  &g_baa_inter_der, &g_baa_inter_len);
+        if (rc != 0) usleep(100000);
+    }
+    if (rc == 0) {
+        g_baa_ready = true;
+        printf("[BAA] Leaf=%d Inter=%d — preheated and ready\n",
+               g_baa_leaf_len, g_baa_inter_len);
+    } else {
+        printf("[BAA] Could not retrieve preheated certificate (rc=%d)\n", rc);
+    }
+}
+
+static bool issue_baa_for_broker(void) {
+    printf("[BAA] Preheating DeviceIdentity certificate before hotspot...\n");
+    void *framework = dlopen(
+        "/System/Library/PrivateFrameworks/DeviceIdentity.framework/DeviceIdentity",
+        RTLD_NOW);
+    if (!framework) {
+        framework = dlopen(
+            "/System/Library/PrivateFrameworks/MobileActivation.framework/MobileActivation",
+            RTLD_NOW);
+    }
+    if (!framework) {
+        printf("[BAA] Cannot load DeviceIdentity framework\n");
+        return false;
+    }
 
     typedef void (^DIBlock)(id, id, id);
     typedef void (*DIFunc)(id, id, DIBlock);
-    DIFunc fn = (DIFunc)dlsym(di, "DeviceIdentityIssueClientCertificateWithCompletion");
-    if (!fn) { printf("[BAA] DeviceIdentityIssueClientCertificateWithCompletion not found!\n"); return; }
+    DIFunc issue = (DIFunc)dlsym(
+        framework, "DeviceIdentityIssueClientCertificateWithCompletion");
+    if (!issue) {
+        printf("[BAA] DeviceIdentity issuance function unavailable\n");
+        return false;
+    }
 
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    fn(nil, [NSDictionary dictionary], ^(id k, id c, id e) {
-        if (e) { NSLog(@"[BAA] Error: %@", e); dispatch_semaphore_signal(sem); return; }
-        NSArray *ca = (NSArray *)c;
-        if ([ca count] < 2) { printf("[BAA] Not enough certs\n"); dispatch_semaphore_signal(sem); return; }
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    issue(nil, [NSDictionary dictionary], ^(id key, id certificates, id error) {
+        if (error) {
+            NSLog(@"[BAA] Preheat error: %@", error);
+            dispatch_semaphore_signal(semaphore);
+            return;
+        }
+        NSArray *chain = (NSArray *)certificates;
+        if (!key || [chain count] < 2) {
+            printf("[BAA] Preheat returned an incomplete certificate chain\n");
+            dispatch_semaphore_signal(semaphore);
+            return;
+        }
 
-        g_baa_key = (SecKeyRef)CFBridgingRetain(k);
-
-        CFDataRef d1 = SecCertificateCopyData((__bridge SecCertificateRef)ca[0]);
-        g_baa_leaf_len = (int)CFDataGetLength(d1);
+        g_baa_broker_key = (SecKeyRef)CFRetain((__bridge CFTypeRef)key);
+        CFDataRef leaf = SecCertificateCopyData(
+            (__bridge SecCertificateRef)chain[0]);
+        CFDataRef intermediate = SecCertificateCopyData(
+            (__bridge SecCertificateRef)chain[1]);
+        g_baa_leaf_len = (int)CFDataGetLength(leaf);
+        g_baa_inter_len = (int)CFDataGetLength(intermediate);
         g_baa_leaf_der = malloc(g_baa_leaf_len);
-        memcpy(g_baa_leaf_der, CFDataGetBytePtr(d1), g_baa_leaf_len);
-        CFRelease(d1);
-
-        CFDataRef d2 = SecCertificateCopyData((__bridge SecCertificateRef)ca[1]);
-        g_baa_inter_len = (int)CFDataGetLength(d2);
         g_baa_inter_der = malloc(g_baa_inter_len);
-        memcpy(g_baa_inter_der, CFDataGetBytePtr(d2), g_baa_inter_len);
-        CFRelease(d2);
-
-        g_baa_ready = true;
-        printf("[BAA] Leaf=%d Inter=%d — ready\n", g_baa_leaf_len, g_baa_inter_len);
-        dispatch_semaphore_signal(sem);
+        if (g_baa_leaf_der && g_baa_inter_der) {
+            memcpy(g_baa_leaf_der, CFDataGetBytePtr(leaf), g_baa_leaf_len);
+            memcpy(g_baa_inter_der, CFDataGetBytePtr(intermediate),
+                   g_baa_inter_len);
+            g_baa_ready = true;
+        }
+        CFRelease(leaf);
+        CFRelease(intermediate);
+        dispatch_semaphore_signal(semaphore);
     });
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30LL * NSEC_PER_SEC));
-    if (!g_baa_ready) printf("[BAA] Certificate issuance TIMED OUT\n");
+
+    if (dispatch_semaphore_wait(
+            semaphore,
+            dispatch_time(DISPATCH_TIME_NOW, 45LL * NSEC_PER_SEC)) != 0) {
+        printf("[BAA] Preheat timed out\n");
+        return false;
+    }
+    if (g_baa_ready) {
+        printf("[BAA] Preheated: leaf=%d intermediate=%d\n",
+               g_baa_leaf_len, g_baa_inter_len);
+    }
+    return g_baa_ready && g_baa_broker_key;
+}
+
+static void baa_broker_handle_client(int client) {
+    uint8_t header[BAA_BROKER_HEADER_SIZE];
+    if (!baa_read_exact(client, header, sizeof(header)) ||
+        memcmp(header, BAA_BROKER_MAGIC, 4) != 0) return;
+    uint8_t opcode = header[4];
+    uint32_t requestLength = baa_read_le32(header + 8);
+    if (requestLength > BAA_BROKER_MAX_PAYLOAD) return;
+
+    uint8_t *request = NULL;
+    if (requestLength > 0) {
+        request = malloc(requestLength);
+        if (!request || !baa_read_exact(client, request, requestLength)) {
+            free(request);
+            return;
+        }
+    }
+
+    uint8_t status = BAA_STATUS_BAD_REQUEST;
+    uint8_t *response = NULL;
+    uint32_t responseLength = 0;
+    if (!g_baa_ready || !g_baa_broker_key) {
+        status = BAA_STATUS_NOT_READY;
+    } else if (opcode == BAA_OP_GET_CERTS && requestLength == 0) {
+        responseLength = 8U + (uint32_t)g_baa_leaf_len +
+                         (uint32_t)g_baa_inter_len;
+        response = malloc(responseLength);
+        if (response) {
+            baa_write_le32(response, (uint32_t)g_baa_leaf_len);
+            baa_write_le32(response + 4, (uint32_t)g_baa_inter_len);
+            memcpy(response + 8, g_baa_leaf_der, g_baa_leaf_len);
+            memcpy(response + 8 + g_baa_leaf_len,
+                   g_baa_inter_der, g_baa_inter_len);
+            status = BAA_STATUS_OK;
+        }
+    } else if (opcode == BAA_OP_SIGN &&
+               requestLength > 0 && requestLength <= 4096) {
+        NSData *message = [NSData dataWithBytes:request length:requestLength];
+        CFErrorRef error = NULL;
+        CFDataRef signature = SecKeyCreateSignature(
+            g_baa_broker_key,
+            kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
+            (__bridge CFDataRef)message, &error);
+        if (signature) {
+            responseLength = (uint32_t)CFDataGetLength(signature);
+            response = malloc(responseLength);
+            if (response) {
+                memcpy(response, CFDataGetBytePtr(signature), responseLength);
+                status = BAA_STATUS_OK;
+            }
+            CFRelease(signature);
+        } else {
+            status = BAA_STATUS_SIGN_FAILED;
+            if (error) {
+                NSLog(@"[BAA] Broker sign failed: %@", error);
+                CFRelease(error);
+            }
+        }
+    }
+    free(request);
+
+    baa_make_header(header, opcode, status, responseLength);
+    baa_write_exact(client, header, sizeof(header));
+    if (responseLength > 0)
+        baa_write_exact(client, response, responseLength);
+    free(response);
+}
+
+static int run_baa_broker(void) {
+    if (!issue_baa_for_broker()) return 1;
+
+    unlink(BAA_BROKER_PATH);
+    int server = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server < 0) return 1;
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, BAA_BROKER_PATH,
+            sizeof(address.sun_path) - 1);
+    if (bind(server, (struct sockaddr *)&address, sizeof(address)) < 0 ||
+        listen(server, 4) < 0) {
+        printf("[BAA] Broker socket failed: %s\n", strerror(errno));
+        close(server);
+        return 1;
+    }
+    chmod(BAA_BROKER_PATH, 0600);
+    printf("[BAA] Broker ready on %s\n", BAA_BROKER_PATH);
+
+    while (1) {
+        int client = accept(server, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        @autoreleasepool {
+            baa_broker_handle_client(client);
+        }
+        close(client);
+    }
+    close(server);
+    unlink(BAA_BROKER_PATH);
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -192,9 +516,11 @@ static void issue_baa_cert(void) {
  * Frame format: [2-byte LE length][ciphertext][16-byte auth tag]
  * - The 2-byte length header is used as AAD
  * - 8-byte nonce counter (LE), starts at 0, increments per message
+ * - Apple's transport reads records up to 16 KiB but emits 1 KiB records
  * ═══════════════════════════════════════════════════════════════ */
 
-#include <openssl/evp.h>
+#define ENCRYPTED_MAX_READ_SIZE  (16 * 1024)
+#define ENCRYPTED_MAX_WRITE_SIZE 1024
 
 typedef struct {
     uint8_t readKey[32];
@@ -206,6 +532,8 @@ typedef struct {
 
 static encrypted_ctx_t g_enc = {0};
 static encrypted_ctx_t g_event_enc = {0};
+static dispatch_semaphore_t g_event_send_lock = NULL;
+static bool process_event_command_frame(const uint8_t *bytes, size_t length);
 
 /* Decrypt one encrypted frame from the socket.
  * Returns plaintext length, -2 on idle timeout, or -1 on error.
@@ -257,37 +585,25 @@ static int enc_recv_frame(int sock, encrypted_ctx_t *enc, uint8_t *outBuf, size_
     memcpy(nonce12 + 4, &enc->readNonce, 8);  /* LE on LE system */
 
     /* Decrypt with ChaCha20-Poly1305 */
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) { free(frame); return -1; }
-    int ok = 1;
-    int len = 0, pt_len = 0;
-
-    ok &= (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1);
-    ok &= (EVP_DecryptInit_ex(ctx, NULL, NULL, enc->readKey, nonce12) == 1);
-    /* AAD = 2-byte length header */
-    ok &= (EVP_DecryptUpdate(ctx, NULL, &len, hdr, 2) == 1);
-    /* Decrypt ciphertext */
-    ok &= (EVP_DecryptUpdate(ctx, outBuf, &len, frame, ptLen) == 1);
-    pt_len = len;
-    /* Set auth tag */
-    ok &= (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, frame + ptLen) == 1);
-    int ret = EVP_DecryptFinal_ex(ctx, outBuf + pt_len, &len);
-    EVP_CIPHER_CTX_free(ctx);
+    crypto_aead_ctx ctx;
+    crypto_aead_init_ietf(&ctx, enc->readKey, nonce12);
+    int ret = crypto_aead_read(&ctx, outBuf, frame + ptLen,
+                               hdr, sizeof(hdr), frame, ptLen);
+    crypto_wipe(&ctx, sizeof(ctx));
     free(frame);
 
-    if (!ok || ret <= 0) {
+    if (ret != 0) {
         printf("[ENC] ChaCha20-Poly1305 decrypt FAILED (nonce=%llu)\n", enc->readNonce);
         return -1;
     }
-    pt_len += len;
     enc->readNonce++;
-    return pt_len;
+    return ptLen;
 }
 
 /* Encrypt and send one frame.
  * Returns 0 on success, -1 on error. */
 static int enc_send_frame(int sock, encrypted_ctx_t *enc, const uint8_t *data, size_t dataLen) {
-    if (dataLen > 16384) {
+    if (dataLen == 0 || dataLen > ENCRYPTED_MAX_WRITE_SIZE) {
         printf("[ENC] Frame too large: %zu\n", dataLen);
         return -1;
     }
@@ -306,31 +622,19 @@ static int enc_send_frame(int sock, encrypted_ctx_t *enc, const uint8_t *data, s
     uint8_t tag[16];
     if (!ct) return -1;
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) { free(ct); return -1; }
-    int ok = 1, len = 0, ct_len = 0;
-
-    ok &= (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1);
-    ok &= (EVP_EncryptInit_ex(ctx, NULL, NULL, enc->writeKey, nonce12) == 1);
-    /* AAD = 2-byte length header */
-    ok &= (EVP_EncryptUpdate(ctx, NULL, &len, hdr, 2) == 1);
-    /* Encrypt plaintext */
-    ok &= (EVP_EncryptUpdate(ctx, ct, &len, data, (int)dataLen) == 1);
-    ct_len = len;
-    ok &= (EVP_EncryptFinal_ex(ctx, ct + ct_len, &len) == 1);
-    ct_len += len;
-    ok &= (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) == 1);
-    EVP_CIPHER_CTX_free(ctx);
-
-    if (!ok) { free(ct); return -1; }
+    crypto_aead_ctx ctx;
+    crypto_aead_init_ietf(&ctx, enc->writeKey, nonce12);
+    crypto_aead_write(&ctx, ct, tag, hdr, sizeof(hdr),
+                      data, dataLen);
+    crypto_wipe(&ctx, sizeof(ctx));
 
     /* Send: header + ciphertext + tag */
-    size_t totalLen = 2 + ct_len + 16;
+    size_t totalLen = 2 + dataLen + 16;
     uint8_t *out = malloc(totalLen);
     if (!out) { free(ct); return -1; }
     memcpy(out, hdr, 2);
-    memcpy(out + 2, ct, ct_len);
-    memcpy(out + 2 + ct_len, tag, 16);
+    memcpy(out + 2, ct, dataLen);
+    memcpy(out + 2 + dataLen, tag, 16);
     free(ct);
 
     size_t sent = 0;
@@ -344,12 +648,32 @@ static int enc_send_frame(int sock, encrypted_ctx_t *enc, const uint8_t *data, s
     return 0;
 }
 
+/*
+ * Encrypt a plaintext byte stream using the same segmentation as Apple's
+ * NetTransportChaCha20Poly1305 writer. HTTP headers and bodies remain one
+ * continuous plaintext stream; only the authenticated transport records are
+ * split. This is required for /info responses containing OEM icon data.
+ */
+static int enc_send_stream(int sock, encrypted_ctx_t *enc,
+                           const uint8_t *data, size_t dataLen) {
+    size_t offset = 0;
+    while (offset < dataLen) {
+        size_t chunk = dataLen - offset;
+        if (chunk > ENCRYPTED_MAX_WRITE_SIZE)
+            chunk = ENCRYPTED_MAX_WRITE_SIZE;
+        if (enc_send_frame(sock, enc, data + offset, chunk) < 0)
+            return -1;
+        offset += chunk;
+    }
+    return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * HTTP Request Parser
  * ═══════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    char method[16];
+    char method[32];
     char path[512];
     char protocol[16];
     const uint8_t *headerStart;
@@ -462,14 +786,20 @@ static void send_response(int sock, const char *proto, int status,
         size_t hLen = strlen(h);
 
         if (g_enc.active) {
-            /* Encrypted mode: build full response then encrypt as one frame */
+            /* Encrypted mode: build one HTTP byte stream, then segment it
+             * into Apple's 1 KiB authenticated transport records. */
             size_t totalPt = hLen + bodyLen;
             uint8_t *ptBuf = malloc(totalPt);
             if (ptBuf) {
                 memcpy(ptBuf, h, hLen);
                 if (body && bodyLen > 0) memcpy(ptBuf + hLen, body, bodyLen);
-                printf("[ENC] Encrypting response: %zu bytes (nonce=%llu)\n", totalPt, g_enc.writeNonce);
-                if (enc_send_frame(sock, &g_enc, ptBuf, totalPt) < 0) {
+                size_t recordCount =
+                    (totalPt + ENCRYPTED_MAX_WRITE_SIZE - 1) /
+                    ENCRYPTED_MAX_WRITE_SIZE;
+                printf("[ENC] Encrypting response: %zu bytes in %zu "
+                       "record(s) (first nonce=%llu)\n",
+                       totalPt, recordCount, g_enc.writeNonce);
+                if (enc_send_stream(sock, &g_enc, ptBuf, totalPt) < 0) {
                     printf("[ENC] ERROR: Failed to send encrypted response\n");
                 }
                 free(ptBuf);
@@ -538,7 +868,7 @@ static void handle_info(int sock, const HTTPReq *r) {
         bool rtsp = (strncmp(r->protocol, "RTSP", 4) == 0);
         const char *proto = rtsp ? "RTSP/1.0" : "HTTP/1.1";
 
-        uint64_t features = g_useHK ? 0x6144540380ULL : 0x2144540380ULL;
+        uint64_t features = g_useHK ? 0x6104040280ULL : 0x2104040280ULL;
 
         NSMutableDictionary *info = [NSMutableDictionary dictionary];
         info[@"deviceID"] = @DEVICE_ID;
@@ -553,6 +883,18 @@ static void handle_info(int sock, const HTTPReq *r) {
         /* statusFlags: bit 2 (0x4) = AudioLink (always set in reference).
          * Zero flags may signal "not ready" to iPhone. */
         info[@"statusFlags"] = @(0x4);
+        NSString *bluetoothID = [NSString stringWithContentsOfFile:@BT_ID_PATH
+                                                          encoding:NSUTF8StringEncoding
+                                                             error:NULL];
+        bluetoothID = [bluetoothID stringByTrimmingCharactersInSet:
+            [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (bluetoothID.length == 17) {
+            info[@"bluetoothIDs"] = @[bluetoothID];
+            printf("[AP] Bluetooth transport identity: %s\n",
+                   bluetoothID.UTF8String);
+        } else {
+            printf("[AP] WARN: Bluetooth transport identity unavailable\n");
+        }
 
         info[@"keepAliveLowPower"] = @YES;
         info[@"keepAliveSendStatsAsBody"] = @YES;
@@ -565,25 +907,107 @@ static void handle_info(int sock, const HTTPReq *r) {
         info[@"nightMode"] = @NO;
         info[@"rightHandDrive"] = @NO;
         info[@"extendedFeatures"] = @[@"vocoderInfo"];
-        info[@"vehicleInformation"] = @{
-            @"ElectronicTollCollection": @{ @"active": @NO }
-        };
+        /*
+         * Apple's receiver advertises this dictionary when buffered main
+         * audio is enabled. The dictionary is intentionally empty: the
+         * presence of the key is the capability signal.
+         */
+        info[@"mainBufferedInfo"] = @{};
+        /*
+         * ElectronicTollCollection is an installed-capability declaration,
+         * not a generic inactive vehicle state. Advertising it with
+         * active=false produces the grey "ETC" item in CarPlay, so omit the
+         * capability entirely on receivers that do not implement it.
+         *
+         * Publish the legacy 104-point icon for compatibility and the
+         * structured, pre-rendered icon form used by Apple's receiver sample.
+         * The latter tells CarPlay that the supplied Showcase artwork is
+         * already a finished app icon and must not be composited as a raw
+         * vehicle glyph.
+         */
+        NSArray<NSString *> *oemIconPaths = @[
+            [[NSBundle mainBundle] pathForResource:@"Icon-OEM-104"
+                                            ofType:@"png"] ?: @"",
+            @"/Applications/Showcase.app/Icon-OEM-104.png",
+            @"/var/jb/Applications/Showcase.app/Icon-OEM-104.png"
+        ];
+        NSData *oemIcon = nil;
+        for (NSString *path in oemIconPaths) {
+            if (path.length == 0) continue;
+            oemIcon = [NSData dataWithContentsOfFile:path];
+            if (oemIcon.length > 0) {
+                printf("[AP] OEM vehicle icon: %s (%lu bytes)\n",
+                       path.UTF8String, (unsigned long)oemIcon.length);
+                break;
+            }
+        }
+        if (oemIcon.length > 0) {
+            info[@"oemIcon"] = oemIcon;
+            info[@"oemIconLabel"] =
+                [NSString stringWithUTF8String:g_instance_name];
+            info[@"oemIconVisible"] = @YES;
+        } else {
+            printf("[AP] WARN: OEM vehicle icon unavailable\n");
+        }
+        NSArray<NSString *> *oemRenderedIconPaths = @[
+            [[NSBundle mainBundle] pathForResource:@"Icon-OEM-120"
+                                            ofType:@"png"] ?: @"",
+            @"/Applications/Showcase.app/Icon-OEM-120.png",
+            @"/var/jb/Applications/Showcase.app/Icon-OEM-120.png"
+        ];
+        NSData *oemRenderedIcon = nil;
+        for (NSString *path in oemRenderedIconPaths) {
+            if (path.length == 0) continue;
+            oemRenderedIcon = [NSData dataWithContentsOfFile:path];
+            if (oemRenderedIcon.length > 0) {
+                printf("[AP] OEM pre-rendered icon: %s (%lu bytes)\n",
+                       path.UTF8String,
+                       (unsigned long)oemRenderedIcon.length);
+                break;
+            }
+        }
+        if (oemRenderedIcon.length > 0) {
+            info[@"oemIcons"] = @[
+                @{
+                    @"widthPixels": @(120),
+                    @"heightPixels": @(120),
+                    @"prerendered": @YES,
+                    @"imageData": oemRenderedIcon
+                }
+            ];
+        } else {
+            printf("[AP] WARN: OEM pre-rendered icon unavailable\n");
+        }
         info[@"limitedUI"] = @NO;
 
-        /* Initial modes — tells iPhone which resources we want to claim.
-         * Without this, iPhone doesn't know to set up screen/audio streams.
-         * Reference: AirPlayCreateModesDictionary / kAirPlayProperty_Modes */
+        /*
+         * Initial resource ownership must include MainAudio. A clean,
+         * first-pair run against Apple's CarPlay Simulator proves the
+         * required transition:
+         *
+         *   MainAudio accessory/permanent accessory
+         *       -> controller/permanent accessory -> type 100 SETUP
+         *       -> controller/permanent controller -> type 103 SETUP
+         *
+         * Omitting resource 2 made iOS begin at controller/controller. That
+         * skipped both audio setup transitions and left audio on the phone.
+         *
+         * CarPlay Simulator's Config decoder encodes MainScreen at
+         * UserInitiated priority (500), but MainAudio at NiceToHave priority
+         * (100). Advertising MainAudio at 500 prevents the sender's ordinary
+         * temporary controller/accessory transition that precedes type 100.
+         */
         info[@"modes"] = @{
             @"resources": @[
                 @{  @"resourceID": @(1),       /* MainScreen */
                     @"transferType": @(1),      /* Take */
                     @"transferPriority": @(500), /* UserInitiated */
                     @"takeConstraint": @(100),   /* Anytime */
-                    @"borrowConstraint": @(100)  /* Anytime */
+                    @"borrowConstraint": @(100)
                 },
                 @{  @"resourceID": @(2),       /* MainAudio */
                     @"transferType": @(1),      /* Take */
-                    @"transferPriority": @(500), /* UserInitiated */
+                    @"transferPriority": @(100), /* NiceToHave */
                     @"takeConstraint": @(100),
                     @"borrowConstraint": @(100)
                 }
@@ -593,78 +1017,142 @@ static void handle_info(int sock, const HTTPReq *r) {
         /* Display capabilities — CarPlay touchscreen */
         NSMutableDictionary *display = [NSMutableDictionary dictionary];
         display[@"uuid"] = @"e0ff8a27-6738-3d56-8a16-cc53ce1299b4";
-        display[@"widthPixels"] = @800;
-        display[@"heightPixels"] = @480;
+        display[@"widthPixels"] = @(g_display_width);
+        display[@"heightPixels"] = @(g_display_height);
         display[@"widthPhysical"] = @0;
         display[@"heightPhysical"] = @0;
-        display[@"maxFPS"] = @30;
-        /* Display feature bits (from reference):
-         *   0x02 = Knobs
-         *   0x04 = LowFidelityTouch
-         *   0x08 = HighFidelityTouch (capacitive touchscreen)
-         *   0x10 = Touchpad
-         * Match simulator: Knobs + HighFidelityTouch + Touchpad = 0x1A */
-        display[@"features"] = @(0x1A);
+        display[@"maxFPS"] = @(g_display_fps);
+        /* Advertise only the implemented capacitive touchscreen. Knob and
+         * touchpad bits are behavioral contracts, not cosmetic profile data. */
+        display[@"features"] = @(0x08);
         display[@"primaryInputDevice"] = @(1);  /* 1=touchscreen */
         display[@"overscanned"] = @NO;
         info[@"displays"] = @[display];
 
-        /* Audio formats — PCM and AAC-LC */
-        NSDictionary *pcm = @{
-            @"type": @(100),
-            @"audioInputFormats": @(0x01000000),
-            @"audioOutputFormats": @(0x01000000)
-        };
-        NSDictionary *aacLC = @{
-            @"type": @(96),
-            @"audioInputFormats": @(0x04000000),
-            @"audioOutputFormats": @(0x04000000)
-        };
-        info[@"audioFormats"] = @[pcm, aacLC];
+        /*
+         * CarPlaySDK builds different audio tables for wired and wireless
+         * sessions. The wireless table uses Opus for interactive audio and
+         * AAC-LC for buffered media; compatibility PCM entries belong to the
+         * wired builder.
+         *
+         * Static recovery of Apple's current wireless builder established the
+         * row order below. Showcase implements types 100, 101, 102, and 103.
+         * Do not advertise the later auxiliary speech streams until their
+         * receiver contracts are implemented. Preserve the SDK's insertion
+         * order.
+         */
+        const uint64_t opus16 = 0x10000000ULL;
+        const uint64_t opus24 = 0x20000000ULL;
+        const uint64_t opus48 = 0x40000000ULL;
+        const uint64_t opusAll = opus16 | opus24 | opus48;
+        const uint64_t aacLC44 = 0x00400000ULL;
+        const uint64_t aacLC48 = 0x00800000ULL;
+        info[@"audioFormats"] = @[
+            @{
+                @"audioType": @"default",
+                @"type": @(100),             /* MainAudio */
+                @"audioInputFormats": @(opusAll),
+                @"audioOutputFormats": @(opusAll)
+            },
+            @{
+                @"audioType": @"default",
+                @"type": @(101),             /* AltAudio */
+                @"audioInputFormats": @(0),
+                @"audioOutputFormats": @(opusAll)
+            },
+            @{
+                @"audioType": @"media",
+                @"type": @(102),             /* MainAudio media */
+                @"audioInputFormats": @(0),
+                @"audioOutputFormats": @(aacLC44 | aacLC48)
+            },
+            @{
+                @"audioType": @"media",
+                @"type": @(103),             /* MainBufferedAudio */
+                @"audioInputFormats": @(0),
+                @"audioOutputFormats": @(aacLC44 | aacLC48)
+            },
+            @{
+                @"audioType": @"alert",
+                @"type": @(100),
+                @"audioInputFormats": @(0),
+                @"audioOutputFormats": @(opus48)
+            },
+            @{
+                @"audioType": @"telephony",
+                @"type": @(100),
+                @"audioInputFormats": @(opusAll),
+                @"audioOutputFormats": @(opusAll)
+            },
+            @{
+                @"audioType": @"speechRecognition",
+                @"type": @(100),
+                @"audioInputFormats": @(opus24),
+                @"audioOutputFormats": @(opus24)
+            }
+        ];
 
-        NSDictionary *latency = @{
-            @"type": @(100),
-            @"audioType": @"default",
-            @"inputLatencyMicros": @0,
-            @"outputLatencyMicros": @0
-        };
-        info[@"audioLatencies"] = @[latency];
+        info[@"audioLatencies"] = @[
+            @{
+                @"type": @(100), @"audioType": @"default",
+                @"inputLatencyMicros": @0, @"outputLatencyMicros": @0
+            },
+            @{
+                @"type": @(100), @"audioType": @"telephony",
+                @"inputLatencyMicros": @0, @"outputLatencyMicros": @0
+            },
+            @{
+                @"type": @(100), @"audioType": @"speechRecognition",
+                @"inputLatencyMicros": @0, @"outputLatencyMicros": @0
+            },
+            @{
+                @"type": @(100), @"audioType": @"alert",
+                @"outputLatencyMicros": @0
+            },
+            @{
+                @"type": @(100), @"audioType": @"media",
+                @"outputLatencyMicros": @0
+            },
+            @{
+                @"type": @(101), @"audioType": @"default",
+                @"outputLatencyMicros": @0
+            }
+        ];
 
         info[@"initialVolume"] = @(-20.0);
 
-        /* HID devices — single-finger touchscreen (Apple reference format).
-         * Report = 5 bytes: [touch(1)][xLo][xHi][yLo][yHi]
-         * Coordinates: absolute, 0-800 X, 0-480 Y */
+        /* HID devices — Apple's single-touch-with-cancel format, used by the
+         * CarPlay Simulator when "High Fidelty" and cancel support are enabled.
+         * Report = 5 bytes: [touch|cancel<<1][xLo][xHi][yLo][yHi].
+         * Coordinates use the negotiated display dimensions. */
         {
-            static const uint8_t hidDesc[] = {
+            const uint8_t hidDesc[] = {
                 0x05, 0x0D,        /* Usage Page (Digitizer) */
                 0x09, 0x04,        /* Usage (Touch Screen) */
                 0xA1, 0x01,        /* Collection (Application) */
-                0x05, 0x0D,        /*   Usage Page (Digitizer) */
                 0x09, 0x22,        /*   Usage (Finger) */
                 0xA1, 0x02,        /*   Collection (Logical) */
-                0x05, 0x0D,        /*     Usage Page (Digitizer) */
-                0x09, 0x33,        /*     Usage (Touch) */
                 0x15, 0x00,        /*     Logical Minimum (0) */
                 0x25, 0x01,        /*     Logical Maximum (1) */
+                0x09, 0x33,        /*     Usage (Touch) */
+                0x09, 0x34,        /*     Usage (Untouch/Cancel) */
                 0x75, 0x01,        /*     Report Size (1) */
-                0x95, 0x01,        /*     Report Count (1) */
+                0x95, 0x02,        /*     Report Count (2) */
                 0x81, 0x02,        /*     Input (Data, Variable, Absolute) */
-                0x75, 0x07,        /*     Report Size (7) - padding */
-                0x95, 0x01,        /*     Report Count (1) */
+                0x95, 0x06,        /*     Report Count (6) */
                 0x81, 0x01,        /*     Input (Constant) */
                 0x05, 0x01,        /*     Usage Page (Generic Desktop) */
+                0x26, (uint8_t)g_display_width,
+                      (uint8_t)(g_display_width >> 8),
+                                      /*     Logical Maximum (display width) */
                 0x09, 0x30,        /*     Usage (X) */
-                0x15, 0x00,        /*     Logical Minimum (0) */
-                0x26, 0x20, 0x03,  /*     Logical Maximum (800) */
                 0x75, 0x10,        /*     Report Size (16) */
                 0x95, 0x01,        /*     Report Count (1) */
                 0x81, 0x02,        /*     Input (Data, Variable, Absolute) */
+                0x26, (uint8_t)g_display_height,
+                      (uint8_t)(g_display_height >> 8),
+                                      /*     Logical Maximum (display height) */
                 0x09, 0x31,        /*     Usage (Y) */
-                0x15, 0x00,        /*     Logical Minimum (0) */
-                0x26, 0xE0, 0x01,  /*     Logical Maximum (480) */
-                0x75, 0x10,        /*     Report Size (16) */
-                0x95, 0x01,        /*     Report Count (1) */
                 0x81, 0x02,        /*     Input (Data, Variable, Absolute) */
                 0xC0,              /*   End Collection */
                 0xC0               /* End Collection */
@@ -731,14 +1219,8 @@ static void handle_pair_setup(int sock, const HTTPReq *r) {
         return;
     }
 
-    /* Create pair context on first use.
-     * The SRP state machine resets internally on each M1,
-     * so we don't need to destroy/recreate the context. */
-    if (!g_pair) {
-        g_pair = pair_ctx_create(ed25519_sk, ed25519_pk, NULL);
-    }
-
-    if (!g_pair) {
+    /* The SRP state machine resets internally on each M1. */
+    if (!ensure_pair_context()) {
         printf("[AP] ERROR: Failed to create pair context\n");
         send_response(sock, proto, 500, "Internal Error",
                      NULL, NULL, 0, r->cseq);
@@ -768,6 +1250,7 @@ static void handle_pair_setup(int sock, const HTTPReq *r) {
     }
 
     if (pair_setup_is_complete(g_pair)) {
+        save_pairing_registry();
         printf("\n[AP] ╔══════════════════════════════════════╗\n");
         printf("[AP] ║  PAIR-SETUP COMPLETE — SUCCESS!      ║\n");
         printf("[AP] ║  Waiting for pair-verify...           ║\n");
@@ -800,13 +1283,7 @@ static void handle_pair_verify(int sock, const HTTPReq *r) {
         return;
     }
 
-    /* Use existing pair context (created during pair-setup) */
-    if (!g_pair) {
-        printf("[AP] WARNING: No pair context — creating fresh one for pair-verify\n");
-        g_pair = pair_ctx_create(ed25519_sk, ed25519_pk, NULL);
-    }
-
-    if (!g_pair) {
+    if (!ensure_pair_context()) {
         send_response(sock, proto, 500, "Internal Error",
                      NULL, NULL, 0, r->cseq);
         return;
@@ -981,40 +1458,35 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
 
     if (!g_baa_ready) {
         printf("[AP] auth-setup: BAA not ready, attempting issuance...\n");
-        issue_baa_cert();
+        load_baa_from_broker();
     }
-    if (!g_baa_ready || !g_baa_key) {
+    if (!g_baa_ready) {
         printf("[AP] auth-setup: BAA certificate unavailable\n");
         send_response(sock, proto, 403, "Forbidden", NULL, NULL, 0, r->cseq);
         return;
     }
 
-    /* Generate our Curve25519 keypair */
-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-    EVP_PKEY_keygen_init(pctx);
-    EVP_PKEY *ourKey = NULL;
-    EVP_PKEY_keygen(pctx, &ourKey);
-    EVP_PKEY_CTX_free(pctx);
-
+    /* Generate our Curve25519 keypair with the system CSPRNG and embedded
+     * Monocypher. */
+    uint8_t ourSK[32];
     uint8_t ourPK[32];
-    size_t pkLen = 32;
-    EVP_PKEY_get_raw_public_key(ourKey, ourPK, &pkLen);
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(ourSK), ourSK) !=
+        errSecSuccess) {
+        printf("[AP] auth-setup: secure random generation failed\n");
+        send_response(sock, proto, 500, "Internal Server Error",
+                      NULL, NULL, 0, r->cseq);
+        return;
+    }
+    crypto_x25519_public_key(ourPK, ourSK);
 
     printf("[AP] auth-setup: our ECDH pk:");
     for (int i = 0; i < 32; i++) printf(" %02x", ourPK[i]);
     printf("\n");
 
     /* Compute ECDH shared secret */
-    EVP_PKEY *peerKey = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peerPK, 32);
-    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(ourKey, NULL);
-    EVP_PKEY_derive_init(dctx);
-    EVP_PKEY_derive_set_peer(dctx, peerKey);
     uint8_t sharedSecret[32];
-    size_t ssLen = 32;
-    EVP_PKEY_derive(dctx, sharedSecret, &ssLen);
-    EVP_PKEY_CTX_free(dctx);
-    EVP_PKEY_free(peerKey);
-    EVP_PKEY_free(ourKey);
+    crypto_x25519(sharedSecret, ourSK, peerPK);
+    crypto_wipe(ourSK, sizeof(ourSK));
 
     printf("[AP] auth-setup: shared secret established\n");
 
@@ -1041,20 +1513,18 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         memcpy(digestData + 32, peerPK, 32);
 
         /* Sign with ECDSA-SHA256 (BAA key's native algorithm) */
-        NSData *sigInput = [NSData dataWithBytes:digestData length:64];
-        CFErrorRef cfErr = NULL;
-        NSData *sig = (__bridge_transfer NSData *)SecKeyCreateSignature(
-            g_baa_key, kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
-            (__bridge CFDataRef)sigInput, &cfErr);
-
-        if (!sig) {
-            NSLog(@"[AP] auth-setup: ECDSA sign FAILED: %@", cfErr);
+        uint8_t *sigBytesOwned = NULL;
+        int sigLength = 0;
+        int signRC = baa_broker_sign(digestData, sizeof(digestData),
+                                     &sigBytesOwned, &sigLength);
+        if (signRC != 0) {
+            printf("[AP] auth-setup: BAA broker sign FAILED: %d\n", signRC);
             send_response(sock, proto, 403, "Forbidden", NULL, NULL, 0, r->cseq);
             return;
         }
 
-        const uint8_t *sigBytes = (const uint8_t *)[sig bytes];
-        size_t sigLen = [sig length];
+        const uint8_t *sigBytes = sigBytesOwned;
+        size_t sigLen = (size_t)sigLength;
         printf("[AP] auth-setup: ECDSA signature: %zu bytes\n", sigLen);
 
         /* Encrypt signature with AES-128-CTR */
@@ -1066,6 +1536,7 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
                                 NULL, 0, 0, kCCModeOptionCTR_BE, &cryptor);
         CCCryptorUpdate(cryptor, sigBytes, sigLen, encSig, sigLen, &encLen);
         CCCryptorRelease(cryptor);
+        free(sigBytesOwned);
 
         printf("[AP] auth-setup: encrypted sig: %zu bytes\n", encLen);
 
@@ -1222,6 +1693,136 @@ static bool sockaddr_to_numeric(const struct sockaddr *sa, socklen_t slen,
     return false;
 }
 
+/*
+ * Apple's receiver marks the screen TCP socket as interactive video before
+ * accepting the sender. This is not cosmetic DSCP tagging: Darwin's network
+ * service type also selects the Wi-Fi WMM access category for locally emitted
+ * packets, including TCP ACKs. Captures from CarPlay Simulator show 0x80 in
+ * both directions, while Showcase previously returned every screen ACK as
+ * best-effort 0x00 even though the iPhone's video packets were 0x80/0x82.
+ *
+ * Apply the public network-service API plus both layers used by
+ * AccessorySDK's SocketSetQoS(kSocketQoS_AirPlayScreenVideo): the IP header
+ * class and Darwin's private socket traffic class. The latter is what the
+ * Apple implementation says the driver uses for mbuf prioritization.
+ *
+ * A Personal Hotspot peer can also arrive as an IPv4-mapped address on our
+ * dual-stack IPv6 listener. In that case set IP_TOS as well as IPV6_TCLASS;
+ * choosing solely from getsockname() would otherwise miss the on-wire IPv4
+ * path used by older receivers. Reapply everything to the accepted socket
+ * because not every Darwin release inherits every listener option.
+ */
+#ifndef SO_NET_SERVICE_TYPE
+#define SO_NET_SERVICE_TYPE 0x1116
+#endif
+#ifndef NET_SERVICE_TYPE_VI
+#define NET_SERVICE_TYPE_VI 3
+#endif
+#ifndef SO_TRAFFIC_CLASS
+#define SO_TRAFFIC_CLASS 0x1086
+#endif
+#ifndef SO_TC_VI
+#define SO_TC_VI 700
+#endif
+
+static void set_screen_socket_qos(int fd, const char *stage) {
+    if (fd < 0) return;
+
+    int serviceType = NET_SERVICE_TYPE_VI;
+    int serviceResult = setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE,
+                                   &serviceType, sizeof(serviceType));
+    int serviceError = serviceResult == 0 ? 0 : errno;
+
+    struct sockaddr_storage localAddress;
+    memset(&localAddress, 0, sizeof(localAddress));
+    socklen_t localLength = sizeof(localAddress);
+    int family = AF_UNSPEC;
+    if (getsockname(fd, (struct sockaddr *)&localAddress, &localLength) == 0)
+        family = localAddress.ss_family;
+
+    struct sockaddr_storage peerAddress;
+    memset(&peerAddress, 0, sizeof(peerAddress));
+    socklen_t peerLength = sizeof(peerAddress);
+    int peerFamily = AF_UNSPEC;
+    bool peerIsIPv4Mapped = false;
+    if (getpeername(fd, (struct sockaddr *)&peerAddress, &peerLength) == 0) {
+        peerFamily = peerAddress.ss_family;
+        if (peerFamily == AF_INET6) {
+            const struct sockaddr_in6 *peer6 =
+                (const struct sockaddr_in6 *)&peerAddress;
+            peerIsIPv4Mapped = IN6_IS_ADDR_V4MAPPED(&peer6->sin6_addr);
+        }
+    }
+
+    int diffServ = 0x80; /* CS4 / WMM interactive video. */
+    int ipResult = -1;
+    int ipError = 0;
+    int ipv6Result = -1;
+    int ipv6Error = 0;
+    if (family == AF_INET) {
+#ifdef IP_TOS
+        ipResult = setsockopt(fd, IPPROTO_IP, IP_TOS,
+                              &diffServ, sizeof(diffServ));
+        if (ipResult != 0) ipError = errno;
+#endif
+    } else if (family == AF_INET6) {
+#ifdef IPV6_TCLASS
+        ipv6Result = setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS,
+                                &diffServ, sizeof(diffServ));
+        if (ipv6Result != 0) ipv6Error = errno;
+#endif
+#ifdef IP_TOS
+        if (peerIsIPv4Mapped) {
+            ipResult = setsockopt(fd, IPPROTO_IP, IP_TOS,
+                                  &diffServ, sizeof(diffServ));
+            if (ipResult != 0) ipError = errno;
+        }
+#endif
+    }
+
+    int trafficClass = SO_TC_VI;
+    int trafficResult = setsockopt(fd, SOL_SOCKET, SO_TRAFFIC_CLASS,
+                                   &trafficClass, sizeof(trafficClass));
+    int trafficError = trafficResult == 0 ? 0 : errno;
+
+    int appliedServiceType = -1;
+    socklen_t appliedLength = sizeof(appliedServiceType);
+    int getResult = getsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE,
+                               &appliedServiceType, &appliedLength);
+
+    int appliedTrafficClass = -1;
+    appliedLength = sizeof(appliedTrafficClass);
+    int trafficGetResult = getsockopt(fd, SOL_SOCKET, SO_TRAFFIC_CLASS,
+                                      &appliedTrafficClass, &appliedLength);
+
+    printf("[SCREEN] QoS %s fd=%d family=%s peer=%s%s "
+           "service=VI(%d) set=%s get=%s(%d) "
+           "traffic=VI(%d) set=%s get=%s(%d) "
+           "ipv6TClass=%s%s ipTOS=%s%s\n",
+           stage ? stage : "socket", fd, addr_family_name(family),
+           addr_family_name(peerFamily), peerIsIPv4Mapped ? "(v4-mapped)" : "",
+           NET_SERVICE_TYPE_VI,
+           serviceResult == 0 ? "OK" : "FAIL",
+           getResult == 0 ? "OK" : "FAIL",
+           getResult == 0 ? appliedServiceType : -1,
+           SO_TC_VI,
+           trafficResult == 0 ? "OK" : "FAIL",
+           trafficGetResult == 0 ? "OK" : "FAIL",
+           trafficGetResult == 0 ? appliedTrafficClass : -1,
+           ipv6Result == 0 ? "OK" :
+               (ipv6Result < 0 && !ipv6Error ? "N/A" : "FAIL"),
+           ipv6Error ? strerror(ipv6Error) : "",
+           ipResult == 0 ? "OK" :
+               (ipResult < 0 && !ipError ? "N/A" : "FAIL"),
+           ipError ? strerror(ipError) : "");
+    if (serviceError || trafficError) {
+        printf("[SCREEN] QoS %s errors service=%s traffic=%s\n",
+               stage ? stage : "socket",
+               serviceError ? strerror(serviceError) : "none",
+               trafficError ? strerror(trafficError) : "none");
+    }
+}
+
 static int bind_udp_port_ipv4(uint16_t *outPort) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (fd < 0) return -1;
@@ -1237,7 +1838,7 @@ static int bind_udp_port_ipv4(uint16_t *outPort) {
     getsockname(fd, (struct sockaddr *)&sa, &sl);
     *outPort = ntohs(sa.sin_port);
     printf("[NET] bound UDP IPv4 fallback port %u fd=%d\n", *outPort, fd);
-    return false;
+    return fd;
 }
 
 /* Helper: bind a UDP socket to any port and return (fd, port). */
@@ -1305,7 +1906,7 @@ static int bind_tcp_port_ipv4(uint16_t *outPort) {
     getsockname(fd, (struct sockaddr *)&sa, &sl);
     *outPort = ntohs(sa.sin_port);
     printf("[NET] bound TCP IPv4 fallback port %u fd=%d\n", *outPort, fd);
-    return false;
+    return fd;
 }
 
 /* Helper: bind a TCP listen socket to any port and return (fd, port) */
@@ -1363,7 +1964,107 @@ tcp_fallback:
     return bind_tcp_port_ipv4(outPort);
 }
 
+/*
+ * AirPlayReceiverSession opens its screen socket in the authenticated RTSP
+ * peer's address family. That distinction matters on Darwin: accepting an
+ * IPv4 sender through an IPv6 dual-stack socket produces an IPv4-mapped
+ * socket on which IP_TOS cannot be applied. It also sets SO_RCVBUF before
+ * listen(), so the accepted connection inherits the intended window scale.
+ */
+static int bind_screen_tcp_port(uint16_t *outPort, int peerFamily) {
+    int family = peerFamily == AF_INET6 ? AF_INET6 : AF_INET;
+    int fd = socket(family, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+        printf("[NET] ERROR: screen %s socket failed: %s\n",
+               addr_family_name(family), strerror(errno));
+        return -1;
+    }
+
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#ifdef SO_NOSIGPIPE
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+#endif
+    if (family == AF_INET6) {
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY,
+                       &yes, sizeof(yes)) != 0) {
+            printf("[NET] ERROR: screen IPV6_V6ONLY=1 failed: %s\n",
+                   strerror(errno));
+            close(fd);
+            return -1;
+        }
+    }
+
+    int requestedRcvBuf = g_screen_receive_buffer;
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
+                   &requestedRcvBuf, sizeof(requestedRcvBuf)) != 0) {
+        printf("[SCREEN] WARN: listener SO_RCVBUF request %d failed: %s\n",
+               requestedRcvBuf, strerror(errno));
+    }
+    int listenerRcvBuf = 0;
+    socklen_t listenerRcvBufLength = sizeof(listenerRcvBuf);
+    if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &listenerRcvBuf,
+                   &listenerRcvBufLength) == 0) {
+        printf("[SCREEN] Listener TCP receive buffer: requested=%d actual=%d\n",
+               requestedRcvBuf, listenerRcvBuf);
+    }
+
+    set_screen_socket_qos(fd, "listener");
+
+    int bindResult = -1;
+    if (family == AF_INET) {
+        struct sockaddr_in address4;
+        memset(&address4, 0, sizeof(address4));
+        address4.sin_family = AF_INET;
+        address4.sin_addr.s_addr = htonl(INADDR_ANY);
+        address4.sin_port = 0;
+        bindResult = bind(fd, (struct sockaddr *)&address4, sizeof(address4));
+    } else {
+        struct sockaddr_in6 address6;
+        memset(&address6, 0, sizeof(address6));
+        address6.sin6_family = AF_INET6;
+        address6.sin6_addr = in6addr_any;
+        address6.sin6_port = 0;
+        bindResult = bind(fd, (struct sockaddr *)&address6, sizeof(address6));
+    }
+    if (bindResult != 0 || listen(fd, 1) != 0) {
+        printf("[NET] ERROR: screen %s bind/listen failed: %s\n",
+               addr_family_name(family), strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    struct sockaddr_storage local;
+    memset(&local, 0, sizeof(local));
+    socklen_t localLength = sizeof(local);
+    if (getsockname(fd, (struct sockaddr *)&local, &localLength) != 0) {
+        printf("[NET] ERROR: screen getsockname failed: %s\n",
+               strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (local.ss_family == AF_INET) {
+        *outPort = ntohs(((struct sockaddr_in *)&local)->sin_port);
+    } else {
+        *outPort = ntohs(((struct sockaddr_in6 *)&local)->sin6_port);
+    }
+    printf("[NET] bound screen TCP %s port %u fd=%d\n",
+           addr_family_name(family), *outPort, fd);
+    return fd;
+}
+
+static int socket_bound_family(int fd) {
+    struct sockaddr_storage local;
+    socklen_t localLen = sizeof(local);
+    memset(&local, 0, sizeof(local));
+    if (fd < 0 ||
+        getsockname(fd, (struct sockaddr *)&local, &localLen) != 0)
+        return AF_UNSPEC;
+    return local.ss_family;
+}
+
 static bool build_peer_sockaddr(const char *host, uint16_t port,
+                                int socketFamily,
                                 struct sockaddr_storage *out,
                                 socklen_t *outLen,
                                 char *display, size_t displayLen) {
@@ -1382,11 +2083,23 @@ static bool build_peer_sockaddr(const char *host, uint16_t port,
     }
 
     memset(out, 0, sizeof(*out));
-    struct sockaddr_in *sin = (struct sockaddr_in *)out;
-    sin->sin_family = AF_INET;
-    sin->sin_port = htons(port);
-    if (inet_pton(AF_INET, addr, &sin->sin_addr) == 1) {
-        *outLen = sizeof(struct sockaddr_in);
+    struct in_addr ipv4;
+    if (inet_pton(AF_INET, addr, &ipv4) == 1) {
+        if (socketFamily == AF_INET6) {
+            struct sockaddr_in6 *mapped = (struct sockaddr_in6 *)out;
+            mapped->sin6_family = AF_INET6;
+            mapped->sin6_port = htons(port);
+            mapped->sin6_addr.s6_addr[10] = 0xff;
+            mapped->sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&mapped->sin6_addr.s6_addr[12], &ipv4, sizeof(ipv4));
+            *outLen = sizeof(*mapped);
+        } else {
+            struct sockaddr_in *sin = (struct sockaddr_in *)out;
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(port);
+            sin->sin_addr = ipv4;
+            *outLen = sizeof(*sin);
+        }
         if (display && displayLen) snprintf(display, displayLen, "%s", addr);
         return true;
     }
@@ -1430,6 +2143,7 @@ static bool  g_session_active = false;
 static bool  g_timing_thread_running = false;
 static bool  g_event_thread_running = false;
 static int   g_event_client_fd = -1;  /* accepted event connection */
+static volatile uint64_t g_last_touch_nanos = 0;
 
 /* Screen stream state */
 static int      g_screen_listen_fd = -1;     /* TCP listen socket for screen data */
@@ -1441,8 +2155,14 @@ static bool     g_screen_key_valid = false;
 /* iPhone's timing port and IP — needed for server-initiated timing negotiation */
 static uint16_t g_iphone_timing_port = 0;
 static char     g_iphone_ip[64] = {0};
+static int      g_iphone_family = AF_UNSPEC;
 static int      g_rtsp_sock = -1;  /* current RTSP control socket, for getpeername */
 static volatile int g_timing_sync_count = 0;  /* responses received during negotiation */
+static volatile double g_timing_remote_minus_local = 0.0;
+static volatile double g_timing_best_rtt = DBL_MAX;
+static volatile int32_t g_timing_offset_valid = 0;
+static volatile uint32_t g_timing_maintenance_generation = 0;
+static bool app_send_video_timing(void);
 
 /* ═══════════════════════════════════════════════════════════════
  * NTP Timing Responder Thread
@@ -1470,10 +2190,80 @@ static volatile int g_timing_sync_count = 0;  /* responses received during negot
 #define NTP_EPOCH_OFFSET 2208988800UL
 
 static void get_ntp_time(uint32_t *sec, uint32_t *frac) {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    *sec  = (uint32_t)(tv.tv_sec + NTP_EPOCH_OFFSET);
-    *frac = (uint32_t)((double)tv.tv_usec * 4294.967296);
+    /*
+     * AirPlay timing is an NTP-encoded monotonic clock, not civil time.
+     * Apple's simulator sends seconds equal to NTP_EPOCH_OFFSET plus its
+     * monotonic uptime, and its CarPlaySDK converts between that clock and
+     * mach_absolute_time for screen presentation and audio anchors.
+     *
+     * Using gettimeofday here made every timing exchange advertise a clock
+     * billions of seconds away from the sender's media timeline. Pairing and
+     * transport survived because NTP can describe a large fixed offset, but
+     * the screen and buffered-audio paths then had to recover from a clock
+     * domain we invented. Keep the same NTP wire representation Apple uses
+     * while sourcing it from the host clock that media timestamps use.
+     *
+     * This must be mach_absolute_time, not CLOCK_MONOTONIC. On older iOS,
+     * CoreMedia's host clock and mach_absolute_time include a different amount
+     * of suspended time than CLOCK_MONOTONIC. Feeding the latter into NTP and
+     * then scheduling on CMClockGetHostTimeClock moves every frame by the
+     * accumulated sleep duration.
+     */
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t timebaseOnce;
+    dispatch_once(&timebaseOnce, ^{
+        mach_timebase_info(&timebase);
+    });
+    uint64_t ticks = mach_absolute_time();
+    long double seconds =
+        ((long double)ticks * (long double)timebase.numer) /
+        ((long double)timebase.denom * 1000000000.0L);
+    uint64_t wholeSeconds = (uint64_t)seconds;
+    long double fractionalSeconds = seconds - (long double)wholeSeconds;
+    *sec = (uint32_t)((uint64_t)NTP_EPOCH_OFFSET +
+                      wholeSeconds);
+    *frac = (uint32_t)(fractionalSeconds * 4294967296.0L);
+}
+
+static uint64_t synchronized_ntp_for_host_ticks(uint64_t hostTicks,
+                                                uint64_t *rawNanos) {
+    static mach_timebase_info_data_t timebase;
+    static dispatch_once_t timebaseOnce;
+    dispatch_once(&timebaseOnce, ^{
+        mach_timebase_info(&timebase);
+    });
+
+    long double ticksToSeconds =
+        (long double)timebase.numer /
+        ((long double)timebase.denom * 1000000000.0L);
+    long double hostSeconds = (long double)hostTicks * ticksToSeconds;
+    long double synchronizedSeconds =
+        hostSeconds + (long double)NTP_EPOCH_OFFSET;
+    if (g_timing_offset_valid) {
+        synchronizedSeconds +=
+            (long double)g_timing_remote_minus_local;
+    }
+    if (synchronizedSeconds < 0) synchronizedSeconds = 0;
+
+    uint64_t wholeSeconds = (uint64_t)synchronizedSeconds;
+    long double fractionalSeconds =
+        synchronizedSeconds - (long double)wholeSeconds;
+    if (rawNanos) {
+        *rawNanos = (uint64_t)((long double)hostTicks *
+                               (long double)timebase.numer /
+                               (long double)timebase.denom);
+    }
+    return (wholeSeconds << 32) |
+           (uint32_t)(fractionalSeconds * 4294967296.0L);
+}
+
+static double ntp_wire_time(const uint8_t bytes[8]) {
+    uint32_t secondsNetwork = 0;
+    uint32_t fractionNetwork = 0;
+    memcpy(&secondsNetwork, bytes, sizeof(secondsNetwork));
+    memcpy(&fractionNetwork, bytes + 4, sizeof(fractionNetwork));
+    return (double)ntohl(secondsNetwork) +
+           (double)ntohl(fractionNetwork) / 4294967296.0;
 }
 
 static void timing_thread_func(void *ctx) {
@@ -1551,10 +2341,33 @@ static void timing_thread_func(void *ctx) {
                    sent, fromHost, fromPort, addr_family_name(from.ss_family));
         } else if (pt == 211) {
             /* Timing response from iPhone to our negotiation request */
+            uint32_t receiveSeconds = 0;
+            uint32_t receiveFraction = 0;
+            get_ntp_time(&receiveSeconds, &receiveFraction);
+            double t1 = ntp_wire_time(buf + 8);
+            double t2 = ntp_wire_time(buf + 16);
+            double t3 = ntp_wire_time(buf + 24);
+            double t4 = (double)receiveSeconds +
+                        (double)receiveFraction / 4294967296.0;
+            double rtt = (t4 - t1) - (t3 - t2);
+            double remoteMinusLocal =
+                ((t2 - t1) + (t3 - t4)) * 0.5;
+            bool selected = false;
+            if (rtt >= 0.0 && rtt < 1.0 &&
+                rtt < g_timing_best_rtt) {
+                g_timing_best_rtt = rtt;
+                g_timing_remote_minus_local = remoteMinusLocal;
+                g_timing_offset_valid = 1;
+                selected = true;
+                app_send_video_timing();
+            }
             g_timing_sync_count++;
-            printf("[TIMING] Received timing RESPONSE (pt=211) from %s:%s family=%s sync #%d\n",
+            printf("[TIMING] Received timing RESPONSE (pt=211) from %s:%s "
+                   "family=%s sync #%d rtt=%.3fms remote-local=%.3fms "
+                   "selected=%d\n",
                    fromHost, fromPort, addr_family_name(from.ss_family),
-                   g_timing_sync_count);
+                   g_timing_sync_count, rtt * 1000.0,
+                   remoteMinusLocal * 1000.0, selected ? 1 : 0);
         } else {
             printf("[TIMING] Unknown packet type %u (%zd bytes)\n", pt, n);
         }
@@ -1608,9 +2421,12 @@ static void event_thread_func(void *ctx) {
 
         g_event_client_fd = client;
 
-        /* TCP keepalive */
+        /* HID commands are tiny and latency-sensitive. Without TCP_NODELAY,
+         * Nagle combines consecutive reports while waiting for the iPhone's
+         * ACK, which turns continuous swipes into visible stair-steps. */
         int yes = 1;
         setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+        setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 
         /* Read loop — decrypt ChaCha20-Poly1305 framed messages */
         uint8_t buf[16384];
@@ -1620,6 +2436,7 @@ static void event_thread_func(void *ctx) {
         if (g_event_enc.active) {
             printf("[EVENT] Encrypted event channel active\n");
             fflush(stdout);
+            uint64_t normalResponseCount = 0;
             while (1) {
                 int ptLen = enc_recv_frame(client, &g_event_enc, buf, sizeof(buf));
                 if (ptLen == -2) {
@@ -1631,6 +2448,17 @@ static void event_thread_func(void *ctx) {
                     printf("[EVENT] Encrypted recv error or disconnect\n");
                     break;
                 }
+                if (ptLen >= 12 &&
+                    memcmp(buf, "RTSP/1.0 200", 12) == 0) {
+                    normalResponseCount++;
+                    if (normalResponseCount % 250 == 0) {
+                        printf("[EVENT] %llu normal HID acknowledgements\n",
+                               normalResponseCount);
+                    }
+                    continue;
+                }
+                if (process_event_command_frame(buf, (size_t)ptLen))
+                    continue;
                 printf("[EVENT] Decrypted %d bytes (nonce=%llu)\n",
                        ptLen, g_event_enc.readNonce - 1);
                 int dump = ptLen > 256 ? 256 : ptLen;
@@ -1730,7 +2558,9 @@ static void start_keepalive_thread(void) {
  * Screen data framing: each frame is a 128-byte header followed by
  * encrypted H.264 NAL unit data.
  * ═══════════════════════════════════════════════════════════════ */
-static bool g_screen_thread_running = false;
+static volatile int32_t g_screen_thread_running = 0;
+static volatile int32_t g_screen_start_pending = 0;
+static uint64_t monotonic_nanos_now(void);
 
 /* ── Helpers: read exactly N bytes from TCP ── */
 static bool tcp_read_exact(int fd, uint8_t *buf, size_t len) {
@@ -1743,15 +2573,212 @@ static bool tcp_read_exact(int fd, uint8_t *buf, size_t len) {
     return true;
 }
 
+/*
+ * A completed-frame arrival gap cannot distinguish sender starvation from
+ * TCP head-of-line blocking: the old telemetry only sampled the socket after
+ * recv() had finally returned the whole record. Keep the screen socket's
+ * blocking semantics, but use select() as an observation point while waiting.
+ * No timeout is applied to the connection and no bytes or frames are dropped.
+ */
+typedef struct {
+    bool valid;
+    uint32_t receiveWindow;
+    uint32_t smoothedRTT;
+    uint32_t currentRTT;
+    uint32_t retransmitTimeout;
+    uint32_t flags;
+    uint64_t receivedPackets;
+    uint64_t receivedBytes;
+    uint64_t outOfOrderBytes;
+} ScreenTCPSnapshot;
+
+static ScreenTCPSnapshot screen_tcp_snapshot(int fd) {
+    ScreenTCPSnapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+#ifdef TCP_CONNECTION_INFO
+    struct tcp_connection_info tcpInfo;
+    memset(&tcpInfo, 0, sizeof(tcpInfo));
+    socklen_t tcpInfoLength = sizeof(tcpInfo);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &tcpInfo,
+                   &tcpInfoLength) == 0) {
+        snapshot.valid = true;
+        snapshot.receiveWindow = tcpInfo.tcpi_rcv_wnd;
+        snapshot.smoothedRTT = tcpInfo.tcpi_srtt;
+        snapshot.currentRTT = tcpInfo.tcpi_rttcur;
+        snapshot.retransmitTimeout = tcpInfo.tcpi_rto;
+        snapshot.flags = tcpInfo.tcpi_flags;
+        snapshot.receivedPackets = tcpInfo.tcpi_rxpackets;
+        snapshot.receivedBytes = tcpInfo.tcpi_rxbytes;
+        snapshot.outOfOrderBytes = tcpInfo.tcpi_rxoutoforderbytes;
+    }
+#else
+    (void)fd;
+#endif
+    return snapshot;
+}
+
+static void screen_log_tcp_wait(int fd, const char *phase,
+                                uint64_t startedNanos, size_t got, size_t need,
+                                ScreenTCPSnapshot baseline,
+                                const char *event) {
+    uint64_t nowNanos = monotonic_nanos_now();
+    double waitedMillis = (double)(nowNanos - startedNanos) / 1000000.0;
+    int pendingBytes = 0;
+    if (ioctl(fd, FIONREAD, &pendingBytes) != 0 || pendingBytes < 0)
+        pendingBytes = 0;
+
+    ScreenTCPSnapshot current = screen_tcp_snapshot(fd);
+    uint64_t packetDelta = 0;
+    uint64_t byteDelta = 0;
+    uint64_t outOfOrderDelta = 0;
+    if (baseline.valid && current.valid) {
+        packetDelta = current.receivedPackets - baseline.receivedPackets;
+        byteDelta = current.receivedBytes - baseline.receivedBytes;
+        outOfOrderDelta =
+            current.outOfOrderBytes - baseline.outOfOrderBytes;
+    }
+
+    printf("[SCREEN][TCP-%s] phase=%s waited=%.1fms read=%zu/%zu "
+           "socket=%d rxPackets=%llu(+%llu) rxBytes=%llu(+%llu) "
+           "rxOOO=%llu(+%llu) rcvWnd=%u srtt=%u rtt=%u rto=%u "
+           "flags=0x%x\n",
+           event, phase, waitedMillis, got, need, pendingBytes,
+           (unsigned long long)current.receivedPackets,
+           (unsigned long long)packetDelta,
+           (unsigned long long)current.receivedBytes,
+           (unsigned long long)byteDelta,
+           (unsigned long long)current.outOfOrderBytes,
+           (unsigned long long)outOfOrderDelta,
+           current.receiveWindow, current.smoothedRTT, current.currentRTT,
+           current.retransmitTimeout, current.flags);
+}
+
+static bool screen_read_exact(int fd, uint8_t *buf, size_t len,
+                              const char *phase) {
+    const uint64_t logThresholdNanos = 500ULL * NSEC_PER_MSEC;
+    const uint64_t logIntervalNanos = 500ULL * NSEC_PER_MSEC;
+    const uint64_t touchWindowNanos = 2ULL * NSEC_PER_SEC;
+    const bool isBody = strcmp(phase, "body") == 0;
+    uint64_t startedNanos = monotonic_nanos_now();
+    uint64_t lastLogNanos = 0;
+    bool observedInteractiveWait = false;
+    ScreenTCPSnapshot baseline = screen_tcp_snapshot(fd);
+    size_t got = 0;
+
+    while (got < len) {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(fd, &readSet);
+        struct timeval timeout = { .tv_sec = 0, .tv_usec = 250000 };
+        int ready = select(fd + 1, &readSet, NULL, NULL, &timeout);
+        if (ready < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (ready == 0) {
+            uint64_t nowNanos = monotonic_nanos_now();
+            uint64_t waitedNanos = nowNanos - startedNanos;
+            uint64_t lastTouchNanos = g_last_touch_nanos;
+            bool touchIsRecent =
+                lastTouchNanos != 0 && nowNanos >= lastTouchNanos &&
+                nowNanos - lastTouchNanos <= touchWindowNanos;
+            if (touchIsRecent) observedInteractiveWait = true;
+            if (waitedNanos >= logThresholdNanos &&
+                (isBody || touchIsRecent) &&
+                (lastLogNanos == 0 ||
+                 nowNanos - lastLogNanos >= logIntervalNanos)) {
+                screen_log_tcp_wait(fd, phase, startedNanos, got, len,
+                                    baseline, "WAIT");
+                lastLogNanos = nowNanos;
+            }
+            continue;
+        }
+
+        ssize_t n = recv(fd, buf + got, len - got, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        got += (size_t)n;
+    }
+
+    uint64_t completedNanos = monotonic_nanos_now();
+    if (completedNanos - startedNanos >= logThresholdNanos &&
+        (isBody || observedInteractiveWait)) {
+        screen_log_tcp_wait(fd, phase, startedNanos, got, len, baseline,
+                            "RECOVER");
+    }
+    return true;
+}
+
 /* ── IPC to iPadPlay app via Unix socket ── */
 #define IPADPLAY_SOCK "/tmp/ipadplay.sock"
 #define MSG_VIDEO_CONFIG 0x01
 #define MSG_VIDEO_FRAME  0x02
 #define MSG_STATUS       0x04   /* services → app, 1 byte status code */
+#define MSG_APP_VISIBILITY 0x05 /* app → services, 1 while foreground */
+#define MSG_VIDEO_TIMING 0x06   /* services → app, uint32 latency in ms */
+#define MSG_VIDEO_RESYNC 0x07   /* app → services, renderer needs keyframe */
+#define VIDEO_FRAME_METADATA_SIZE 56
 /* STATUS_* codes are forward-declared at the top of the file. */
 
 static int g_app_sock = -1;
+static volatile bool g_app_video_enabled = true;
+static volatile uint32_t g_screen_latency_ms = 75;
+
+/* AirPlayScreenHeader.smallParam[1] bit 1 (kAirPlayScreenFlag_RespectTimestamps).
+ * When the sender sets it, params[0] of every VideoFrame carries the 32.32
+ * fixed-point time on the session timeline at which the frame must appear.
+ * Displaying on arrival instead turns delivery jitter straight into judder and
+ * throws away frames that arrive inside one refresh of each other. */
+static volatile uint32_t g_screen_respect_timestamps = 0;
+
+static uint64_t monotonic_nanos_now(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec;
+}
+
+/* Presentation contract:
+ * [uint32 latencyMs][uint8 respectTimestamps]
+ * [double senderToHostOffset][uint8 offsetValid].
+ *
+ * NTP gives remote-minus-local. Frame timestamps are on the remote timeline,
+ * so senderToHostOffset is its negation. */
+static uint32_t build_video_timing_payload(uint8_t out[14]) {
+    uint32_t latency = g_screen_latency_ms;
+    memcpy(out, &latency, sizeof(latency));
+    out[4] = g_screen_respect_timestamps ? 1 : 0;
+    double senderToHostOffset = -g_timing_remote_minus_local;
+    memcpy(out + 5, &senderToHostOffset, sizeof(senderToHostOffset));
+    out[13] = g_timing_offset_valid ? 1 : 0;
+    return 14;
+}
+static dispatch_semaphore_t g_app_send_lock = NULL;
+static dispatch_semaphore_t g_video_config_lock = NULL;
+static uint8_t *g_latest_video_config = NULL;
+static uint32_t g_latest_video_config_length = 0;
 static void start_touch_reader(int fd);  /* forward declaration */
+static void send_request_ui_command(const char *reason);
+static void send_take_main_screen_command(const char *reason);
+
+static bool app_write_all(int fd, const uint8_t *data, size_t length) {
+    size_t sent = 0;
+    while (sent < length) {
+        ssize_t n = write(fd, data + sent, length - sent);
+        if (n <= 0) return false;
+        sent += (size_t)n;
+    }
+    return true;
+}
+
+static bool app_write_msg_to_socket(int fd, uint8_t type,
+                                    const uint8_t *data, uint32_t len) {
+    uint8_t hdr[5] = {
+        len & 0xFF, (len >> 8) & 0xFF,
+        (len >> 16) & 0xFF, (len >> 24) & 0xFF, type
+    };
+    return app_write_all(fd, hdr, sizeof(hdr)) &&
+           app_write_all(fd, data, len);
+}
 
 static bool app_ensure_connected(void) {
     if (g_app_sock >= 0) return true;
@@ -1774,34 +2801,462 @@ static bool app_ensure_connected(void) {
     /* Start touch reader on this socket (reads touch events from app) */
     start_touch_reader(g_app_sock);
 
+    /* A relaunched UI process has no H.264 format description. Bootstrap each
+     * new IPC connection with the negotiated timing and latest SPS/PPS before
+     * the next video frame. */
+    uint8_t timingPayload[14];
+    uint32_t timingLen = build_video_timing_payload(timingPayload);
+    if (!app_write_msg_to_socket(g_app_sock, MSG_VIDEO_TIMING,
+                                 timingPayload, timingLen))
+        goto fail;
+    if (g_video_config_lock)
+        dispatch_semaphore_wait(g_video_config_lock,
+                                DISPATCH_TIME_FOREVER);
+    if (g_latest_video_config && g_latest_video_config_length > 0) {
+        bool configSent = app_write_msg_to_socket(
+            g_app_sock, MSG_VIDEO_CONFIG, g_latest_video_config,
+            g_latest_video_config_length);
+        if (g_video_config_lock)
+            dispatch_semaphore_signal(g_video_config_lock);
+        if (!configSent) goto fail;
+        printf("[SCREEN] Bootstrapped new app connection with video config\n");
+        /* The new decoder cannot consume an arbitrary delta frame. Cycling
+         * MainScreen asks the phone for a fresh config + IDR instead of
+         * copying and replaying an ever-growing compressed GOP. */
+        send_take_main_screen_command("new app decoder");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     100 * NSEC_PER_MSEC),
+                       dispatch_get_global_queue(0, 0), ^{
+            send_request_ui_command("new app decoder");
+        });
+    } else if (g_video_config_lock) {
+        dispatch_semaphore_signal(g_video_config_lock);
+    }
     return true;
-}
 
-static bool app_send_msg(uint8_t type, const uint8_t *data, uint32_t len) {
-    if (!app_ensure_connected()) return false;
-    uint8_t hdr[5] = {
-        len & 0xFF, (len >> 8) & 0xFF,
-        (len >> 16) & 0xFF, (len >> 24) & 0xFF, type
-    };
-    /* Send header */
-    size_t sent = 0;
-    while (sent < 5) {
-        ssize_t n = write(g_app_sock, hdr + sent, 5 - sent);
-        if (n <= 0) goto fail;
-        sent += n;
-    }
-    /* Send payload */
-    sent = 0;
-    while (sent < len) {
-        ssize_t n = write(g_app_sock, data + sent, len - sent);
-        if (n <= 0) goto fail;
-        sent += n;
-    }
-    return true;
 fail:
     close(g_app_sock);
     g_app_sock = -1;
     return false;
+}
+
+static bool app_send_msg(uint8_t type, const uint8_t *data, uint32_t len) {
+    if (g_app_send_lock)
+        dispatch_semaphore_wait(g_app_send_lock, DISPATCH_TIME_FOREVER);
+    bool success = false;
+    if (!app_ensure_connected()) goto done;
+    if (!app_write_msg_to_socket(g_app_sock, type, data, len)) goto fail;
+    success = true;
+    goto done;
+fail:
+    close(g_app_sock);
+    g_app_sock = -1;
+done:
+    if (g_app_send_lock) dispatch_semaphore_signal(g_app_send_lock);
+    return success;
+}
+
+static bool app_send_video_timing(void) {
+    uint8_t payload[14];
+    uint32_t len = build_video_timing_payload(payload);
+    return app_send_msg(MSG_VIDEO_TIMING, payload, len);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Wireless CarPlay audio
+ *
+ * Low-latency audio arrives as encrypted RTP/UDP. MainBuffered (type 103)
+ * instead uses a TCP byte stream containing 2-byte, big-endian, inclusive
+ * record lengths followed by encrypted RTP packets. The network service
+ * authenticates and decrypts packets, then forwards codec frames to Showcase;
+ * the app owns the system audio session and hardware codec.
+ * ═══════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    uint32_t type;
+    int dataFd;
+    int controlFd;
+    uint16_t dataPort;
+    uint16_t controlPort;
+    uint64_t connectionID;
+    uint64_t formatMask;
+    uint32_t framesPerPacket;
+    uint32_t latencyMs;
+    uint8_t key[32];
+    bool keyValid;
+    volatile int32_t running;
+    volatile uint64_t generation;
+    bool haveSequence;
+    uint16_t lastSequence;
+    uint64_t packetCount;
+    uint64_t decryptErrors;
+    uint64_t sequenceGaps;
+    uint64_t lastArrivalNanos;
+    uint64_t maxArrivalGapNanos;
+    uint64_t longArrivalGaps;
+    uint32_t lastRtpTimestamp;
+    uint64_t lastHostNTP;
+    int64_t renderedSampleTime;
+    uint64_t renderedHostNTP;
+    uint64_t renderedHostRawNanos;
+    uint64_t renderUpdateCount;
+    bool flushPending;
+    uint16_t flushUntilSequence;
+    uint32_t flushUntilTimestamp;
+    uint64_t flushDropCount;
+    bool usesTCP;
+} carplay_audio_stream_t;
+
+typedef struct {
+    carplay_audio_stream_t *stream;
+    uint64_t generation;
+    int dataFd;
+    uint16_t dataPort;
+    bool usesTCP;
+} carplay_audio_receiver_context_t;
+
+static pthread_mutex_t g_audio_feedback_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_audio_control_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static carplay_audio_stream_t g_audio_streams[4] = {
+    { .type = 100, .dataFd = -1, .controlFd = -1 },
+    { .type = 101, .dataFd = -1, .controlFd = -1 },
+    { .type = 102, .dataFd = -1, .controlFd = -1 },
+    { .type = 103, .dataFd = -1, .controlFd = -1 }   /* MainBufferedAudio */
+};
+
+static carplay_audio_stream_t *audio_stream_for_type(uint32_t type) {
+    for (size_t i = 0; i < sizeof(g_audio_streams) /
+                            sizeof(g_audio_streams[0]); i++) {
+        if (g_audio_streams[i].type == type) return &g_audio_streams[i];
+    }
+    return NULL;
+}
+
+static uint32_t audio_default_frames_per_packet(uint64_t formatMask) {
+    if (formatMask & 0x00008854ULL)
+        return 1; /* PCM */
+    if (formatMask == 0x00400000ULL || formatMask == 0x00800000ULL)
+        return 1024; /* AAC-LC */
+    if (formatMask == 0x10000000ULL) return 320; /* Opus 16 kHz, 20 ms */
+    if (formatMask == 0x20000000ULL) return 480; /* Opus 24 kHz, 20 ms */
+    if (formatMask == 0x40000000ULL) return 960; /* Opus 48 kHz, 20 ms */
+    return 512;      /* AAC-ELD */
+}
+
+static double audio_sample_rate(uint64_t formatMask) {
+    switch (formatMask) {
+        case 0x00000004ULL: return 8000.0;
+        case 0x00000010ULL: return 16000.0;
+        case 0x00000040ULL: return 24000.0;
+        case 0x00000800ULL:
+        case 0x00400000ULL:
+        case 0x01000000ULL: return 44100.0;
+        case 0x00008000ULL:
+        case 0x00800000ULL:
+        case 0x02000000ULL: return 48000.0;
+        case 0x04000000ULL: return 16000.0;
+        case 0x08000000ULL: return 24000.0;
+        case 0x10000000ULL: return 16000.0;
+        case 0x20000000ULL: return 24000.0;
+        case 0x40000000ULL: return 48000.0;
+        default: return 0.0;
+    }
+}
+
+static void app_send_audio_config(carplay_audio_stream_t *stream) {
+    uint8_t payload[20] = {0};
+    memcpy(payload, &stream->type, 4);
+    memcpy(payload + 4, &stream->formatMask, 8);
+    memcpy(payload + 12, &stream->framesPerPacket, 4);
+    memcpy(payload + 16, &stream->latencyMs, 4);
+    app_send_msg(MSG_AUDIO_CONFIG, payload, sizeof(payload));
+}
+
+static void app_send_audio_packet(carplay_audio_stream_t *stream,
+                                  uint16_t sequence, uint32_t timestamp,
+                                  const uint8_t *bytes, uint32_t length) {
+    uint32_t msgLength = 12 + length;
+    uint8_t *message = malloc(msgLength);
+    if (!message) return;
+    memset(message, 0, 12);
+    memcpy(message, &stream->type, 4);
+    memcpy(message + 4, &sequence, 2);
+    memcpy(message + 8, &timestamp, 4);
+    memcpy(message + 12, bytes, length);
+    app_send_msg(MSG_AUDIO_PACKET, message, msgLength);
+    free(message);
+}
+
+static void app_send_audio_control(uint32_t streamType, uint8_t action) {
+    uint8_t payload[5] = {0};
+    memcpy(payload, &streamType, 4);
+    payload[4] = action;
+    bool sent = app_send_msg(MSG_AUDIO_CONTROL, payload, sizeof(payload));
+    printf("[AUDIO] control stream=%u action=%u app=%s\n",
+           streamType, action, sent ? "sent" : "failed");
+}
+
+static void audio_process_rtp_packet(carplay_audio_stream_t *stream,
+                                     uint8_t *packet, size_t packetLength) {
+    if (!stream || !packet || packetLength < 12 + 24 ||
+        !stream->keyValid) return;
+
+    uint16_t sequenceNetwork = 0;
+    uint32_t timestampNetwork = 0;
+    memcpy(&sequenceNetwork, packet + 2, 2);
+    memcpy(&timestampNetwork, packet + 4, 4);
+    uint16_t sequence = ntohs(sequenceNetwork);
+    uint32_t timestamp = ntohl(timestampNetwork);
+    uint64_t arrivalNanos = monotonic_nanos_now();
+    uint64_t arrivalGapNanos = stream->lastArrivalNanos
+        ? arrivalNanos - stream->lastArrivalNanos : 0;
+    stream->lastArrivalNanos = arrivalNanos;
+    if (arrivalGapNanos > stream->maxArrivalGapNanos)
+        stream->maxArrivalGapNanos = arrivalGapNanos;
+    if (arrivalGapNanos >= 100 * NSEC_PER_MSEC) {
+        stream->longArrivalGaps++;
+        printf("[AUDIO] stream=%u arrival gap #%llu %.1fms seq=%u\n",
+               stream->type,
+               (unsigned long long)stream->longArrivalGaps,
+               (double)arrivalGapNanos / 1000000.0, sequence);
+    }
+
+    /*
+     * FLUSHBUFFERED names the first packet of the sender's new RTP epoch with
+     * an extended sequence number and timestamp. The RTP header carries only
+     * the low 16 sequence bits. Drop the old epoch until that boundary (or the
+     * first packet modularly after it) so it cannot refill the AudioQueue
+     * after the app has discarded its stale buffered media.
+     */
+    bool dropForFlush = false;
+    bool completedFlush = false;
+    uint64_t droppedForFlush = 0;
+    pthread_mutex_lock(&g_audio_control_lock);
+    if (stream->flushPending) {
+        int16_t relative =
+            (int16_t)(sequence - stream->flushUntilSequence);
+        if (relative < 0 && timestamp != stream->flushUntilTimestamp) {
+            stream->flushDropCount++;
+            droppedForFlush = stream->flushDropCount;
+            dropForFlush = true;
+        } else {
+            stream->flushPending = false;
+            completedFlush = true;
+            droppedForFlush = stream->flushDropCount;
+        }
+    }
+    pthread_mutex_unlock(&g_audio_control_lock);
+    if (dropForFlush) {
+        if (droppedForFlush <= 3 || (droppedForFlush % 100) == 0) {
+            printf("[AUDIO] stream=%u flush drop #%llu seq=%u ts=%u\n",
+                   stream->type, (unsigned long long)droppedForFlush,
+                   sequence, timestamp);
+        }
+        return;
+    }
+    if (completedFlush) {
+        printf("[AUDIO] stream=%u flush boundary reached seq=%u ts=%u "
+               "dropped=%llu\n",
+               stream->type, sequence, timestamp,
+               (unsigned long long)droppedForFlush);
+    }
+
+    uint8_t *encrypted = packet + 12;
+    size_t encryptedLength = packetLength - 12;
+    if (encryptedLength < 24) return;
+
+    size_t ciphertextLength = encryptedLength - 24;
+    uint8_t nonce[12] = {0};
+    memcpy(nonce + 4, encrypted + encryptedLength - 8, 8);
+    uint8_t *tag = encrypted + encryptedLength - 24;
+
+    /* Modern CarPlay audio authenticates RTP timestamp + SSRC, both in
+     * their network-order wire representation. */
+    crypto_aead_ctx crypto;
+    crypto_aead_init_ietf(&crypto, stream->key, nonce);
+    int result = crypto_aead_read(&crypto, encrypted, tag,
+                                  packet + 4, 8,
+                                  encrypted, ciphertextLength);
+    crypto_wipe(&crypto, sizeof(crypto));
+    if (result != 0) {
+        stream->decryptErrors++;
+        if (stream->decryptErrors <= 3 ||
+            (stream->decryptErrors % 100) == 0) {
+            printf("[AUDIO] stream=%u decrypt failure #%llu seq=%u\n",
+                   stream->type,
+                   (unsigned long long)stream->decryptErrors, sequence);
+        }
+        return;
+    }
+
+    if (stream->haveSequence &&
+        sequence != (uint16_t)(stream->lastSequence + 1)) {
+        stream->sequenceGaps++;
+        printf("[AUDIO] stream=%u RTP gap #%llu expected=%u got=%u\n",
+               stream->type,
+               (unsigned long long)stream->sequenceGaps,
+               (uint16_t)(stream->lastSequence + 1), sequence);
+    }
+    stream->lastSequence = sequence;
+    stream->haveSequence = true;
+    stream->packetCount++;
+    uint32_t hostSeconds = 0;
+    uint32_t hostFraction = 0;
+    get_ntp_time(&hostSeconds, &hostFraction);
+    stream->lastRtpTimestamp = timestamp;
+    stream->lastHostNTP =
+        ((uint64_t)hostSeconds << 32) | hostFraction;
+    app_send_audio_packet(stream, sequence, timestamp, encrypted,
+                          (uint32_t)ciphertextLength);
+    if (stream->packetCount <= 3 ||
+        (stream->packetCount % 500) == 0) {
+        printf("[AUDIO] stream=%u packet #%llu seq=%u ts=%u bytes=%zu\n",
+               stream->type, (unsigned long long)stream->packetCount,
+               sequence, timestamp, ciphertextLength);
+    }
+}
+
+static void audio_receiver_func(void *arg) {
+    carplay_audio_receiver_context_t *context = arg;
+    carplay_audio_stream_t *stream = context->stream;
+    uint64_t generation = context->generation;
+    int dataFd = context->dataFd;
+    uint8_t packet[65536];
+    printf("[AUDIO] stream=%u receiver started %s port=%u fd=%d "
+           "generation=%llu format=0x%llx framesPerPacket=%u key=%d\n",
+           stream->type, context->usesTCP ? "TCP" : "UDP",
+           context->dataPort, dataFd, (unsigned long long)generation,
+           (unsigned long long)stream->formatMask,
+           stream->framesPerPacket, stream->keyValid ? 1 : 0);
+    app_send_audio_config(stream);
+
+    if (context->usesTCP) {
+        int client = accept(dataFd, NULL, NULL);
+        if (client < 0) {
+            printf("[AUDIO] stream=%u TCP accept failed: %s\n",
+                   stream->type, strerror(errno));
+        } else {
+            int receiveBuffer = 2 * 1024 * 1024;
+            setsockopt(client, SOL_SOCKET, SO_RCVBUF,
+                       &receiveBuffer, sizeof(receiveBuffer));
+            printf("[AUDIO] stream=%u TCP sender connected fd=%d\n",
+                   stream->type, client);
+            while (stream->running &&
+                   stream->generation == generation) {
+                uint8_t lengthBytes[2];
+                if (!tcp_read_exact(client, lengthBytes,
+                                    sizeof(lengthBytes))) break;
+                uint16_t inclusiveLength =
+                    ((uint16_t)lengthBytes[0] << 8) | lengthBytes[1];
+                if (inclusiveLength < 2 + 12 + 24) {
+                    printf("[AUDIO] stream=%u invalid TCP record length=%u\n",
+                           stream->type, inclusiveLength);
+                    break;
+                }
+                size_t packetLength = (size_t)inclusiveLength - 2;
+                if (!tcp_read_exact(client, packet, packetLength)) break;
+                if (stream->generation != generation) break;
+                audio_process_rtp_packet(stream, packet, packetLength);
+            }
+            close(client);
+        }
+    } else {
+        while (stream->running &&
+               stream->generation == generation) {
+            ssize_t received = recvfrom(dataFd, packet,
+                                        sizeof(packet), 0, NULL, NULL);
+            if (received < 0) {
+                if (errno == EINTR || errno == EAGAIN ||
+                    errno == EWOULDBLOCK) continue;
+                printf("[AUDIO] stream=%u recv error: %s\n",
+                       stream->type, strerror(errno));
+                break;
+            }
+            if (stream->generation != generation) break;
+            audio_process_rtp_packet(stream, packet, (size_t)received);
+        }
+    }
+    if (stream->generation == generation)
+        __sync_bool_compare_and_swap(&stream->running, 1, 0);
+    printf("[AUDIO] stream=%u receiver stopped generation=%llu "
+           "packets=%llu gaps=%llu decryptErrors=%llu "
+           "arrivalGaps=%llu maxArrival=%.1fms\n",
+           stream->type, (unsigned long long)generation,
+           (unsigned long long)stream->packetCount,
+           (unsigned long long)stream->sequenceGaps,
+           (unsigned long long)stream->decryptErrors,
+           (unsigned long long)stream->longArrivalGaps,
+           (double)stream->maxArrivalGapNanos / 1000000.0);
+    free(context);
+}
+
+static void start_audio_receiver(carplay_audio_stream_t *stream) {
+    if (!stream || stream->dataFd < 0 ||
+        !__sync_bool_compare_and_swap(&stream->running, 0, 1)) return;
+    carplay_audio_receiver_context_t *context =
+        calloc(1, sizeof(*context));
+    if (!context) {
+        stream->running = 0;
+        return;
+    }
+    context->stream = stream;
+    context->generation = stream->generation;
+    context->dataFd = stream->dataFd;
+    context->dataPort = stream->dataPort;
+    context->usesTCP = stream->usesTCP;
+    if (!stream->usesTCP) {
+        int receiveBuffer = 512 * 1024;
+        setsockopt(stream->dataFd, SOL_SOCKET, SO_RCVBUF,
+                   &receiveBuffer, sizeof(receiveBuffer));
+        struct timeval timeout = { .tv_sec = 1, .tv_usec = 0 };
+        setsockopt(stream->dataFd, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout));
+    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0),
+                   ^{ audio_receiver_func(context); });
+}
+
+static void stop_audio_receiver(carplay_audio_stream_t *stream,
+                                const char *reason) {
+    if (!stream) return;
+    bool wasActive =
+        stream->running || stream->dataFd >= 0 || stream->controlFd >= 0 ||
+        stream->formatMask != 0;
+    if (!wasActive) return;
+
+    uint64_t oldGeneration = stream->generation;
+    __sync_add_and_fetch(&stream->generation, 1);
+    stream->running = 0;
+
+    int dataFd = stream->dataFd;
+    int controlFd = stream->controlFd;
+    stream->dataFd = -1;
+    stream->controlFd = -1;
+    stream->dataPort = 0;
+    stream->controlPort = 0;
+    if (dataFd >= 0) {
+        shutdown(dataFd, SHUT_RDWR);
+        close(dataFd);
+    }
+    if (controlFd >= 0 && controlFd != dataFd) {
+        shutdown(controlFd, SHUT_RDWR);
+        close(controlFd);
+    }
+
+    stream->formatMask = 0;
+    stream->keyValid = false;
+    stream->haveSequence = false;
+    pthread_mutex_lock(&g_audio_feedback_lock);
+    stream->renderedSampleTime = 0;
+    stream->renderedHostNTP = 0;
+    stream->renderedHostRawNanos = 0;
+    stream->renderUpdateCount = 0;
+    pthread_mutex_unlock(&g_audio_feedback_lock);
+    app_send_audio_control(stream->type, AUDIO_CONTROL_STOP);
+    printf("[AUDIO] stream=%u stopped generation=%llu reason=%s\n",
+           stream->type, (unsigned long long)oldGeneration,
+           reason ? reason : "unspecified");
 }
 
 /* ── Send a single-byte status update to the iPadPlay app (best-effort) ── */
@@ -1809,10 +3264,177 @@ static void app_send_status(uint8_t code) {
     app_send_msg(MSG_STATUS, &code, 1);
 }
 
+static bool h264_frame_contains_idr(const uint8_t *bytes, size_t length) {
+    size_t offset = 0;
+    while (offset + 5 <= length) {
+        uint32_t nalLength =
+            ((uint32_t)bytes[offset] << 24) |
+            ((uint32_t)bytes[offset + 1] << 16) |
+            ((uint32_t)bytes[offset + 2] << 8) |
+            (uint32_t)bytes[offset + 3];
+        if (nalLength == 0 || offset + 4 + nalLength > length) break;
+        if ((bytes[offset + 4] & 0x1f) == 5) return true;
+        offset += 4 + nalLength;
+    }
+    return false;
+}
+
+static bool app_send_video_frame(uint64_t timestamp, bool isIDR,
+                                 const uint8_t *bytes, uint32_t length,
+                                 uint32_t serviceSequence,
+                                 uint64_t serviceArrivalNanos,
+                                 uint32_t arrivalGapMicros,
+                                 uint32_t tcpPendingBytes,
+                                 uint32_t tcpReceiveWindow,
+                                 uint32_t tcpSmoothedRTT,
+                                 uint32_t tcpCurrentRTT,
+                                 uint32_t tcpFlags,
+                                 uint32_t decryptMicros) {
+    uint32_t messageLength = VIDEO_FRAME_METADATA_SIZE + length;
+    uint8_t header[5] = {
+        messageLength & 0xff, (messageLength >> 8) & 0xff,
+        (messageLength >> 16) & 0xff, (messageLength >> 24) & 0xff,
+        MSG_VIDEO_FRAME
+    };
+    uint8_t metadata[VIDEO_FRAME_METADATA_SIZE] = {0};
+    memcpy(metadata, &timestamp, sizeof(timestamp));
+    metadata[8] = isIDR ? 1 : 0;
+    metadata[9] = 1; /* metadata layout version */
+    memcpy(metadata + 12, &serviceSequence, sizeof(serviceSequence));
+    memcpy(metadata + 16, &serviceArrivalNanos,
+           sizeof(serviceArrivalNanos));
+    memcpy(metadata + 24, &arrivalGapMicros, sizeof(arrivalGapMicros));
+    memcpy(metadata + 28, &tcpPendingBytes, sizeof(tcpPendingBytes));
+    memcpy(metadata + 32, &tcpReceiveWindow, sizeof(tcpReceiveWindow));
+    memcpy(metadata + 36, &tcpSmoothedRTT, sizeof(tcpSmoothedRTT));
+    memcpy(metadata + 40, &tcpCurrentRTT, sizeof(tcpCurrentRTT));
+    memcpy(metadata + 44, &tcpFlags, sizeof(tcpFlags));
+    memcpy(metadata + 48, &decryptMicros, sizeof(decryptMicros));
+
+    uint64_t lockStarted = monotonic_nanos_now();
+    if (g_app_send_lock)
+        dispatch_semaphore_wait(g_app_send_lock, DISPATCH_TIME_FOREVER);
+    uint64_t lockAcquired = monotonic_nanos_now();
+    bool success = false;
+    if (!app_ensure_connected()) goto done;
+    success = app_write_all(g_app_sock, header, sizeof(header)) &&
+              app_write_all(g_app_sock, metadata, sizeof(metadata)) &&
+              app_write_all(g_app_sock, bytes, length);
+    if (!success) {
+        close(g_app_sock);
+        g_app_sock = -1;
+    }
+done:
+    ;
+    uint64_t writeFinished = monotonic_nanos_now();
+    double lockWaitMs = (double)(lockAcquired - lockStarted) / 1000000.0;
+    double ipcHoldMs = (double)(writeFinished - lockAcquired) / 1000000.0;
+    if (!success || arrivalGapMicros > 50000 ||
+        serviceSequence % 300 == 0 || lockWaitMs > 5.0 ||
+        ipcHoldMs > 5.0) {
+        printf("[SCREEN-TL] seq=%u arrival=%llu gap=%.1fms bytes=%u "
+               "decrypt=%.2fms pending=%u rcvWnd=%u srtt=%ums rtt=%ums "
+               "tcpFlags=0x%x ipcWait=%.2fms ipcHold=%.2fms sent=%d\n",
+               serviceSequence,
+               (unsigned long long)serviceArrivalNanos,
+               (double)arrivalGapMicros / 1000.0, length,
+               (double)decryptMicros / 1000.0, tcpPendingBytes,
+               tcpReceiveWindow, tcpSmoothedRTT, tcpCurrentRTT, tcpFlags,
+               lockWaitMs, ipcHoldMs, success ? 1 : 0);
+    }
+    if (g_app_send_lock) dispatch_semaphore_signal(g_app_send_lock);
+    return success;
+}
+
 /* ── HID report sender — sends touch events to iPhone via event channel ── */
 #define MSG_TOUCH 0x03
 static int g_event_cmd_cseq = 10;
-static dispatch_semaphore_t g_event_send_lock = NULL;
+static dispatch_queue_t g_hid_send_queue = NULL;
+
+static void send_event_command(NSDictionary *cmd, const char *name,
+                               const char *reason) {
+    if (g_event_client_fd < 0 || !g_event_enc.active) {
+        printf("[EVENT-CMD] %s unavailable (%s): fd=%d enc=%d\n",
+               name, reason ?: "unspecified", g_event_client_fd,
+               g_event_enc.active);
+        return;
+    }
+    @autoreleasepool {
+        NSData *plist = [NSPropertyListSerialization
+            dataWithPropertyList:cmd
+                          format:NSPropertyListBinaryFormat_v1_0
+                         options:0
+                           error:nil];
+        if (!plist) return;
+        NSMutableString *header = [NSMutableString string];
+        [header appendString:@"POST /command RTSP/1.0\r\n"];
+        [header appendFormat:@"Content-Length: %lu\r\n",
+                             (unsigned long)plist.length];
+        [header appendString:
+            @"Content-Type: application/x-apple-binary-plist\r\n"];
+        int commandSequence = __sync_fetch_and_add(&g_event_cmd_cseq, 1);
+        [header appendFormat:@"CSeq: %d\r\n", commandSequence];
+        [header appendFormat:@"User-Agent: AirPlay/%s\r\n", SOURCE_VERSION];
+        [header appendString:@"\r\n"];
+        NSMutableData *message =
+            [NSMutableData dataWithBytes:header.UTF8String
+                                  length:strlen(header.UTF8String)];
+        [message appendData:plist];
+
+        if (g_event_send_lock)
+            dispatch_semaphore_wait(g_event_send_lock, DISPATCH_TIME_FOREVER);
+        int result = enc_send_frame(g_event_client_fd, &g_event_enc,
+                                    message.bytes, message.length);
+        if (g_event_send_lock) dispatch_semaphore_signal(g_event_send_lock);
+        printf("[EVENT-CMD] %s %s (%s, nonce=%llu)\n",
+               name,
+               result == 0 ? "sent" : "failed", reason ?: "unspecified",
+               g_event_enc.writeNonce ? g_event_enc.writeNonce - 1 : 0);
+    }
+}
+
+static void send_request_ui_command(const char *reason) {
+    @autoreleasepool {
+        send_event_command(@{ @"type": @"requestUI" }, "requestUI", reason);
+    }
+}
+
+static void send_force_key_frame_command(const char *reason) {
+    @autoreleasepool {
+        send_event_command(@{ @"type": @"forceKeyFrame" },
+                           "forceKeyFrame", reason);
+    }
+}
+
+/* When Showcase leaves the foreground, its own UI becomes the active native
+ * display. Tell the iPhone's CarPlay resource manager that the accessory is
+ * taking MainScreen. requestUI returns the screen to CarPlay later and causes
+ * a fresh screen stream/config/keyframe instead of trying to reconstruct an
+ * arbitrarily long H.264 dependency chain. */
+static void send_take_main_screen_command(const char *reason) {
+    @autoreleasepool {
+        NSDictionary *resource = @{
+            @"resourceID": @(1),        /* MainScreen */
+            @"transferType": @(1),      /* Take */
+            @"transferPriority": @(500),/* UserInitiated */
+            @"takeConstraint": @(100),  /* Anytime */
+            @"borrowConstraint": @(100) /* Anytime */
+        };
+        NSDictionary *cmd = @{
+            @"type": @"changeModes",
+            @"params": @{ @"resources": @[resource] }
+        };
+        send_event_command(cmd, "changeModes(MainScreen=Take)", reason);
+    }
+}
+
+#define HID_CONGESTED_MAX_PENDING 3
+#define HID_HEALTHY_BURST_MAX_PENDING 12
+#define HID_SEND_STALL_NANOS (50ULL * NSEC_PER_MSEC)
+static volatile int32_t g_hid_pending_moves = 0;
+static volatile int64_t g_hid_dropped_moves = 0;
+static volatile uint64_t g_hid_oldest_pending_nanos = 0;
+static volatile uint64_t g_hid_slow_send_count = 0;
 
 static void send_hid_report(const uint8_t *report, size_t reportLen) {
     if (g_event_client_fd < 0 || !g_event_enc.active) return;
@@ -1835,17 +3457,102 @@ static void send_hid_report(const uint8_t *report, size_t reportLen) {
         [hdrStr appendString:@"POST /command RTSP/1.0\r\n"];
         [hdrStr appendFormat:@"Content-Length: %lu\r\n", (unsigned long)plist.length];
         [hdrStr appendString:@"Content-Type: application/x-apple-binary-plist\r\n"];
-        [hdrStr appendFormat:@"CSeq: %d\r\n", g_event_cmd_cseq++];
+        int commandSequence = __sync_fetch_and_add(&g_event_cmd_cseq, 1);
+        [hdrStr appendFormat:@"CSeq: %d\r\n", commandSequence];
         [hdrStr appendString:@"\r\n"];
 
         NSMutableData *msg = [NSMutableData dataWithBytes:hdrStr.UTF8String
                                                    length:strlen(hdrStr.UTF8String)];
         [msg appendData:plist];
 
-        if (g_event_send_lock) dispatch_semaphore_wait(g_event_send_lock, DISPATCH_TIME_FOREVER);
-        enc_send_frame(g_event_client_fd, &g_event_enc, msg.bytes, msg.length);
+        uint64_t startedNanos = monotonic_nanos_now();
+        if (g_event_send_lock)
+            dispatch_semaphore_wait(
+                g_event_send_lock, DISPATCH_TIME_FOREVER);
+        uint64_t lockAcquiredNanos = monotonic_nanos_now();
+        int result = enc_send_frame(
+            g_event_client_fd, &g_event_enc, msg.bytes, msg.length);
         if (g_event_send_lock) dispatch_semaphore_signal(g_event_send_lock);
+        uint64_t completedNanos = monotonic_nanos_now();
+        uint64_t totalNanos = completedNanos - startedNanos;
+        if (result != 0 || totalNanos >= 20 * NSEC_PER_MSEC) {
+            uint64_t slowCount =
+                __sync_add_and_fetch(&g_hid_slow_send_count, 1);
+            if (slowCount <= 10 || (slowCount % 50) == 0) {
+                printf("[TOUCH-WIRE] #%llu result=%d total=%.2fms "
+                       "lock=%.2fms write=%.2fms pending=%d shed=%lld\n",
+                       (unsigned long long)slowCount, result,
+                       (double)totalNanos / 1000000.0,
+                       (double)(lockAcquiredNanos - startedNanos) /
+                           1000000.0,
+                       (double)(completedNanos - lockAcquiredNanos) /
+                           1000000.0,
+                       (int)g_hid_pending_moves,
+                       (long long)g_hid_dropped_moves);
+            }
+        }
     }
+}
+
+/* Down and up are never shed. UIKit may deliver several coalesced samples in
+ * one IPC message, so queue depth by itself is not congestion: the previous
+ * three-report admission cap discarded the end of healthy short swipes before
+ * the event queue had a chance to run. Permit a bounded coalesced burst and
+ * shed interior points only when the oldest queued write has made no progress
+ * for 50 ms. */
+static bool queue_touch_report(uint8_t phase, uint16_t x, uint16_t y,
+                               uint8_t contact, uint64_t timestampNs) {
+    if (!g_hid_send_queue) return false;
+    /* Preserve the complete path. CarPlay derives gesture velocity from the
+     * intermediate reports, so replacing moves with the newest point creates
+     * sluggish or intermittently missed swipes even on a healthy transport.
+     *
+     * The event socket is blocking, so when the radio congests, enc_send_frame
+     * stalls and moves pile up behind it. Releasing that backlog delivers a
+     * dozen points to the iPhone within a few milliseconds; CarPlay times
+     * touches on arrival, reads that as an enormous velocity, and flings the
+     * map. Bounding the queue keeps the path intact while the transport is
+     * healthy — the overwhelmingly common case — and sheds interior points only
+     * while it is behind, which is exactly when a stale point is worthless. */
+    bool isMove = (phase == 1);
+    if (isMove) {
+        uint64_t nowNanos = monotonic_nanos_now();
+        int32_t pending = g_hid_pending_moves;
+        uint64_t oldestNanos = g_hid_oldest_pending_nanos;
+        bool sendStalled =
+            pending >= HID_CONGESTED_MAX_PENDING &&
+            oldestNanos != 0 &&
+            nowNanos - oldestNanos >= HID_SEND_STALL_NANOS;
+        if (pending >= HID_HEALTHY_BURST_MAX_PENDING || sendStalled) {
+            __sync_fetch_and_add(&g_hid_dropped_moves, 1);
+            return false;
+        }
+        int32_t newPending =
+            __sync_add_and_fetch(&g_hid_pending_moves, 1);
+        if (newPending == 1)
+            __sync_lock_test_and_set(
+                &g_hid_oldest_pending_nanos, nowNanos);
+    }
+    dispatch_async(g_hid_send_queue, ^{
+        uint8_t report[5] = {
+            phase == 3 ? 2 : (phase == 2 ? 0 : 1),
+            (uint8_t)(x & 0xff),
+            (uint8_t)(x >> 8),
+            (uint8_t)(y & 0xff),
+            (uint8_t)(y >> 8)
+        };
+        send_hid_report(report, sizeof(report));
+        if (isMove) {
+            int32_t remaining =
+                __sync_sub_and_fetch(&g_hid_pending_moves, 1);
+            __sync_lock_test_and_set(
+                &g_hid_oldest_pending_nanos,
+                remaining > 0 ? monotonic_nanos_now() : 0);
+        }
+        (void)contact;
+        (void)timestampNs;
+    });
+    return true;
 }
 
 /* ── Touch reader thread — reads touch events from iPadPlay app via IPC ── */
@@ -1857,6 +3564,15 @@ static void touch_reader_func(void *arg) {
     fflush(stdout);
 
     int touchCount = 0;
+    uint64_t gestureCount = 0;
+    uint64_t gestureStartSample = 0;
+    uint64_t gestureStartHost = 0;
+    uint16_t gestureStartX = 0, gestureStartY = 0;
+    uint16_t gestureLastX = 0, gestureLastY = 0;
+    double gesturePath = 0;
+    uint32_t gestureMoves = 0;
+    uint32_t gestureQueuedMoves = 0;
+    int64_t gestureShedStart = 0;
 
     while (1) {
         /* Read IPC header: [4 byte len LE][1 byte type] */
@@ -1866,32 +3582,142 @@ static void touch_reader_func(void *arg) {
         uint32_t len = hdr[0] | (hdr[1]<<8) | (hdr[2]<<16) | (hdr[3]<<24);
         uint8_t type = hdr[4];
 
-        if (type == MSG_TOUCH && len == 5) {
-            uint8_t payload[5];
-            if (!tcp_read_exact(fd, payload, 5)) break;
+        if (type == MSG_TOUCH && len > 0) {
+            uint8_t *payload = malloc(len);
+            if (!payload || !tcp_read_exact(fd, payload, len)) {
+                free(payload);
+                break;
+            }
 
-            uint8_t phase = payload[0];
-            uint16_t x = payload[1] | (payload[2] << 8);
-            uint16_t y = payload[3] | (payload[4] << 8);
+            if (len == 5) {
+                /* Accept Beta 2 clients during package transition. */
+                uint8_t phase = payload[0];
+                uint16_t x = payload[1] | (payload[2] << 8);
+                uint16_t y = payload[3] | (payload[4] << 8);
+                queue_touch_report(phase, x, y, 0, 0);
+                touchCount++;
+            } else if ((len % 14) == 0) {
+                for (uint32_t offset = 0; offset < len; offset += 14) {
+                    uint8_t phase = payload[offset];
+                    uint8_t contact = payload[offset + 1];
+                    uint16_t x = payload[offset + 2] |
+                                 (payload[offset + 3] << 8);
+                    uint16_t y = payload[offset + 4] |
+                                 (payload[offset + 5] << 8);
+                    uint64_t timestampNs = 0;
+                    memcpy(&timestampNs, payload + offset + 6,
+                           sizeof(timestampNs));
+                    uint64_t touchHostNanos = monotonic_nanos_now();
+                    g_last_touch_nanos = touchHostNanos;
+                    if (phase == 0) {
+                        gestureCount++;
+                        gestureStartSample = timestampNs;
+                        gestureStartHost = touchHostNanos;
+                        gestureStartX = gestureLastX = x;
+                        gestureStartY = gestureLastY = y;
+                        gesturePath = 0;
+                        gestureMoves = 0;
+                        gestureQueuedMoves = 0;
+                        gestureShedStart = g_hid_dropped_moves;
+                    } else if (phase == 1) {
+                        double dx = (double)x - gestureLastX;
+                        double dy = (double)y - gestureLastY;
+                        gesturePath += hypot(dx, dy);
+                        gestureLastX = x;
+                        gestureLastY = y;
+                        gestureMoves++;
+                    }
+                    bool queued = queue_touch_report(
+                        phase, x, y, contact, timestampNs);
+                    if (phase == 1 && queued) gestureQueuedMoves++;
+                    touchCount++;
+                    if (touchCount <= 3 || touchCount % 100 == 0) {
+                        printf("[TOUCH] #%d: phase=%d contact=%u x=%u y=%u "
+                               "sample=%llu → HID btn=%d pending=%d shed=%lld\n",
+                               touchCount, phase, contact, x, y,
+                               (unsigned long long)timestampNs,
+                               phase == 2 ? 0 : 1,
+                               (int)g_hid_pending_moves,
+                               (long long)g_hid_dropped_moves);
+                    }
+                    if (phase == 2 || phase == 3) {
+                        double dx = (double)x - gestureStartX;
+                        double dy = (double)y - gestureStartY;
+                        double displacement = hypot(dx, dy);
+                        double durationMs =
+                            timestampNs >= gestureStartSample &&
+                            gestureStartSample != 0
+                                ? (double)(timestampNs -
+                                    gestureStartSample) / 1000000.0
+                                : (double)(touchHostNanos -
+                                    gestureStartHost) / 1000000.0;
+                        int64_t shed =
+                            g_hid_dropped_moves - gestureShedStart;
+                        printf("[TOUCH-GESTURE] #%llu phase=%u "
+                               "duration=%.1fms moves=%u queued=%u "
+                               "shed=%lld displacement=%.1f path=%.1f "
+                               "end=(%u,%u)\n",
+                               (unsigned long long)gestureCount, phase,
+                               durationMs, gestureMoves,
+                               gestureQueuedMoves, (long long)shed,
+                               displacement, gesturePath, x, y);
+                    }
+                }
+            } else {
+                printf("[TOUCH] ignored malformed payload len=%u\n", len);
+            }
+            free(payload);
+            fflush(stdout);
+        } else if (type == MSG_APP_VISIBILITY && len == 1) {
+            uint8_t visible = 0;
+            if (!tcp_read_exact(fd, &visible, 1)) break;
+            g_app_video_enabled = visible != 0;
+            printf("[SCREEN] Showcase is %s; video forwarding %s\n",
+                   g_app_video_enabled ? "foreground" : "background",
+                   g_app_video_enabled ? "resumed" : "paused");
+            if (g_app_video_enabled) {
+                send_request_ui_command("foreground resync");
+            } else {
+                send_take_main_screen_command("Showcase backgrounded");
+            }
+        } else if (type == MSG_VIDEO_RESYNC && len == 1) {
+            uint8_t requested = 0;
+            if (!tcp_read_exact(fd, &requested, 1)) break;
+            if (requested) {
+                printf("[SCREEN] Renderer requested a fresh screen stream\n");
+                send_force_key_frame_command("decoder/stale-chain recovery");
+            }
+        } else if (type == MSG_AUDIO_RENDER && len == 20) {
+            uint8_t payload[20];
+            if (!tcp_read_exact(fd, payload, sizeof(payload))) break;
+            uint32_t streamType = 0;
+            int64_t sampleTime = 0;
+            uint64_t hostTicks = 0;
+            memcpy(&streamType, payload, 4);
+            memcpy(&sampleTime, payload + 4, 8);
+            memcpy(&hostTicks, payload + 12, 8);
 
-            /* Map phase to HID button state */
-            uint8_t buttons = (phase == 2) ? 0 : 1;  /* 0=down, 1=move → pressed; 2=up → released */
-
-            /* Build HID report: [buttons][xLo][xHi][yLo][yHi] */
-            uint8_t report[5];
-            report[0] = buttons;
-            report[1] = x & 0xFF;
-            report[2] = x >> 8;
-            report[3] = y & 0xFF;
-            report[4] = y >> 8;
-
-            send_hid_report(report, 5);
-
-            touchCount++;
-            if (touchCount <= 3 || touchCount % 100 == 0) {
-                printf("[TOUCH] #%d: phase=%d x=%u y=%u → HID btn=%d\n",
-                       touchCount, phase, x, y, buttons);
-                fflush(stdout);
+            carplay_audio_stream_t *audio =
+                audio_stream_for_type(streamType);
+            if (audio) {
+                uint64_t rawNanos = 0;
+                uint64_t hostNTP =
+                    synchronized_ntp_for_host_ticks(hostTicks, &rawNanos);
+                pthread_mutex_lock(&g_audio_feedback_lock);
+                audio->renderedSampleTime = sampleTime;
+                audio->renderedHostNTP = hostNTP;
+                audio->renderedHostRawNanos = rawNanos;
+                audio->renderUpdateCount++;
+                uint64_t updateCount = audio->renderUpdateCount;
+                pthread_mutex_unlock(&g_audio_feedback_lock);
+                if (updateCount <= 3 || (updateCount % 20) == 0) {
+                    printf("[AUDIO] render stream=%u update=%llu "
+                           "sample=%lld hostNTP=%llu rawNs=%llu\n",
+                           streamType, (unsigned long long)updateCount,
+                           (long long)sampleTime,
+                           (unsigned long long)hostNTP,
+                           (unsigned long long)rawNanos);
+                }
             }
         } else {
             /* Skip unknown message type — read and discard payload */
@@ -1919,20 +3745,26 @@ static void start_touch_reader(int fd) {
 
 static void *screen_thread_func(void *arg) {
     (void)arg;
+    int listenFd = g_screen_listen_fd;
     printf("[SCREEN] Waiting for iPhone to connect on port %u (fd=%d)...\n",
-           g_screen_data_port, g_screen_listen_fd);
+           g_screen_data_port, listenFd);
     fflush(stdout);
 
     struct sockaddr_storage peer;
     socklen_t peerLen = sizeof(peer);
-    int clientFd = accept(g_screen_listen_fd, (struct sockaddr *)&peer, &peerLen);
+    int clientFd = accept(listenFd, (struct sockaddr *)&peer, &peerLen);
     if (clientFd < 0) {
         printf("[SCREEN] ERROR: accept failed: %s\n", strerror(errno));
         fflush(stdout);
+        close(listenFd);
+        if (g_screen_listen_fd == listenFd)
+            g_screen_listen_fd = -1;
+        __sync_lock_release(&g_screen_thread_running);
         return NULL;
     }
-    close(g_screen_listen_fd);
-    g_screen_listen_fd = -1;
+    close(listenFd);
+    if (g_screen_listen_fd == listenFd)
+        g_screen_listen_fd = -1;
 
     char peerIP[NI_MAXHOST] = {0};
     char peerPort[NI_MAXSERV] = {0};
@@ -1940,9 +3772,29 @@ static void *screen_thread_func(void *arg) {
                         peerIP, sizeof(peerIP), peerPort, sizeof(peerPort));
     printf("[SCREEN] *** Connected from %s:%s family=%s ***\n",
            peerIP, peerPort, addr_family_name(peer.ss_family));
+    set_screen_socket_qos(clientFd, "accepted");
 
-    int rcvBuf = 512 * 1024;
-    setsockopt(clientFd, SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(rcvBuf));
+    /*
+     * The iPhone encoder emits short bursts far above its average bitrate.
+     * A shallow fixed window works on fast PCIe radios, but on older HSIC
+     * receivers it propagates temporary radio loss back to the sender, where
+     * the screen sink starts discarding frames. The app selects this window
+     * from the runtime WLAN transport rather than jailbreak layout or a device
+     * model table.
+     */
+    int requestedRcvBuf = g_screen_receive_buffer;
+    int rcvBuf = requestedRcvBuf;
+    if (setsockopt(clientFd, SOL_SOCKET, SO_RCVBUF,
+                   &requestedRcvBuf, sizeof(requestedRcvBuf)) != 0) {
+        printf("[SCREEN] WARN: SO_RCVBUF request %d failed: %s\n",
+               requestedRcvBuf, strerror(errno));
+    }
+    socklen_t rcvBufLength = sizeof(rcvBuf);
+    if (getsockopt(clientFd, SOL_SOCKET, SO_RCVBUF,
+                   &rcvBuf, &rcvBufLength) == 0) {
+        printf("[SCREEN] TCP receive buffer: requested=%d actual=%d bytes\n",
+               requestedRcvBuf, rcvBuf);
+    }
 
     printf("[SCREEN] Key valid=%d, connID=%llu\n", g_screen_key_valid, g_screen_conn_id);
     fflush(stdout);
@@ -1955,10 +3807,18 @@ static void *screen_thread_func(void *arg) {
     int videoFrameCount = 0;
     uint64_t totalBytes = 0;
     int msgCount = 0;
+    double arrivalWindowStart = 0;
+    double lastFrameArrival = 0;
+    double maxFrameGap = 0;
+    uint64_t arrivalWindowBytes = 0;
+    unsigned int arrivalWindowFrames = 0;
+    unsigned int gapsOver50ms = 0;
+    unsigned int gapsOver100ms = 0;
+    double lastStatsLogSeconds = 0;
 
     while (1) {
         /* Read 128-byte header */
-        if (!tcp_read_exact(clientFd, header, 128)) {
+        if (!screen_read_exact(clientFd, header, 128, "header")) {
             printf("[SCREEN] Connection closed (header read)\n");
             break;
         }
@@ -1972,12 +3832,13 @@ static void *screen_thread_func(void *arg) {
                 bodyAlloc = bodySize + 4096;
                 body = realloc(body, bodyAlloc);
             }
-            if (!tcp_read_exact(clientFd, body, bodySize)) {
+            if (!screen_read_exact(clientFd, body, bodySize, "body")) {
                 printf("[SCREEN] Connection closed (body read, expected %u)\n", bodySize);
                 break;
             }
         }
 
+        uint64_t messageArrivalNanos = monotonic_nanos_now();
         totalBytes += 128 + bodySize;
         msgCount++;
 
@@ -1985,8 +3846,21 @@ static void *screen_thread_func(void *arg) {
             case 1: { /* VideoConfig — SPS/PPS (AVCC), display dimensions */
                 float width = *(float *)(header + 8 + 8);   /* params[1].f32[0] */
                 float height = *(float *)(header + 8 + 12);  /* params[1].f32[1] */
-                printf("[SCREEN] VideoConfig: %.0fx%.0f, AVCC=%u bytes\n",
-                       width, height, bodySize);
+
+                /* smallParam[1] carries the screen flags. Bit 1 is
+                 * RespectTimestamps, bit 2 Encrypted — the latter is a useful
+                 * cross-check because this stream is in fact encrypted. */
+                uint8_t screenFlags = header[6];
+                g_screen_respect_timestamps = (screenFlags & 0x02) ? 1 : 0;
+                printf("[SCREEN] VideoConfig: %.0fx%.0f, AVCC=%u bytes, "
+                       "flags=0x%02x (respectTimestamps=%u encrypted=%u)\n",
+                       width, height, bodySize, screenFlags,
+                       g_screen_respect_timestamps,
+                       (screenFlags & 0x04) ? 1u : 0u);
+
+                /* The renderer must learn the contract before the first frame
+                 * that depends on it. */
+                app_send_video_timing();
 
                 /* Send config to iPadPlay app: [float width][float height][AVCC] */
                 uint32_t msgLen = 8 + bodySize;
@@ -1994,6 +3868,19 @@ static void *screen_thread_func(void *arg) {
                 memcpy(msg, &width, 4);
                 memcpy(msg + 4, &height, 4);
                 memcpy(msg + 8, body, bodySize);
+                if (g_video_config_lock)
+                    dispatch_semaphore_wait(g_video_config_lock,
+                                            DISPATCH_TIME_FOREVER);
+                free(g_latest_video_config);
+                g_latest_video_config = malloc(msgLen);
+                if (g_latest_video_config) {
+                    memcpy(g_latest_video_config, msg, msgLen);
+                    g_latest_video_config_length = msgLen;
+                } else {
+                    g_latest_video_config_length = 0;
+                }
+                if (g_video_config_lock)
+                    dispatch_semaphore_signal(g_video_config_lock);
                 bool sent = app_send_msg(MSG_VIDEO_CONFIG, msg, msgLen);
                 free(msg);
                 printf("[SCREEN] VideoConfig → app: %s\n", sent ? "OK" : "not connected");
@@ -2021,27 +3908,17 @@ static void *screen_thread_func(void *arg) {
 
                 uint32_t ctLen = bodySize - 16;  /* last 16 = poly1305 tag */
 
-                EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-                EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL);
-                EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL);
-                EVP_DecryptInit_ex(ctx, NULL, NULL, g_screen_key, ietfNonce);
-
-                /* AAD = 128-byte header */
-                int outLen = 0;
-                EVP_DecryptUpdate(ctx, NULL, &outLen, header, 128);
-
-                /* Decrypt ciphertext in-place */
-                EVP_DecryptUpdate(ctx, body, &outLen, body, ctLen);
-
-                /* Set expected tag */
-                EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, body + ctLen);
-
-                int authOK = EVP_DecryptFinal_ex(ctx, body + outLen, &outLen);
-                EVP_CIPHER_CTX_free(ctx);
+                crypto_aead_ctx ctx;
+                crypto_aead_init_ietf(&ctx, g_screen_key, ietfNonce);
+                int authResult = crypto_aead_read(
+                    &ctx, body, body + ctLen, header, sizeof(header),
+                    body, ctLen);
+                crypto_wipe(&ctx, sizeof(ctx));
+                int authOK = authResult == 0;
 
                 if (videoFrameCount <= 3) {
                     printf("[SCREEN] VideoFrame #%d: %u bytes ct, decrypt=%s, nonce=%llu\n",
-                           videoFrameCount, ctLen, authOK > 0 ? "OK" : "FAIL", chachaNonce);
+                           videoFrameCount, ctLen, authOK ? "OK" : "FAIL", chachaNonce);
                     if (ctLen >= 8) {
                         printf("[SCREEN] Decrypted hex: ");
                         int dl = ctLen > 32 ? 32 : ctLen;
@@ -2053,14 +3930,139 @@ static void *screen_thread_func(void *arg) {
 
                 chachaNonce++;
 
-                if (authOK <= 0) break;
+                if (!authOK) break;
 
-                /* Send decrypted frame to iPadPlay app */
-                app_send_msg(MSG_VIDEO_FRAME, body, ctLen);
+                uint64_t decryptDoneNanos = monotonic_nanos_now();
+                uint64_t decryptNanos = decryptDoneNanos -
+                    messageArrivalNanos;
+                uint32_t decryptMicros = decryptNanos / 1000ULL > UINT32_MAX
+                    ? UINT32_MAX : (uint32_t)(decryptNanos / 1000ULL);
+                double arrivalSeconds =
+                    (double)messageArrivalNanos / 1000000000.0;
+                uint32_t arrivalGapMicros = 0;
+                if (arrivalWindowStart == 0)
+                    arrivalWindowStart = arrivalSeconds;
+                if (lastFrameArrival > 0) {
+                    double gap = arrivalSeconds - lastFrameArrival;
+                    double gapMicros = gap * 1000000.0;
+                    if (gapMicros > (double)UINT32_MAX)
+                        arrivalGapMicros = UINT32_MAX;
+                    else if (gapMicros > 0)
+                        arrivalGapMicros = (uint32_t)gapMicros;
+                    if (gap > maxFrameGap) maxFrameGap = gap;
+                    if (gap > 0.050) gapsOver50ms++;
+                    if (gap > 0.100) gapsOver100ms++;
+                }
+                lastFrameArrival = arrivalSeconds;
+                arrivalWindowFrames++;
+                arrivalWindowBytes += ctLen;
+
+                /* packet[5] bit 0x10 marks an IDR frame in the AirPlay screen
+                 * protocol. params[0] is the sender's 32.32 fixed-point
+                 * presentation time on the session timeline; the renderer maps
+                 * it into host time and schedules the frame there whenever
+                 * RespectTimestamps is set. */
+                uint64_t ntpTimestamp = 0;
+                memcpy(&ntpTimestamp, header + 8, sizeof(ntpTimestamp));
+                bool isIDR = (header[5] & 0x10) != 0 ||
+                    h264_frame_contains_idr(body, ctLen);
+                if (g_app_video_enabled) {
+                    int pendingBytes = 0;
+                    if (ioctl(clientFd, FIONREAD, &pendingBytes) != 0 ||
+                        pendingBytes < 0)
+                        pendingBytes = 0;
+
+                    uint32_t receiveWindow = 0;
+                    uint32_t smoothedRTT = 0;
+                    uint32_t currentRTT = 0;
+                    uint32_t tcpFlags = 0;
+#ifdef TCP_CONNECTION_INFO
+                    if (arrivalGapMicros > 50000 ||
+                        videoFrameCount % 300 == 0) {
+                        struct tcp_connection_info tcpInfo;
+                        memset(&tcpInfo, 0, sizeof(tcpInfo));
+                        socklen_t tcpInfoLength = sizeof(tcpInfo);
+                        if (getsockopt(clientFd, IPPROTO_TCP,
+                                       TCP_CONNECTION_INFO, &tcpInfo,
+                                       &tcpInfoLength) == 0) {
+                            receiveWindow = tcpInfo.tcpi_rcv_wnd;
+                            smoothedRTT = tcpInfo.tcpi_srtt;
+                            currentRTT = tcpInfo.tcpi_rttcur;
+                            tcpFlags = tcpInfo.tcpi_flags;
+                        }
+                    }
+#endif
+                    app_send_video_frame(
+                        ntpTimestamp, isIDR, body, ctLen,
+                        (uint32_t)videoFrameCount, messageArrivalNanos,
+                        arrivalGapMicros, (uint32_t)pendingBytes,
+                        receiveWindow, smoothedRTT, currentRTT, tcpFlags,
+                        decryptMicros);
+                }
+
+                double windowDuration = arrivalSeconds - arrivalWindowStart;
+                if (windowDuration >= 5.0) {
+                    double fps = arrivalWindowFrames / windowDuration;
+                    double mbps = (arrivalWindowBytes * 8.0) /
+                        (windowDuration * 1000000.0);
+                    printf("[SCREEN] Live arrival: %.1f fps %.2f Mbps, "
+                           "max gap %.1fms (>50=%u >100=%u), forwarding=%d\n",
+                           fps, mbps, maxFrameGap * 1000.0,
+                           gapsOver50ms, gapsOver100ms,
+                           g_app_video_enabled ? 1 : 0);
+                    arrivalWindowStart = arrivalSeconds;
+                    arrivalWindowBytes = 0;
+                    arrivalWindowFrames = 0;
+                    maxFrameGap = 0;
+                    gapsOver50ms = 0;
+                    gapsOver100ms = 0;
+                }
                 break;
             }
 
-            case 5: /* KeepAliveWithBody — encoder stats, ignore */
+            case 5: { /* KeepAliveWithBody — carries sender video statistics.
+                       * The AccessorySDK ignores this opcode outright. Parsing
+                       * the plist and printing the dictionary costs a copy, a
+                       * deserialisation and ~17 line-buffered write() calls,
+                       * and it used to happen on this thread once a second —
+                       * long enough to stop draining the screen socket and turn
+                       * the next frames into a late burst. Snapshot the bytes,
+                       * hand them to a background queue, and sample rarely. */
+                static dispatch_queue_t statsQueue;
+                static dispatch_once_t statsOnce;
+                dispatch_once(&statsOnce, ^{
+                    statsQueue = dispatch_queue_create(
+                        "com.reng.showcase.screenstats", DISPATCH_QUEUE_SERIAL);
+                    dispatch_set_target_queue(statsQueue,
+                        dispatch_get_global_queue(
+                            DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0));
+                });
+                struct timespec statsNow;
+                clock_gettime(CLOCK_MONOTONIC, &statsNow);
+                double statsSeconds = (double)statsNow.tv_sec +
+                    (double)statsNow.tv_nsec / 1000000000.0;
+                if (statsSeconds - lastStatsLogSeconds >= 15.0 &&
+                    bodySize > 0 && bodySize < 4u * 1024u * 1024u) {
+                    lastStatsLogSeconds = statsSeconds;
+                    size_t plistLength = bodySize;
+                    if (plistLength > 25000) plistLength -= 25000;
+                    NSData *snapshot = [NSData dataWithBytes:body
+                                                      length:plistLength];
+                    dispatch_async(statsQueue, ^{
+                        @autoreleasepool {
+                            id stats = [NSPropertyListSerialization
+                                propertyListWithData:snapshot
+                                             options:NSPropertyListImmutable
+                                              format:NULL
+                                               error:NULL];
+                            if (stats)
+                                printf("[SCREEN] Sender performance: %s\n",
+                                       [[stats description] UTF8String]);
+                        }
+                    });
+                }
+                break;
+            }
             case 2: /* KeepAlive */
             case 4: /* Ignore (bandwidth measurement) */
                 break;
@@ -2082,18 +4084,54 @@ static void *screen_thread_func(void *arg) {
            msgCount, videoFrameCount, totalBytes);
     fflush(stdout);
     free(body);
-    if (g_app_sock >= 0) { close(g_app_sock); g_app_sock = -1; }
     close(clientFd);
-    g_screen_thread_running = false;
+    __sync_lock_release(&g_screen_thread_running);
     return NULL;
 }
 
 static void start_screen_thread(void) {
-    if (g_screen_thread_running || g_screen_listen_fd < 0) return;
-    g_screen_thread_running = true;
+    if (g_screen_listen_fd < 0) return;
+    if (!__sync_bool_compare_and_swap(&g_screen_thread_running, 0, 1)) {
+        /* A replacement SETUP can arrive while the old stream thread is
+         * finishing its socket cleanup. Retry off the RTSP thread so the
+         * SETUP response is never delayed. */
+        if (__sync_bool_compare_and_swap(&g_screen_start_pending, 0, 1)) {
+            dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                while (g_screen_thread_running)
+                    usleep(20000);
+                __sync_lock_release(&g_screen_start_pending);
+                start_screen_thread();
+            });
+        }
+        return;
+    }
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         screen_thread_func(NULL);
     });
+}
+
+static ssize_t send_timing_request(int fd,
+                                   const struct sockaddr *destination,
+                                   socklen_t destinationLength) {
+    uint8_t packet[32] = {0};
+    packet[0] = 0x80;
+    packet[1] = 0xD2;
+    packet[2] = 0x00;
+    packet[3] = 0x07;
+
+    uint32_t seconds = 0;
+    uint32_t fraction = 0;
+    get_ntp_time(&seconds, &fraction);
+    packet[24] = (seconds >> 24) & 0xFF;
+    packet[25] = (seconds >> 16) & 0xFF;
+    packet[26] = (seconds >> 8) & 0xFF;
+    packet[27] = seconds & 0xFF;
+    packet[28] = (fraction >> 24) & 0xFF;
+    packet[29] = (fraction >> 16) & 0xFF;
+    packet[30] = (fraction >> 8) & 0xFF;
+    packet[31] = fraction & 0xFF;
+    return sendto(fd, packet, sizeof(packet), 0,
+                  destination, destinationLength);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2126,42 +4164,29 @@ static bool timing_negotiate_blocking(void) {
     socklen_t destLen = 0;
     char destDisplay[NI_MAXHOST + IF_NAMESIZE + 4];
     memset(destDisplay, 0, sizeof(destDisplay));
+    int timingFamily = socket_bound_family(g_timing_fd);
     if (!build_peer_sockaddr(g_iphone_ip, g_iphone_timing_port,
+                             timingFamily,
                              &dest, &destLen,
                              destDisplay, sizeof(destDisplay))) {
         printf("[TIMING] WARN: could not parse timing destination %s; waiting for client timing packets\n",
                g_iphone_ip);
         return false;
     }
-    printf("[TIMING] negotiate destination %s %s port=%u\n",
-           addr_family_name(dest.ss_family), destDisplay, g_iphone_timing_port);
+    printf("[TIMING] negotiate socket=%s destination=%s %s port=%u\n",
+           addr_family_name(timingFamily), addr_family_name(dest.ss_family),
+           destDisplay, g_iphone_timing_port);
 
     g_timing_sync_count = 0;
+    g_timing_best_rtt = DBL_MAX;
+    g_timing_remote_minus_local = 0.0;
+    g_timing_offset_valid = 0;
+    app_send_video_timing();
 
     /* Send 5 NTP requests with 100ms spacing, then wait for responses */
     for (int i = 0; i < 5; i++) {
-        uint8_t pkt[32];
-        memset(pkt, 0, 32);
-
-        pkt[0] = 0x80;   /* version 2, no padding */
-        pkt[1] = 0xD2;   /* packet type 210 = timing request */
-        pkt[2] = 0x00;
-        pkt[3] = 0x07;   /* length = 7 (8 words minus 1) */
-
-        /* T3 (transmit) = our current NTP time */
-        uint32_t sec, frac;
-        get_ntp_time(&sec, &frac);
-        pkt[24] = (sec >> 24) & 0xFF;
-        pkt[25] = (sec >> 16) & 0xFF;
-        pkt[26] = (sec >>  8) & 0xFF;
-        pkt[27] = (sec >>  0) & 0xFF;
-        pkt[28] = (frac >> 24) & 0xFF;
-        pkt[29] = (frac >> 16) & 0xFF;
-        pkt[30] = (frac >>  8) & 0xFF;
-        pkt[31] = (frac >>  0) & 0xFF;
-
-        ssize_t sent = sendto(g_timing_fd, pkt, 32, 0,
-                              (struct sockaddr *)&dest, destLen);
+        ssize_t sent = send_timing_request(
+            g_timing_fd, (struct sockaddr *)&dest, destLen);
         if (sent < 0) {
             printf("[TIMING] WARN: sendto failed for %s errno=%d (%s); waiting for client timing packets\n",
                    destDisplay, errno, strerror(errno));
@@ -2185,6 +4210,32 @@ static bool timing_negotiate_blocking(void) {
     printf("[TIMING-NEG] Negotiation complete: %d responses in %dms\n",
            g_timing_sync_count, waitMs);
     fflush(stdout);
+
+    /*
+     * CarPlaySDK continues probing roughly every 2–3 seconds for the lifetime
+     * of a session. Keep one generation alive so resume/re-RECORD replaces the
+     * old destination without accumulating maintenance loops.
+     */
+    uint32_t generation =
+        __sync_add_and_fetch(&g_timing_maintenance_generation, 1);
+    struct sockaddr_storage maintenanceDestination = dest;
+    socklen_t maintenanceLength = destLen;
+    int maintenanceFd = g_timing_fd;
+    dispatch_async(dispatch_get_global_queue(
+                       DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        while (generation == g_timing_maintenance_generation &&
+               maintenanceFd == g_timing_fd && maintenanceFd >= 0) {
+            usleep(2500000);
+            if (generation != g_timing_maintenance_generation) break;
+            ssize_t sent = send_timing_request(
+                maintenanceFd,
+                (struct sockaddr *)&maintenanceDestination,
+                maintenanceLength);
+            if (sent < 0 && errno != EINTR)
+                printf("[TIMING] maintenance request failed: %s\n",
+                       strerror(errno));
+        }
+    });
 
     return (g_timing_sync_count >= 3);
 }
@@ -2235,10 +4286,20 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                                     host, sizeof(host), serv, sizeof(serv));
                 /* Strip ::ffff: prefix for IPv4-mapped IPv6 */
                 const char *ip = host;
-                if (strncmp(ip, "::ffff:", 7) == 0) ip += 7;
+                g_iphone_family = peerAddr.ss_family;
+                if (peerAddr.ss_family == AF_INET6) {
+                    const struct sockaddr_in6 *peer6 =
+                        (const struct sockaddr_in6 *)&peerAddr;
+                    if (IN6_IS_ADDR_V4MAPPED(&peer6->sin6_addr)) {
+                        ip += strncmp(ip, "::ffff:", 7) == 0 ? 7 : 0;
+                        g_iphone_family = AF_INET;
+                    }
+                }
                 snprintf(g_iphone_ip, sizeof(g_iphone_ip), "%s", ip);
-                printf("[AP] iPhone IP: %s (family=%s peer_port=%s)\n",
-                       g_iphone_ip, addr_family_name(peerAddr.ss_family), serv);
+                printf("[AP] iPhone IP: %s (socketFamily=%s "
+                       "screenFamily=%s peer_port=%s)\n",
+                       g_iphone_ip, addr_family_name(peerAddr.ss_family),
+                       addr_family_name(g_iphone_family), serv);
             }
 
             /* Allocate control ports if not already done */
@@ -2259,6 +4320,19 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
 
             respDict[@"timingPort"] = @(g_timing_port);
             respDict[@"eventPort"]  = @(g_event_port);
+
+            /*
+             * Session features are negotiated, not enabled merely by listing
+             * their stream formats in /info. Enable only the buffered-audio
+             * feature that both peers advertised/support; do not mirror
+             * unknown sender features.
+             */
+            NSArray *requestedFeatures = reqDict[@"features"];
+            if ([requestedFeatures isKindOfClass:[NSArray class]] &&
+                [requestedFeatures containsObject:@"mainBuffered"]) {
+                respDict[@"enabledFeatures"] = @[@"mainBuffered"];
+                printf("[AUDIO] enabled session feature: mainBuffered\n");
+            }
 
             /* iPhone sent keepAliveLowPower=1 */
             if ([reqDict[@"keepAliveLowPower"] boolValue]) {
@@ -2285,12 +4359,26 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                 uint16_t dataPort = 0;
                 int dataFd = -1;
 
-                /* type 110 = screen/video (TCP), type 96 = main audio (UDP),
-                 * type 100 = alt audio, others = UDP */
+                /* Screen is H.264/TCP. CarPlay audio types 100/101/102 are
+                 * encrypted RTP/UDP and are handled by dedicated receivers. */
                 if (type == 110) {
-                    dataFd = bind_tcp_port(&dataPort);
-                    printf("[NET] screen/video dataPort=%u fd=%d dual-stack when available\n",
-                           dataPort, dataFd);
+                    dataFd = bind_screen_tcp_port(&dataPort, g_iphone_family);
+                    printf("[NET] screen/video dataPort=%u fd=%d family=%s\n",
+                           dataPort, dataFd,
+                           addr_family_name(socket_bound_family(dataFd)));
+
+                    NSNumber *latency = stream[@"latencyMs"];
+                    if (latency) {
+                        uint32_t requestedLatency =
+                            (uint32_t)[latency unsignedIntValue];
+                        if (requestedLatency >= 20 &&
+                            requestedLatency <= 500) {
+                            g_screen_latency_ms = requestedLatency;
+                        }
+                    }
+                    printf("[AP] Screen target latency: %u ms\n",
+                           g_screen_latency_ms);
+                    app_send_video_timing();
 
                     /* Save screen stream state for screen thread */
                     g_screen_listen_fd = dataFd;
@@ -2312,15 +4400,150 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
                     /* Start screen receiver thread */
                     start_screen_thread();
                     app_send_status(STATUS_STREAM_SETUP);
+                } else if (type == 100 || type == 101 ||
+                           type == 102 || type == 103) {
+                    printf("[AUDIO] SETUP requested type=%d (%s)\n", type,
+                           type == 103 ? "MainBuffered" :
+                           type == 102 ? "MainHigh" :
+                           type == 101 ? "Alt" : "Main");
+                    /* Apple's MainBuffered receiver opens a TCP server. Its
+                     * SETUP response also advertises the 8 MiB buffer used for
+                     * the prefetched media stream. Types 100-102 remain UDP. */
+                    bool bufferedTCP = type == 103;
+                    carplay_audio_stream_t *audio =
+                        audio_stream_for_type((uint32_t)type);
+                    if (audio) {
+                        stop_audio_receiver(
+                            audio, "replaced by a new SETUP");
+                    }
+                    dataFd = bufferedTCP
+                        ? bind_tcp_port(&dataPort)
+                        : bind_udp_port(&dataPort);
+                    if (audio && dataFd >= 0) {
+                        audio->dataFd = dataFd;
+                        audio->dataPort = dataPort;
+                        audio->usesTCP = bufferedTCP;
+                        audio->packetCount = 0;
+                        audio->decryptErrors = 0;
+                        audio->sequenceGaps = 0;
+                        audio->lastArrivalNanos = 0;
+                        audio->maxArrivalGapNanos = 0;
+                        audio->longArrivalGaps = 0;
+                        audio->haveSequence = false;
+                        pthread_mutex_lock(&g_audio_control_lock);
+                        audio->flushPending = false;
+                        audio->flushUntilSequence = 0;
+                        audio->flushUntilTimestamp = 0;
+                        audio->flushDropCount = 0;
+                        pthread_mutex_unlock(&g_audio_control_lock);
+                        pthread_mutex_lock(&g_audio_feedback_lock);
+                        audio->renderedSampleTime = 0;
+                        audio->renderedHostNTP = 0;
+                        audio->renderedHostRawNanos = 0;
+                        audio->renderUpdateCount = 0;
+                        pthread_mutex_unlock(&g_audio_feedback_lock);
+
+                        NSNumber *connectionID =
+                            stream[@"streamConnectionID"];
+                        audio->connectionID = connectionID
+                            ? connectionID.unsignedLongLongValue : 0;
+                        NSNumber *format = stream[@"audioFormat"];
+                        if (format) {
+                            audio->formatMask =
+                                format.unsignedLongLongValue;
+                        } else {
+                            /* SDK fallback: uncompressed stereo output. */
+                            audio->formatMask = 0x00008000ULL;
+                        }
+                        NSNumber *samplesPerFrame = stream[@"spf"];
+                        audio->framesPerPacket = samplesPerFrame
+                            ? samplesPerFrame.unsignedIntValue
+                            : audio_default_frames_per_packet(
+                                  audio->formatMask);
+                        NSNumber *audioLatency = stream[@"audioLatencyMs"];
+                        audio->latencyMs = audioLatency
+                            ? audioLatency.unsignedIntValue : 100;
+                        /* MainBuffered carries its own 32-byte key in the
+                         * SETUP body ("shk") rather than having one derived
+                         * from the stream connection ID, which is how the
+                         * screen and the low-latency audio types work. Observed
+                         * directly in Apple's receiver log. */
+                        audio->keyValid = false;
+                        NSData *sharedKey = stream[@"shk"];
+                        if ([sharedKey isKindOfClass:[NSData class]] &&
+                            sharedKey.length == sizeof(audio->key)) {
+                            memcpy(audio->key, sharedKey.bytes,
+                                   sizeof(audio->key));
+                            audio->keyValid = true;
+                            printf("[AUDIO] stream=%d key supplied in SETUP "
+                                   "(shk, %u bytes)\n", type,
+                                   (unsigned)sharedKey.length);
+                        } else if (audio->connectionID &&
+                                   pair_derive_stream_key(
+                                       g_pair, audio->connectionID,
+                                       audio->key) == 0) {
+                            audio->keyValid = true;
+                            printf("[AUDIO] stream=%d key derived from "
+                                   "connID\n", type);
+                        }
+
+                        /* Recorded for the renderer and for diagnosis: the
+                         * compression type and mode select the decoder, and
+                         * clientID identifies which app is playing. */
+                        NSNumber *compression = stream[@"ct"];
+                        NSString *audioMode = stream[@"audioMode"];
+                        NSString *audioTypeStr = stream[@"audioType"];
+                        NSString *clientID = stream[@"clientID"];
+                        printf("[AUDIO] stream=%d ct=%s mode=%s audioType=%s "
+                               "client=%s formatIndex=%s\n", type,
+                               compression ? compression.stringValue.UTF8String : "-",
+                               audioMode ? audioMode.UTF8String : "-",
+                               audioTypeStr ? audioTypeStr.UTF8String : "-",
+                               clientID ? clientID.UTF8String : "-",
+                               stream[@"audioFormatIndex"]
+                                   ? [stream[@"audioFormatIndex"] stringValue].UTF8String
+                                   : "-");
+                        if (audio->connectionID)
+                            rs[@"streamConnectionID"] =
+                                @(audio->connectionID);
+
+                        /* MainHigh uses a companion RTCP port. MainBuffered
+                         * carries its records over TCP and has no controlPort
+                         * in Apple's SETUP response. */
+                        if (type == 102) {
+                            uint16_t controlPort = 0;
+                            int controlFd =
+                                bind_udp_port(&controlPort);
+                            audio->controlFd = controlFd;
+                            audio->controlPort = controlPort;
+                            if (controlFd >= 0)
+                                rs[@"controlPort"] = @(controlPort);
+                        }
+                        if (type == 103)
+                            rs[@"audioBufferSize"] = @(8 * 1024 * 1024);
+                        printf("[NET] audio stream=%d %s dataPort=%u fd=%d "
+                               "controlPort=%u format=0x%llx spf=%u "
+                               "latency=%ums connID=%llu key=%d\n",
+                               type, bufferedTCP ? "TCP" : "UDP",
+                               dataPort, dataFd,
+                               audio->controlPort,
+                               (unsigned long long)audio->formatMask,
+                               audio->framesPerPacket, audio->latencyMs,
+                               (unsigned long long)audio->connectionID,
+                               audio->keyValid ? 1 : 0);
+                        start_audio_receiver(audio);
+                    }
                 } else {
                     dataFd = bind_udp_port(&dataPort);
-                    printf("[NET] audio/aux UDP dataPort=%u fd=%d dual-stack when available\n",
-                           dataPort, dataFd);
+                    printf("[NET] auxiliary stream=%d UDP dataPort=%u fd=%d\n",
+                           type, dataPort, dataFd);
                 }
                 rs[@"dataPort"] = @(dataPort);
 
-                /* For audio streams, also provide controlPort */
-                if (type != 110) {
+                /* Unknown auxiliary streams retain the legacy control port.
+                 * Known audio streams above use the per-type SDK contract. */
+                if (type != 110 && type != 100 && type != 101 &&
+                    type != 102 && type != 103) {
                     uint16_t ctrlPort = 0;
                     int ctrlFd = bind_udp_port(&ctrlPort);
                     rs[@"controlPort"] = @(ctrlPort);
@@ -2408,66 +4631,15 @@ static void handle_record(int sock, const HTTPReq *r) {
 
     send_response(sock, "RTSP/1.0", 200, "OK", NULL, NULL, 0, r->cseq);
 
-    /* ── Send requestUI on the encrypted event channel ──
-     * The reference (AirPlayReceiverSessionRequestUI) sends a
-     * POST /command with body {"type":"requestUI"} on the event channel
-     * to tell the iPhone to start CarPlay UI streaming. Without this,
-     * the iPhone doesn't know we want the CarPlay screen and tears down. */
-    if (g_event_client_fd >= 0 && g_event_enc.active) {
-        @autoreleasepool {
-            /* Build the requestUI command plist */
-            NSDictionary *cmd = @{ @"type": @"requestUI" };
-            NSError *err = nil;
-            NSData *plist = [NSPropertyListSerialization
-                dataWithPropertyList:cmd
-                              format:NSPropertyListBinaryFormat_v1_0
-                             options:0
-                               error:&err];
-            if (plist) {
-                /* Build HTTP POST request */
-                NSMutableString *hdr = [NSMutableString string];
-                [hdr appendString:@"POST /command RTSP/1.0\r\n"];
-                [hdr appendFormat:@"Content-Length: %lu\r\n", (unsigned long)plist.length];
-                [hdr appendString:@"Content-Type: application/x-apple-binary-plist\r\n"];
-                [hdr appendString:@"CSeq: 1\r\n"];
-                [hdr appendFormat:@"User-Agent: AirPlay/%s\r\n", SOURCE_VERSION];
-                [hdr appendString:@"\r\n"];
-
-                /* Concatenate header + body into one buffer */
-                NSMutableData *msg = [NSMutableData dataWithBytes:hdr.UTF8String
-                                                          length:strlen(hdr.UTF8String)];
-                [msg appendData:plist];
-
-                printf("[EVENT-CMD] Sending requestUI: %zu bytes\n", msg.length);
-                fflush(stdout);
-
-                int ret = enc_send_frame(g_event_client_fd, &g_event_enc,
-                                         msg.bytes, msg.length);
-                if (ret == 0) {
-                    printf("[EVENT-CMD] *** requestUI sent successfully (nonce=%llu) ***\n",
-                           g_event_enc.writeNonce - 1);
-                } else {
-                    printf("[EVENT-CMD] ERROR: Failed to send requestUI\n");
-                }
-                fflush(stdout);
-
-                /* changeModes removed — initial modes are now in /info response.
-                 * iPhone reads modes from /info to determine resource claims.
-                 * changeModes is only for runtime mode changes after streams are set up. */
-            } else {
-                printf("[EVENT-CMD] ERROR: Failed to create requestUI plist: %s\n",
-                       err.localizedDescription.UTF8String);
-            }
-        }
-    } else {
-        printf("[AP] WARNING: Cannot send requestUI — event fd=%d enc=%d\n",
-               g_event_client_fd, g_event_enc.active);
-    }
+    /* Ask the phone for the first UI frame. The same command is reused after
+     * foregrounding so the decoder can restart from a clean keyframe. */
+    send_request_ui_command("record started");
 }
 
 static void handle_teardown(int sock, const HTTPReq *r) {
     printf("[AP] -> TEARDOWN (CSeq=%d, bodyLen=%zu)\n", r->cseq, r->bodyLen);
 
+    bool hadStreamTargets = false;
     if (r->body && r->bodyLen > 0) {
         @autoreleasepool {
             NSData *d = [NSData dataWithBytesNoCopy:(void *)r->body
@@ -2478,6 +4650,24 @@ static void handle_teardown(int sock, const HTTPReq *r) {
             if (obj) {
                 printf("[AP] TEARDOWN plist: %s\n",
                        [[obj description] UTF8String]);
+                if ([obj isKindOfClass:[NSDictionary class]]) {
+                    NSArray *streams = obj[@"streams"];
+                    if ([streams isKindOfClass:[NSArray class]] &&
+                        streams.count > 0) {
+                        hadStreamTargets = true;
+                        for (id entry in streams) {
+                            if (![entry isKindOfClass:
+                                    [NSDictionary class]]) continue;
+                            NSNumber *type = entry[@"type"];
+                            carplay_audio_stream_t *audio =
+                                audio_stream_for_type(
+                                    type.unsignedIntValue);
+                            if (audio)
+                                stop_audio_receiver(
+                                    audio, "sender stream TEARDOWN");
+                        }
+                    }
+                }
             } else {
                 printf("[AP] TEARDOWN hex (%zu):", r->bodyLen);
                 size_t n = r->bodyLen > 256 ? 256 : r->bodyLen;
@@ -2487,11 +4677,169 @@ static void handle_teardown(int sock, const HTTPReq *r) {
         }
     }
 
-    g_recording = false;
+    if (!hadStreamTargets) {
+        g_recording = false;
+        __sync_add_and_fetch(&g_timing_maintenance_generation, 1);
+        for (size_t index = 0;
+             index < sizeof(g_audio_streams) /
+                     sizeof(g_audio_streams[0]);
+             index++) {
+            stop_audio_receiver(
+                &g_audio_streams[index], "full session TEARDOWN");
+        }
+    }
 
     send_response(sock, "RTSP/1.0", 200, "OK", NULL, NULL, 0, r->cseq);
-    printf("[AP] Session torn down.\n");
+    printf("[AP] %s torn down.\n",
+           hadStreamTargets ? "Requested stream(s)" : "Session");
     fflush(stdout);
+}
+
+static void handle_setrate(int sock, const HTTPReq *r) {
+    @autoreleasepool {
+        NSDictionary *request = nil;
+        if (r->body && r->bodyLen > 0) {
+            NSData *data = [NSData dataWithBytesNoCopy:(void *)r->body
+                                                length:r->bodyLen
+                                          freeWhenDone:NO];
+            id object = [NSPropertyListSerialization
+                propertyListWithData:data options:0 format:NULL error:NULL];
+            if ([object isKindOfClass:[NSDictionary class]])
+                request = object;
+        }
+
+        NSNumber *rtpTime = request[@"rtpTime"];
+        NSNumber *rate = request[@"rate"];
+        if (!rtpTime || !rate) {
+            printf("[AUDIO] SETRATE missing rtpTime/rate\n");
+            send_response(sock, "RTSP/1.0", 400, "Bad Request",
+                          NULL, NULL, 0, r->cseq);
+            return;
+        }
+
+        /*
+         * MainBuffered uses SETRATE as its playback anchor. Apple's receiver
+         * returns the requested RTP position together with the accessory's
+         * current synchronized network time, then applies that same anchor
+         * locally. The network-time seconds in this plist omit the NTP epoch
+         * bias used on the UDP timing wire.
+         */
+        uint64_t synchronizedNTP =
+            synchronized_ntp_for_host_ticks(mach_absolute_time(), NULL);
+        uint32_t ntpSeconds = (uint32_t)(synchronizedNTP >> 32);
+        uint32_t ntpFraction = (uint32_t)synchronizedNTP;
+        uint32_t networkSeconds = ntpSeconds - NTP_EPOCH_OFFSET;
+        NSDictionary *response = @{
+            @"networkTimeFlags": @0,
+            @"networkTimeTimelineID": @0,
+            @"networkTimeSecs": @(networkSeconds),
+            @"networkTimeFrac": @(ntpFraction),
+            @"rtpTime": rtpTime,
+            @"rate": rate
+        };
+        NSData *body = [NSPropertyListSerialization
+            dataWithPropertyList:response
+                          format:NSPropertyListBinaryFormat_v1_0
+                         options:0
+                           error:NULL];
+        printf("[AUDIO] SETRATE rate=%s rtpTime=%s anchor=%u.%u\n",
+               rate.stringValue.UTF8String,
+               rtpTime.stringValue.UTF8String,
+               networkSeconds, ntpFraction);
+        send_response(sock, "RTSP/1.0", 200, "OK",
+                      "application/x-apple-binary-plist",
+                      body.bytes, body.length, r->cseq);
+        app_send_audio_control(103, rate.doubleValue == 0.0
+                                    ? AUDIO_CONTROL_PAUSE
+                                    : AUDIO_CONTROL_RESUME);
+    }
+}
+
+static void handle_setrate_anchor_time(int sock, const HTTPReq *r) {
+    @autoreleasepool {
+        NSDictionary *request = nil;
+        if (r->body && r->bodyLen > 0) {
+            NSData *data = [NSData dataWithBytesNoCopy:(void *)r->body
+                                                length:r->bodyLen
+                                          freeWhenDone:NO];
+            id object = [NSPropertyListSerialization
+                propertyListWithData:data options:0 format:NULL error:NULL];
+            if ([object isKindOfClass:[NSDictionary class]])
+                request = object;
+        }
+
+        NSNumber *rate = request[@"rate"];
+        if (!rate) {
+            printf("[AUDIO] SETRATEANCHORTIME missing rate\n");
+            send_response(sock, "RTSP/1.0", 400, "Bad Request",
+                          NULL, NULL, 0, r->cseq);
+            return;
+        }
+
+        bool paused = rate.doubleValue == 0.0;
+        printf("[AUDIO] SETRATEANCHORTIME rate=%s -> %s\n",
+               rate.stringValue.UTF8String,
+               paused ? "pause" : "resume");
+        app_send_audio_control(103, paused
+                                    ? AUDIO_CONTROL_PAUSE
+                                    : AUDIO_CONTROL_RESUME);
+        send_response(sock, "RTSP/1.0", 200, "OK",
+                      NULL, NULL, 0, r->cseq);
+    }
+}
+
+static void handle_flush_buffered(int sock, const HTTPReq *r) {
+    @autoreleasepool {
+        NSDictionary *request = nil;
+        if (r->body && r->bodyLen > 0) {
+            NSData *data = [NSData dataWithBytesNoCopy:(void *)r->body
+                                                length:r->bodyLen
+                                          freeWhenDone:NO];
+            id object = [NSPropertyListSerialization
+                propertyListWithData:data options:0 format:NULL error:NULL];
+            if ([object isKindOfClass:[NSDictionary class]])
+                request = object;
+        }
+
+        NSNumber *flushUntilSeq = request[@"flushUntilSeq"];
+        NSNumber *flushUntilTS = request[@"flushUntilTS"];
+        if (!flushUntilSeq || !flushUntilTS) {
+            printf("[AUDIO] FLUSHBUFFERED missing sequence/timestamp\n");
+            send_response(sock, "RTSP/1.0", 400, "Bad Request",
+                          NULL, NULL, 0, r->cseq);
+            return;
+        }
+
+        carplay_audio_stream_t *audio = audio_stream_for_type(103);
+        uint64_t extendedSequence =
+            flushUntilSeq.unsignedLongLongValue;
+        uint32_t timestamp = flushUntilTS.unsignedIntValue;
+        if (audio) {
+            pthread_mutex_lock(&g_audio_control_lock);
+            audio->flushPending = true;
+            audio->flushUntilSequence =
+                (uint16_t)(extendedSequence & 0xffff);
+            audio->flushUntilTimestamp = timestamp;
+            audio->flushDropCount = 0;
+            pthread_mutex_unlock(&g_audio_control_lock);
+
+            /* Old render coordinates no longer describe the media epoch. */
+            pthread_mutex_lock(&g_audio_feedback_lock);
+            audio->renderedSampleTime = 0;
+            audio->renderedHostNTP = 0;
+            audio->renderedHostRawNanos = 0;
+            audio->renderUpdateCount = 0;
+            pthread_mutex_unlock(&g_audio_feedback_lock);
+        }
+
+        printf("[AUDIO] FLUSHBUFFERED untilSeq=%llu (rtp=%u) "
+               "untilTS=%u\n",
+               (unsigned long long)extendedSequence,
+               (unsigned)(extendedSequence & 0xffff), timestamp);
+        app_send_audio_control(103, AUDIO_CONTROL_FLUSH);
+        send_response(sock, "RTSP/1.0", 200, "OK",
+                      NULL, NULL, 0, r->cseq);
+    }
 }
 
 static void handle_rtsp_generic(int sock, const HTTPReq *r) {
@@ -2514,6 +4862,120 @@ static void handle_rtsp_generic(int sock, const HTTPReq *r) {
  * Endpoint: POST /command, /feedback
  * ═══════════════════════════════════════════════════════════════ */
 
+static NSDictionary *g_modes_state = nil;
+
+static void handle_command_dictionary(NSDictionary *command) {
+    NSString *type = command[@"type"];
+    if (![type isKindOfClass:[NSString class]]) return;
+
+    if ([type isEqualToString:@"modesChanged"]) {
+        NSDictionary *params = command[@"params"];
+        if ([params isKindOfClass:[NSDictionary class]]) {
+            g_modes_state = [params copy];
+            printf("[CONTROL] modesChanged state updated: %s\n",
+                   g_modes_state.description.UTF8String);
+        }
+    } else if ([type isEqualToString:@"disableBluetooth"]) {
+        const uint8_t request = 1;
+        bool sent = app_send_msg(MSG_BT_HANDOFF, &request, sizeof(request));
+        printf("[HANDOFF] disableBluetooth honored; app teardown request %s\n",
+               sent ? "sent" : "failed");
+    } else if ([type isEqualToString:@"duckAudio"] ||
+               [type isEqualToString:@"unduckAudio"]) {
+        printf("[CONTROL] %s received\n", type.UTF8String);
+    } else if ([type isEqualToString:@"forceKeyFrame"]) {
+        printf("[CONTROL] forceKeyFrame received\n");
+    } else {
+        printf("[CONTROL] unhandled command type=%s\n", type.UTF8String);
+    }
+}
+
+static bool process_event_command_frame(const uint8_t *bytes, size_t length) {
+    HTTPReq request;
+    if (!parse_http(bytes, length, &request) ||
+        strcasecmp(request.method, "POST") != 0 ||
+        !strstr(request.path, "/command") ||
+        request.bodyLen < request.contentLength) return false;
+
+    @autoreleasepool {
+        NSData *data = [NSData dataWithBytesNoCopy:(void *)request.body
+                                            length:request.bodyLen
+                                      freeWhenDone:NO];
+        id object = [NSPropertyListSerialization
+            propertyListWithData:data options:0 format:NULL error:NULL];
+        if ([object isKindOfClass:[NSDictionary class]])
+            handle_command_dictionary(object);
+    }
+
+    char response[160];
+    int responseLength = snprintf(
+        response, sizeof(response),
+        "RTSP/1.0 200 OK\r\nContent-Length: 0\r\nCSeq: %d\r\n\r\n",
+        request.cseq);
+    if (g_event_send_lock)
+        dispatch_semaphore_wait(g_event_send_lock, DISPATCH_TIME_FOREVER);
+    int result = enc_send_frame(g_event_client_fd, &g_event_enc,
+                                (const uint8_t *)response,
+                                (size_t)responseLength);
+    if (g_event_send_lock) dispatch_semaphore_signal(g_event_send_lock);
+    printf("[EVENT] command response %s CSeq=%d\n",
+           result == 0 ? "sent" : "failed", request.cseq);
+    return true;
+}
+
+static void handle_feedback(int sock, const HTTPReq *request) {
+    @autoreleasepool {
+        NSMutableArray *streams = [NSMutableArray array];
+        for (size_t index = 0;
+             index < sizeof(g_audio_streams) / sizeof(g_audio_streams[0]);
+             index++) {
+            carplay_audio_stream_t *audio = &g_audio_streams[index];
+            if (audio->dataFd < 0 || audio->formatMask == 0) continue;
+
+            NSMutableDictionary *stream = [NSMutableDictionary dictionary];
+            stream[@"type"] = @(audio->type);
+            double rate = audio_sample_rate(audio->formatMask);
+            if (rate > 0) stream[@"sampleRate"] = @(rate);
+            int64_t renderedSampleTime = 0;
+            uint64_t renderedHostNTP = 0;
+            uint64_t renderedHostRawNanos = 0;
+            uint64_t renderUpdateCount = 0;
+            pthread_mutex_lock(&g_audio_feedback_lock);
+            renderedSampleTime = audio->renderedSampleTime;
+            renderedHostNTP = audio->renderedHostNTP;
+            renderedHostRawNanos = audio->renderedHostRawNanos;
+            renderUpdateCount = audio->renderUpdateCount;
+            pthread_mutex_unlock(&g_audio_feedback_lock);
+            if (renderUpdateCount > 0 && renderedHostNTP != 0) {
+                stream[@"streamConnectionID"] = @(audio->connectionID);
+                stream[@"timestamp"] = @(renderedHostNTP);
+                stream[@"timestampRawNs"] = @(renderedHostRawNanos);
+                stream[@"sampleTime"] = @(renderedSampleTime);
+            }
+            [streams addObject:stream];
+        }
+
+        NSDictionary *feedback = @{ @"streams": streams };
+        NSError *error = nil;
+        NSData *body = [NSPropertyListSerialization
+            dataWithPropertyList:feedback
+                          format:NSPropertyListBinaryFormat_v1_0
+                         options:0
+                           error:&error];
+        printf("[AUDIO] feedback streams=%lu render=%s%s\n",
+               (unsigned long)streams.count,
+               streams.count > 0 &&
+                       [streams[0][@"sampleTime"] isKindOfClass:
+                           [NSNumber class]] ? "valid" : "pending",
+               error ? " serialization-error" : "");
+        bool rtsp = strncmp(request->protocol, "RTSP", 4) == 0;
+        send_response(sock, rtsp ? "RTSP/1.0" : "HTTP/1.1",
+                      error ? 500 : 200, error ? "Error" : "OK",
+                      "application/x-apple-binary-plist",
+                      body.bytes, body.length, request->cseq);
+    }
+}
+
 static void handle_post_generic(int sock, const HTTPReq *r) {
     printf("[AP] -> POST %s (bodyLen=%zu, ct=%s)\n",
            r->path, r->bodyLen,
@@ -2529,6 +4991,9 @@ static void handle_post_generic(int sock, const HTTPReq *r) {
                 propertyListWithData:d options:0 format:NULL error:NULL];
             if (obj) {
                 printf("[AP] plist: %s\n", [[obj description] UTF8String]);
+                if (strstr(r->path, "/command") &&
+                    [obj isKindOfClass:[NSDictionary class]])
+                    handle_command_dictionary(obj);
             } else {
                 printf("[AP] hex (%zu):", r->bodyLen);
                 size_t n = r->bodyLen > 256 ? 256 : r->bodyLen;
@@ -2569,6 +5034,8 @@ static void route_request(int sock, const HTTPReq *r) {
             handle_fp_setup(sock, r);
         else if (strstr(r->path, "/auth-setup"))
             handle_auth_setup(sock, r);
+        else if (strstr(r->path, "/feedback"))
+            handle_feedback(sock, r);
         else
             handle_post_generic(sock, r);
     }
@@ -2580,6 +5047,15 @@ static void route_request(int sock, const HTTPReq *r) {
     }
     else if (strcasecmp(r->method, "RECORD") == 0) {
         handle_record(sock, r);
+    }
+    else if (strcasecmp(r->method, "SETRATE") == 0) {
+        handle_setrate(sock, r);
+    }
+    else if (strcasecmp(r->method, "SETRATEANCHORTIME") == 0) {
+        handle_setrate_anchor_time(sock, r);
+    }
+    else if (strcasecmp(r->method, "FLUSHBUFFERED") == 0) {
+        handle_flush_buffered(sock, r);
     }
     else if (strcasecmp(r->method, "TEARDOWN") == 0) {
         handle_teardown(sock, r);
@@ -2664,12 +5140,22 @@ static void handle_client(int c) {
                             handle_fp_setup(c, &r);
                         else if (strstr(r.path, "/auth-setup"))
                             handle_auth_setup(c, &r);
+                        else if (strstr(r.path, "/feedback"))
+                            handle_feedback(c, &r);
                         else
                             handle_post_generic(c, &r);
                     } else if (strcasecmp(r.method, "SETUP") == 0) {
                         handle_rtsp_setup(c, &r);
                     } else if (strcasecmp(r.method, "RECORD") == 0) {
                         handle_record(c, &r);
+                    } else if (strcasecmp(r.method, "SETRATE") == 0) {
+                        handle_setrate(c, &r);
+                    } else if (strcasecmp(r.method,
+                                          "SETRATEANCHORTIME") == 0) {
+                        handle_setrate_anchor_time(c, &r);
+                    } else if (strcasecmp(r.method,
+                                          "FLUSHBUFFERED") == 0) {
+                        handle_flush_buffered(c, &r);
                     } else if (strcasecmp(r.method, "TEARDOWN") == 0) {
                         handle_teardown(c, &r);
                     } else if (strcasecmp(r.method, "OPTIONS") == 0) {
@@ -3521,7 +6007,22 @@ int main(int argc, char *argv[]) {
     }
 
     signal(SIGPIPE, SIG_IGN);
+    if (g_baa_broker_mode) {
+        printf("[SVC] Starting pre-hotspot BAA broker mode\n");
+        return run_baa_broker();
+    }
     g_event_send_lock = dispatch_semaphore_create(1);
+    g_app_send_lock = dispatch_semaphore_create(1);
+    g_video_config_lock = dispatch_semaphore_create(1);
+    g_hid_send_queue = dispatch_queue_create(
+        "com.reng.showcase.hid", DISPATCH_QUEUE_SERIAL);
+    dispatch_set_target_queue(g_hid_send_queue,
+                              dispatch_get_global_queue(
+                                  DISPATCH_QUEUE_PRIORITY_HIGH, 0));
+    if (!ensure_pair_context()) {
+        printf("[SVC] FATAL: could not initialize pairing context\n");
+        return 1;
+    }
 
     printf("[SVC] CarPlay Network Services v5.1 (real Ed25519 pk, no HK)\n");
     printf("[SVC] DeviceID:  %s\n", DEVICE_ID);
@@ -3530,20 +6031,26 @@ int main(int argc, char *argv[]) {
     printf("[SVC] srcvers:   %s\n", SOURCE_VERSION);
     printf("[SVC] HK:        %s\n", g_useHK ? "YES" : "NO");
     printf("[SVC] RAOP name: %s\n", g_raop_name);
+    printf("[SVC] Display:   %ux%u @ %u FPS\n",
+           g_display_width, g_display_height, g_display_fps);
     printf("[SVC] pi:        %s\n", HK_PI);
     printf("[SVC] pk:        %s\n", HK_PK);
     printf("[SVC] Ed25519:   REAL keypair (sk stored for pair-verify)\n");
 
-    /* Issue BAA certificate for auth-setup */
-    issue_baa_cert();
+    /* Load the certificate preheated by the long-lived broker helper. */
+    load_baa_from_broker();
 
-    /* Resolve bridge100 */
+    /* Prefer bridge100 when it is already present. Personal Hotspot can
+     * briefly remove and recreate the bridge during the Bluetooth-to-Wi-Fi
+     * transition; DNS-SD interface 0 safely advertises on eligible
+     * interfaces instead of killing the receiver during that race. */
     unsigned int br = if_nametoindex("bridge100");
     if (br == 0) {
-        printf("[SVC] FATAL: bridge100 not found! Is the hotspot active?\n");
-        return 1;
+        printf("[SVC] WARN: bridge100 is transiently unavailable; "
+               "registering DNS-SD on all eligible interfaces\n");
+    } else {
+        printf("[SVC] bridge100 ifIndex = %u\n", br);
     }
-    printf("[SVC] bridge100 ifIndex = %u\n", br);
 
     /* Start AirPlay HTTP/RTSP server on port 7000 */
     if (!start_airplay_server(AIRPLAY_PORT)) {

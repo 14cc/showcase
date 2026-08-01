@@ -1,20 +1,23 @@
 /*
- * Showcase.m — Wireless CarPlay receiver for iPad
+ * Showcase.m - Wireless CarPlay receiver application
  *
  * Self-contained orchestrator app with state machine, car management,
- * AP credentials persistence, and full Apple-style UI.
+ * hotspot credential storage, receiver media, touch input, and lifecycle
+ * recovery for jailbroken iPhones and iPads.
  *
  * Compile (on-device):
  *   clang -fobjc-arc -isysroot /tmp/iPhoneOS10.3.sdk \
  *         -o Showcase Showcase.m \
- *         -framework UIKit -framework AVFoundation \
- *         -framework CoreMedia -framework Foundation \
+ *         -framework UIKit -framework AVFoundation -framework AudioToolbox \
+ *         -framework CoreMedia -framework Foundation -framework Security \
  *         -Wl,-undefined,dynamic_lookup
  */
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
+#import <Security/Security.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -23,6 +26,7 @@
 #include <sys/sysctl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
@@ -33,6 +37,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <float.h>
+#include <math.h>
+#include <dlfcn.h>
+#include <mach/mach_time.h>
+#include "baa_broker.h"
 
 extern char **environ;
 
@@ -48,13 +57,22 @@ extern char **environ;
 #define DIAGNOSTICS_ENABLED_KEY @"diagnosticsEnabled"
 static FILE *g_logfile = NULL;
 
+static uint64_t monotonic_nanos_now(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * NSEC_PER_SEC + (uint64_t)now.tv_nsec;
+}
+
 static void ip_log(const char *fmt, ...) {
     if (!g_logfile) return;
     char ts[32];
     time_t t = time(NULL);
     struct tm tm; localtime_r(&t, &tm);
     strftime(ts, sizeof(ts), "%H:%M:%S", &tm);
-    fprintf(g_logfile, "[%s] ", ts);
+    uint64_t monotonicNanos = monotonic_nanos_now();
+    fprintf(g_logfile, "[%s mono=%llu.%06llu] ", ts,
+            (unsigned long long)(monotonicNanos / NSEC_PER_SEC),
+            (unsigned long long)((monotonicNanos % NSEC_PER_SEC) / 1000ULL));
     va_list ap;
     va_start(ap, fmt);
     vfprintf(g_logfile, fmt, ap);
@@ -78,7 +96,7 @@ static void ip_log_open(void) {
  * ═══════════════════════════════════════════════════════════════ */
 
 #define APP_NAME          "Showcase"
-#define APP_VERSION       "1.0 beta 2-19"
+#define APP_VERSION       "1.0 beta 3"
 #define APP_AUTHOR        "Amine Rostane"
 #define SOCK_PATH         "/tmp/ipadplay.sock"   /* IPC socket — kept for compat with carplay_services */
 #define BLUETOOTHD_PLIST  "/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
@@ -95,6 +113,7 @@ static void ip_log_open(void) {
 #endif
 #define JB_PATH(path)     JB_PREFIX path
 #define BTDAEMON_PATH     JB_PATH("/usr/bin/BTdaemon")
+#define BTSTACK_DYLIB_PATH JB_PATH("/usr/lib/libBTstack.dylib")
 #ifdef SHOWCASE_ROOTLESS
 #define BT_HELPER_NAME    "CarDisplaySim"
 #define SVC_HELPER_NAME   "CarPlay Simulator"
@@ -113,6 +132,21 @@ static void ip_log_open(void) {
 #define MSG_VIDEO_FRAME   0x02
 #define MSG_TOUCH         0x03
 #define MSG_STATUS        0x04   /* services → app, 1 byte status code */
+#define MSG_APP_VISIBILITY 0x05  /* app → services, 1 while foreground */
+#define MSG_VIDEO_TIMING  0x06   /* services → app, uint32 latency in ms */
+#define MSG_VIDEO_RESYNC  0x07   /* app → services, renderer needs keyframe */
+#define MSG_AUDIO_CONFIG  0x08   /* services → app, negotiated audio stream */
+#define MSG_AUDIO_PACKET  0x09   /* services → app, decrypted RTP payload */
+#define MSG_BT_HANDOFF    0x0A   /* services → app, end Bluetooth transport */
+#define MSG_AUDIO_RENDER  0x0B   /* app → services, hardware render clock */
+#define MSG_AUDIO_CONTROL 0x0C   /* services → app, buffered playback control */
+#define VIDEO_FRAME_METADATA_SIZE 56
+#define VIDEO_STALE_RECOVERY_MIN_MS 250.0
+
+#define AUDIO_CONTROL_PAUSE  0
+#define AUDIO_CONTROL_RESUME 1
+#define AUDIO_CONTROL_FLUSH  2
+#define AUDIO_CONTROL_STOP   3
 
 #define STATUS_IPHONE_CONNECTED     0x01
 #define STATUS_PAIR_SETUP_COMPLETE  0x02
@@ -122,6 +156,7 @@ static void ip_log_open(void) {
 #define TOUCH_DOWN  0
 #define TOUCH_MOVE  1
 #define TOUCH_UP    2
+#define TOUCH_CANCEL 3
 
 typedef NS_ENUM(NSInteger, ShowcaseState) {
     StateIdle = 0,
@@ -162,23 +197,677 @@ static const char *launchctl_path(void) {
  * ═══════════════════════════════════════════════════════════════ */
 
 static volatile int g_touch_fd = -1;
+static volatile uint32_t g_touch_epoch = 0;
+static dispatch_queue_t g_touch_write_queue = NULL;
 static volatile float g_carplay_w = 0;
 static volatile float g_carplay_h = 0;
+static volatile int32_t g_video_suspended = 0;
+static volatile int32_t g_video_needs_resync = 0;
+static volatile uint32_t g_video_target_latency_ms = 75;
+static volatile int32_t g_video_respect_timestamps = 0;
+static volatile double g_video_sender_to_host_offset = 0.0;
+static volatile int32_t g_video_timing_offset_valid = 0;
+
+/* ── Sender-timeline clock recovery and presentation scheduling ───
+ * Every VideoFrame carries params[0]: a 32.32 fixed-point instant on the
+ * sender's session timeline. Presenting a frame needs that instant expressed in
+ * host time, which means an offset between the two clocks plus a budget for
+ * transport jitter.
+ *
+ * Offset. Estimated from the minimum of (hostArrival - senderTime): the
+ * fastest-delivered frame is the one that suffered least queueing, so it is the
+ * best available view of the true offset. The minimum is taken over a trailing
+ * window rather than the whole session, otherwise a single unusually fast frame
+ * anchors the timeline forever and the budget silently erodes. The applied
+ * offset slews toward that target instead of stepping, because a step moves
+ * every future frame's slot and shows up as a hitch.
+ *
+ * Budget. Fixed at the sender's latencyMs, frames whose transport delay exceeds
+ * it miss their slot. The budget therefore tracks recent jitter and grows up to
+ * the 2x latency that the AccessorySDK itself treats as the late threshold.
+ *
+ * Pacing. A frame that has missed its slot must not simply be dumped at "now":
+ * after a hiccup a whole burst arrives at once, every frame lands within a
+ * millisecond or two, and the display shows only the last of them — the same
+ * collapse that displaying on arrival caused. Late frames are instead paced off
+ * the previous frame's presentation time at slightly under one frame interval,
+ * so the backlog drains in order and slightly faster than real time until it
+ * rejoins the grid. This also makes presentation timestamps monotonic by
+ * construction.
+ * ──────────────────────────────────────────────────────────────── */
+#define VIDEO_CLOCK_WINDOW_SECONDS  8.0    /* trailing window for the offset   */
+#define VIDEO_CLOCK_SLEW_PER_SEC    0.004  /* 4 ms/s, both directions          */
+#define VIDEO_CLOCK_RESET_SECONDS   5.0    /* beyond this, a new timeline      */
+/* Budget sizing. The AccessorySDK never adds latencyMs to the display time at
+ * all — it maps the timestamp through the synchronised clock and presents at
+ * exactly that instant, using latencyMs only to decide what counts as late.
+ * Our anchor is a delay minimum rather than a true NTP clock, so some budget is
+ * required, but latencyMs is the sender's statement of expected latency and so
+ * belongs as the ceiling, never the floor. Buffering is the expensive way to
+ * buy smoothness: every millisecond here is a millisecond of touch response.
+ * Pacing absorbs the tail instead. */
+#define VIDEO_BUDGET_FLOOR_FRAMES   2.0    /* two frames of slack, ~33 ms      */
+#define VIDEO_JITTER_DEVIATIONS     3.0    /* budget = mean + 3 deviations     */
+#define VIDEO_JITTER_EWMA_SHIFT     16.0   /* smoothing for mean and deviation */
+#define VIDEO_CATCHUP_GAP_FRACTION  0.80   /* drain bursts 20% faster than 1x  */
+#define VIDEO_FRAME_INTERVAL_MIN    (1.0 / 240.0)
+#define VIDEO_FRAME_INTERVAL_MAX    (1.0 / 15.0)
+
+static double g_video_clock_offset = 0.0;   /* hostTime - senderTime, seconds */
+static double g_video_clock_last_update = 0.0;
+static bool   g_video_clock_valid = false;
+static double g_video_window_min = 0.0;     /* min delay, current window      */
+static double g_video_window_prev_min = 0.0;/* min delay, previous window     */
+static double g_video_window_start = 0.0;
+static bool   g_video_window_has_sample = false;
+static double g_video_jitter_mean = 0.0;    /* EWMA of delay above offset     */
+static double g_video_jitter_dev = 0.0;     /* EWMA of deviation from mean    */
+static double g_video_budget_seconds = 0.0; /* applied jitter budget          */
+static double g_video_last_pts = 0.0;       /* last scheduled presentation    */
+static bool   g_video_last_pts_valid = false;
+static double g_video_last_sender = 0.0;
+static bool   g_video_last_sender_valid = false;
+static double g_video_frame_interval = 1.0 / 60.0;  /* sender's actual cadence */
+
+static void video_clock_reset(void) {
+    g_video_clock_valid = false;
+    g_video_clock_offset = 0.0;
+    g_video_clock_last_update = 0.0;
+    g_video_window_min = 0.0;
+    g_video_window_prev_min = 0.0;
+    g_video_window_start = 0.0;
+    g_video_window_has_sample = false;
+    g_video_jitter_mean = 0.0;
+    g_video_jitter_dev = 0.0;
+    g_video_budget_seconds = 0.0;
+    g_video_last_pts = 0.0;
+    g_video_last_pts_valid = false;
+    g_video_last_sender = 0.0;
+    g_video_last_sender_valid = false;
+    g_video_frame_interval = 1.0 / 60.0;
+}
+
+/* Computes the presentation host time for a frame. outMissedSlot reports that
+ * the frame's own slot had already passed, i.e. transport exceeded the budget,
+ * and outLatenessSeconds by how much.
+ *
+ * Magnitude is what matters, not the count. Apple's own receiver, measured on a
+ * wired link, reports roughly half its frames past their slot — but never by
+ * more than about 11 ms, and its headroom sits around 33 ms. A high late count
+ * with small magnitudes is normal; large magnitudes are the defect. */
+static double video_clock_schedule(uint64_t senderTimestamp,
+                                   double hostArrival,
+                                   bool *outMissedSlot,
+                                   double *outLatenessSeconds) {
+    double senderSeconds = (double)senderTimestamp / 4294967296.0;
+
+    /*
+     * Normal path: use the NTP mapping measured on the AirPlay timing socket.
+     * This is what CarPlaySDK does through
+     * AirTunesClock_GetUpTicksNearSynchronizedNTPTime. Arrival time is not a
+     * clock sample; it includes Wi-Fi and TCP jitter, so it must never move a
+     * correctly synchronized presentation timestamp.
+     */
+    if (g_video_timing_offset_valid) {
+        double pts = senderSeconds + g_video_sender_to_host_offset;
+        bool missed = pts <= hostArrival;
+        if (outMissedSlot) *outMissedSlot = missed;
+        if (outLatenessSeconds)
+            *outLatenessSeconds = missed ? hostArrival - pts : 0.0;
+        if (g_video_last_sender_valid) {
+            double senderDelta = senderSeconds - g_video_last_sender;
+            if (senderDelta >= VIDEO_FRAME_INTERVAL_MIN &&
+                senderDelta <= VIDEO_FRAME_INTERVAL_MAX)
+                g_video_frame_interval = senderDelta;
+        }
+        g_video_budget_seconds = 0.0;
+        g_video_clock_offset = g_video_sender_to_host_offset;
+        g_video_clock_valid = true;
+        g_video_last_pts = pts;
+        g_video_last_pts_valid = true;
+        g_video_last_sender = senderSeconds;
+        g_video_last_sender_valid = true;
+        return pts;
+    }
+
+    double observed = hostArrival - senderSeconds;
+    double latencySeconds = (double)g_video_target_latency_ms / 1000.0;
+
+    if (!g_video_clock_valid ||
+        fabs(observed - g_video_clock_offset) > VIDEO_CLOCK_RESET_SECONDS) {
+        g_video_clock_valid = true;
+        g_video_clock_offset = observed;
+        g_video_clock_last_update = hostArrival;
+        g_video_window_min = observed;
+        g_video_window_prev_min = observed;
+        g_video_window_start = hostArrival;
+        g_video_window_has_sample = true;
+        g_video_jitter_mean = 0.0;
+        g_video_jitter_dev = 0.0;
+        g_video_budget_seconds = 0.0;
+        g_video_last_pts_valid = false;
+        g_video_last_sender_valid = false;
+    }
+
+    /* Trailing-window minimum, kept as two half-windows so the estimate can
+     * rise again when the path genuinely slows down. */
+    if (!g_video_window_has_sample || observed < g_video_window_min)
+        g_video_window_min = observed;
+    g_video_window_has_sample = true;
+    double jitter = observed - g_video_clock_offset;
+    if (jitter < 0) jitter = 0;
+    double deviation = fabs(jitter - g_video_jitter_mean);
+    g_video_jitter_mean += (jitter - g_video_jitter_mean) / VIDEO_JITTER_EWMA_SHIFT;
+    g_video_jitter_dev  += (deviation - g_video_jitter_dev) / VIDEO_JITTER_EWMA_SHIFT;
+
+    if (hostArrival - g_video_window_start >= VIDEO_CLOCK_WINDOW_SECONDS) {
+        g_video_window_prev_min = g_video_window_min;
+        g_video_window_min = observed;
+        g_video_window_start = hostArrival;
+    }
+
+    double target = g_video_window_min < g_video_window_prev_min
+                  ? g_video_window_min : g_video_window_prev_min;
+    double elapsed = hostArrival - g_video_clock_last_update;
+    if (elapsed > 0) {
+        double allowed = elapsed * VIDEO_CLOCK_SLEW_PER_SEC;
+        double delta = target - g_video_clock_offset;
+        if (delta > allowed) delta = allowed;
+        else if (delta < -allowed) delta = -allowed;
+        g_video_clock_offset += delta;
+    }
+    g_video_clock_last_update = hostArrival;
+
+    /* Budget from the smoothed jitter estimate. A window maximum was pinned at
+     * the ceiling by a single bad frame per window and never recovered, which
+     * spent the whole allowance on latency without buying smoothness. */
+    double wanted = g_video_jitter_mean +
+                    VIDEO_JITTER_DEVIATIONS * g_video_jitter_dev;
+    double floorBudget = g_video_frame_interval * VIDEO_BUDGET_FLOOR_FRAMES;
+    if (wanted < floorBudget) wanted = floorBudget;
+    if (wanted > latencySeconds) wanted = latencySeconds;
+    if (g_video_budget_seconds <= 0.0) g_video_budget_seconds = wanted;
+    else if (elapsed > 0) {
+        /* Grow quickly to stop dropping frames, shrink slowly to hold latency
+         * down without oscillating. */
+        double rate = (wanted > g_video_budget_seconds) ? 0.050 : 0.005;
+        double allowed = elapsed * rate;
+        double delta = wanted - g_video_budget_seconds;
+        if (delta > allowed) delta = allowed;
+        else if (delta < -allowed) delta = -allowed;
+        g_video_budget_seconds += delta;
+    }
+
+    double gridPTS = senderSeconds + g_video_clock_offset + g_video_budget_seconds;
+
+    /* Pace anything that missed its slot instead of dumping it at "now". */
+    double interval = g_video_frame_interval;
+    if (g_video_last_sender_valid) {
+        double senderDelta = senderSeconds - g_video_last_sender;
+        if (senderDelta >= VIDEO_FRAME_INTERVAL_MIN &&
+            senderDelta <= VIDEO_FRAME_INTERVAL_MAX) {
+            interval = senderDelta;
+            g_video_frame_interval = senderDelta;
+        }
+    }
+    double floorPTS = hostArrival;
+    if (g_video_last_pts_valid) {
+        floorPTS = g_video_last_pts + interval * VIDEO_CATCHUP_GAP_FRACTION;
+        if (floorPTS < hostArrival) floorPTS = hostArrival;
+    }
+
+    bool missed = (gridPTS <= hostArrival);
+    double pts = (gridPTS > floorPTS) ? gridPTS : floorPTS;
+    if (outLatenessSeconds)
+        *outLatenessSeconds = missed ? (hostArrival - gridPTS) : 0.0;
+
+    g_video_last_pts = pts;
+    g_video_last_pts_valid = true;
+    g_video_last_sender = senderSeconds;
+    g_video_last_sender_valid = true;
+    if (outMissedSlot) *outMissedSlot = missed;
+    return pts;
+}
+
+static double video_host_now(void) {
+    return CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()));
+}
+
+/* AVSampleBufferDisplayLayer ignores presentationTimeStamp unless a control
+ * timebase is attached — without one it paints every buffer as soon as it is
+ * enqueued, which is the behaviour we are removing. Running the timebase on the
+ * host clock at rate 1.0 makes sample PTS values plain host-time seconds. */
+static void video_install_timebase(AVSampleBufferDisplayLayer *layer) {
+    if (!layer || layer.controlTimebase) return;
+    CMTimebaseRef timebase = NULL;
+    OSStatus status = CMTimebaseCreateWithMasterClock(
+        kCFAllocatorDefault, CMClockGetHostTimeClock(), &timebase);
+    if (status != noErr || !timebase) {
+        ip_log("timebase create failed (%d); falling back to immediate display",
+               (int)status);
+        return;
+    }
+    CMTimebaseSetTime(timebase, CMClockGetTime(CMClockGetHostTimeClock()));
+    CMTimebaseSetRate(timebase, 1.0);
+    layer.controlTimebase = timebase;
+    CFRelease(timebase);
+}
+
+typedef NS_ENUM(uint8_t, CarPlayWLANAttachment) {
+    CarPlayWLANAttachmentUnknown = 0,
+    CarPlayWLANAttachmentHSIC,
+    CarPlayWLANAttachmentPCIe,
+};
+
+static const char *carplay_wlan_attachment_name(
+    CarPlayWLANAttachment attachment) {
+    switch (attachment) {
+        case CarPlayWLANAttachmentHSIC: return "HSIC";
+        case CarPlayWLANAttachmentPCIe: return "PCIe";
+        default: return "unknown";
+    }
+}
+
+typedef struct {
+    uint16_t width;
+    uint16_t height;
+    uint16_t nativeLong;
+    uint16_t nativeShort;
+    uint64_t pixelBudget;
+    uint64_t physicalMemory;
+    NSUInteger activeProcessors;
+    uint16_t framesPerSecond;
+    CarPlayWLANAttachment wlanAttachment;
+} CarPlayDisplayProfile;
+
+static const char *first_existing_tool(const char *const paths[]);
+
+static NSData *capture_process_output(const char *path, char *const argv[]) {
+    int pipes[2];
+    if (!path || pipe(pipes) != 0) return nil;
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&actions, pipes[1], 1);
+    posix_spawn_file_actions_addopen(&actions, 2, "/dev/null", O_WRONLY, 0);
+    posix_spawn_file_actions_addclose(&actions, pipes[0]);
+    posix_spawn_file_actions_addclose(&actions, pipes[1]);
+
+    pid_t pid = 0;
+    int spawnError = posix_spawn(&pid, path, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(pipes[1]);
+    if (spawnError != 0) {
+        close(pipes[0]);
+        return nil;
+    }
+
+    NSMutableData *output = [NSMutableData data];
+    uint8_t buffer[8192];
+    for (;;) {
+        ssize_t count = read(pipes[0], buffer, sizeof(buffer));
+        if (count > 0) {
+            [output appendBytes:buffer length:(NSUInteger)count];
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    close(pipes[0]);
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return output;
+}
+
+static NSString *wlan_ioreg_snapshot(BOOL fullTree) {
+    const char *ioregPaths[] = { "/usr/sbin/ioreg", "/usr/bin/ioreg", NULL };
+    const char *ioreg = first_existing_tool(ioregPaths);
+    if (!ioreg) return nil;
+    char *fullArgv[] = {
+        (char *)"ioreg", (char *)"-l", (char *)"-w", (char *)"0", NULL
+    };
+    char *interfaceArgv[] = {
+        (char *)"ioreg", (char *)"-r", (char *)"-c",
+        (char *)"IO80211Interface", (char *)"-l", (char *)"-w",
+        (char *)"0", NULL
+    };
+    NSData *data = capture_process_output(
+        ioreg, fullTree ? fullArgv : interfaceArgv);
+    if (!data.length) return nil;
+    return [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+}
+
+typedef NS_ENUM(NSInteger, BluetoothRegistryProbeState) {
+    BluetoothRegistryProbeUnavailable = -1,
+    BluetoothRegistryProbeMissing = 0,
+    BluetoothRegistryProbeLegacyUART = 1,
+};
+
+static BluetoothRegistryProbeState bluetooth_registry_probe(void) {
+    @autoreleasepool {
+        NSString *tree = wlan_ioreg_snapshot(YES);
+        if (!tree.length) return BluetoothRegistryProbeUnavailable;
+
+        BOOL uartService =
+            [tree rangeOfString:@"<class AppleSimpleUARTSync"].location !=
+                NSNotFound;
+        BOOL bluetoothEndpoint =
+            [tree rangeOfString:@"\"IOTTYBaseName\" = \"bluetooth\""].location !=
+                NSNotFound ||
+            [tree rangeOfString:@"\"device_type\" = <\"bluetooth\">"].location !=
+                NSNotFound ||
+            [tree rangeOfString:@"com.apple.uart.bluetooth"].location !=
+                NSNotFound;
+        return uartService && bluetoothEndpoint
+            ? BluetoothRegistryProbeLegacyUART
+            : BluetoothRegistryProbeMissing;
+    }
+}
+
+static NSString *hardware_machine_identifier(void) {
+    char machine[128] = {0};
+    size_t length = sizeof(machine);
+    if (sysctlbyname("hw.machine", machine, &length, NULL, 0) == 0 &&
+        machine[0]) {
+        machine[sizeof(machine) - 1] = '\0';
+        return [NSString stringWithUTF8String:machine];
+    }
+    return @"unknown";
+}
+
+static NSString *bounded_log_tail(NSString *path, NSUInteger maxBytes,
+                                  NSUInteger maxLines) {
+    if (!path.length || maxBytes == 0 || maxLines == 0) return @"";
+    @try {
+        NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+        if (!handle) return @"";
+        unsigned long long end = [handle seekToEndOfFile];
+        unsigned long long start = end > maxBytes ? end - maxBytes : 0;
+        [handle seekToFileOffset:start];
+        NSData *data = [handle readDataToEndOfFile];
+        [handle closeFile];
+        if (!data.length) return @"";
+
+        NSString *text = [[NSString alloc] initWithData:data
+                                               encoding:NSUTF8StringEncoding];
+        if (!text) {
+            text = [[NSString alloc] initWithData:data
+                                         encoding:NSISOLatin1StringEncoding];
+        }
+        if (!text.length) return @"";
+        NSArray<NSString *> *lines =
+            [text componentsSeparatedByCharactersInSet:
+                [NSCharacterSet newlineCharacterSet]];
+        NSUInteger first = lines.count > maxLines ? lines.count - maxLines : 0;
+        NSArray<NSString *> *tail =
+            [lines subarrayWithRange:NSMakeRange(first, lines.count - first)];
+        return [tail componentsJoinedByString:@"\n"];
+    } @catch (__unused NSException *exception) {
+        return @"";
+    }
+}
+
+static NSString *bluetooth_failure_class(NSString *reason,
+                                         NSString *combinedLogs,
+                                         BluetoothRegistryProbeState registry) {
+    NSString *lower = [[NSString stringWithFormat:@"%@\n%@",
+                        reason ?: @"", combinedLogs ?: @""] lowercaseString];
+    if (registry == BluetoothRegistryProbeMissing)
+        return @"legacy-uart-transport-not-present";
+    if ([lower containsString:@"h4_open: ioctl failed"])
+        return @"private-uart-endpoint-unavailable";
+    if ([lower containsString:@"h4_open: socket failed"])
+        return @"netgraph-control-socket-unavailable";
+    if ([lower containsString:@"h4_open: connect failed"])
+        return @"bluetooth-uart-connect-failed";
+    if ([lower containsString:@"h4_open: getsockopt failed"] ||
+        [lower containsString:@"h4_open: setsockopt failed"])
+        return @"bluetooth-uart-configuration-failed";
+    if ([lower containsString:@"btstack_event_poweron_failed"] ||
+        [lower containsString:@"poweron_failed"])
+        return @"controller-power-on-failed";
+    if ([lower containsString:@"ioregisterforsystempower failed"])
+        return @"bluetooth-power-registration-failed";
+    if ([lower containsString:@"socket not available"])
+        return @"btstack-daemon-socket-unavailable";
+    if ([lower containsString:@"launch daemon failed"])
+        return @"btstack-launch-failed";
+    if ([lower containsString:@"ready sentinel"])
+        return @"no-hci-events-before-timeout";
+    return @"bluetooth-takeover-failed";
+}
+
+static NSString *bluetooth_diagnostic_report(
+    NSString *reason, BOOL retryAttempted,
+    BluetoothRegistryProbeState registry) {
+    NSString *initial = bounded_log_tail(
+        @LOG_DIR "/carplay_bt.log", 8192, 18);
+    NSString *retry = retryAttempted
+        ? bounded_log_tail(@LOG_DIR "/carplay_bt-retry.log", 8192, 18)
+        : @"";
+    NSString *daemon = bounded_log_tail(@"/var/log/BTstack.log", 8192, 18);
+    NSString *combined = [NSString stringWithFormat:@"%@\n%@\n%@",
+                          initial ?: @"", retry ?: @"", daemon ?: @""];
+    NSString *failureClass =
+        bluetooth_failure_class(reason, combined, registry);
+    NSString *registryText = registry == BluetoothRegistryProbeLegacyUART
+        ? @"legacy-uart-present"
+        : (registry == BluetoothRegistryProbeMissing
+            ? @"legacy-uart-missing" : @"unavailable");
+#ifdef SHOWCASE_ROOTLESS
+    NSString *layout = @"rootless";
+#else
+    NSString *layout = @"rootful";
+#endif
+
+    NSMutableString *report = [NSMutableString string];
+    [report appendString:@"Showcase Bluetooth compatibility report\n"];
+    [report appendFormat:@"version=%s\n", APP_VERSION];
+    [report appendFormat:@"device=%@\n", hardware_machine_identifier()];
+    [report appendFormat:@"ios=%@\n", [UIDevice currentDevice].systemVersion];
+    [report appendFormat:@"layout=%@ (diagnostic only)\n", layout];
+    [report appendFormat:@"failure_class=%@\n", failureClass];
+    [report appendFormat:@"stage=%@\n", reason ?: @"unknown"];
+    [report appendFormat:@"euid=%u\n", geteuid()];
+    [report appendFormat:@"registry=%@\n", registryText];
+    [report appendFormat:@"helper=%s executable=%s\n", BT_HELPER_NAME,
+        access([[[[NSBundle mainBundle] bundlePath]
+            stringByAppendingPathComponent:@BT_HELPER_NAME] UTF8String],
+            X_OK) == 0 ? "yes" : "no"];
+    [report appendFormat:@"btdaemon=%s executable=%s\n", BTDAEMON_PATH,
+        access(BTDAEMON_PATH, X_OK) == 0 ? "yes" : "no"];
+    [report appendFormat:@"libbtstack=%s readable=%s\n", BTSTACK_DYLIB_PATH,
+        access(BTSTACK_DYLIB_PATH, R_OK) == 0 ? "yes" : "no"];
+    [report appendFormat:@"launch_plist=%s readable=%s\n", BTSTACK_PLIST,
+        access(BTSTACK_PLIST, R_OK) == 0 ? "yes" : "no"];
+    [report appendFormat:@"retry=%@\n", retryAttempted ? @"yes" : @"no"];
+    if (initial.length)
+        [report appendFormat:@"\ncarplay_bt tail:\n%@\n", initial];
+    if (retry.length)
+        [report appendFormat:@"\ncarplay_bt retry tail:\n%@\n", retry];
+    if (daemon.length)
+        [report appendFormat:@"\nBTstack daemon tail:\n%@\n", daemon];
+    return report;
+}
+
+static CarPlayWLANAttachment wlan_attachment_class(void) {
+    @autoreleasepool {
+        NSString *tree = wlan_ioreg_snapshot(YES);
+        if (!tree.length) return CarPlayWLANAttachmentUnknown;
+
+        /*
+         * Match instantiated transport services and device-tree compatibility
+         * strings. Do not use the IOKitDiagnostics class table: a driver class
+         * may be present with zero live instances on unrelated hardware.
+         */
+        NSArray<NSString *> *hsicMarkers = @[
+            @"<class AppleBCMWLANBusInterfaceHSIC",
+            @"<class AppleBCMWLANChipManagerHSIC",
+            @"AppleBCMWLANBusInterfaceHSICShim",
+            @"wlan-hsic"
+        ];
+        for (NSString *marker in hsicMarkers) {
+            if ([tree rangeOfString:marker].location != NSNotFound)
+                return CarPlayWLANAttachmentHSIC;
+        }
+
+        NSArray<NSString *> *pcieMarkers = @[
+            @"<class AppleBCMWLANBusInterfacePCIe",
+            @"<class AppleBCMWLANPCIe",
+            @"wlan-pcie"
+        ];
+        for (NSString *marker in pcieMarkers) {
+            if ([tree rangeOfString:marker].location != NSNotFound)
+                return CarPlayWLANAttachmentPCIe;
+        }
+        return CarPlayWLANAttachmentUnknown;
+    }
+}
+
+static CarPlayDisplayProfile preferred_carplay_display_profile(void) {
+    UIScreen *screen = [UIScreen mainScreen];
+    CGSize nativeSize = [screen respondsToSelector:@selector(nativeBounds)]
+        ? screen.nativeBounds.size
+        : CGSizeMake(screen.bounds.size.width * screen.scale,
+                     screen.bounds.size.height * screen.scale);
+    double nativeLong = MAX(nativeSize.width, nativeSize.height);
+    double nativeShort = MIN(nativeSize.width, nativeSize.height);
+    double aspect = nativeShort > 0 ? nativeLong / nativeShort : (5.0 / 3.0);
+
+    NSProcessInfo *process = [NSProcessInfo processInfo];
+    uint64_t memory = process.physicalMemory;
+    NSUInteger processors = process.activeProcessorCount;
+    NSInteger screenFPS = [screen respondsToSelector:
+        @selector(maximumFramesPerSecond)] ? screen.maximumFramesPerSecond : 60;
+    uint16_t framesPerSecond = (uint16_t)MAX(30, MIN(screenFPS, 60));
+    CarPlayWLANAttachment wlanAttachment = wlan_attachment_class();
+    if (wlanAttachment == CarPlayWLANAttachmentHSIC)
+        framesPerSecond = MIN(framesPerSecond, 30);
+
+    /* Size the stream from runtime hardware capability, never jailbreak
+     * layout. One-gigabyte devices share memory bandwidth between UIKit,
+     * VideoToolbox, the CarPlay service, and the hotspot; a 960x720-class
+     * budget limits the shared memory and wireless working set.
+     * Two-gigabyte devices and above retain a 720p-class floor. */
+    uint64_t pixelBudget = 960ULL * 720ULL;
+    if (memory >= 1536ULL * 1024ULL * 1024ULL)
+        pixelBudget = 1280ULL * 720ULL;
+    if (memory >= 3ULL * 1024ULL * 1024ULL * 1024ULL && processors >= 4)
+        pixelBudget = 1600ULL * 900ULL;
+    if (memory >= 4ULL * 1024ULL * 1024ULL * 1024ULL && processors >= 6)
+        pixelBudget = 1920ULL * 1080ULL;
+    uint64_t nativePixels = (uint64_t)nativeLong * (uint64_t)nativeShort;
+    if (nativePixels > 0 && pixelBudget > nativePixels)
+        pixelBudget = nativePixels;
+
+    /* Search codec-friendly 16-pixel dimensions. The score rewards using
+     * the available decode budget but penalizes aspect error heavily, so the
+     * selected stream fills the physical display without stretching. */
+    uint16_t bestWidth = 800;
+    uint16_t bestHeight = 480;
+    double bestScore = -DBL_MAX;
+    uint16_t maxWidth = (uint16_t)(floor(MIN(nativeLong, 1920.0) / 16.0) * 16.0);
+    for (uint16_t candidateWidth = 640;
+         candidateWidth <= maxWidth;
+         candidateWidth = (uint16_t)(candidateWidth + 16)) {
+        uint16_t candidateHeight = (uint16_t)(
+            floor(((candidateWidth / aspect) / 16.0) + 0.5) * 16.0);
+        if (candidateHeight < 360 || candidateHeight > nativeShort) continue;
+        uint64_t pixels = (uint64_t)candidateWidth * candidateHeight;
+        if (pixels > pixelBudget) continue;
+        double candidateAspect =
+            (double)candidateWidth / (double)candidateHeight;
+        double aspectError = fabs(candidateAspect - aspect) / aspect;
+        double budgetUse = pixelBudget > 0
+            ? (double)pixels / (double)pixelBudget : 0;
+        double score = budgetUse - (aspectError * 10.0);
+        if (score > bestScore) {
+            bestScore = score;
+            bestWidth = candidateWidth;
+            bestHeight = candidateHeight;
+        }
+    }
+
+    CarPlayDisplayProfile profile = {
+        .width = bestWidth,
+        .height = bestHeight,
+        .nativeLong = (uint16_t)nativeLong,
+        .nativeShort = (uint16_t)nativeShort,
+        .pixelBudget = pixelBudget,
+        .physicalMemory = memory,
+        .activeProcessors = processors,
+        .framesPerSecond = framesPerSecond,
+        .wlanAttachment = wlanAttachment,
+    };
+    return profile;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * Touch IPC
  * ═══════════════════════════════════════════════════════════════ */
 
-static void send_touch(uint8_t phase, uint16_t x, uint16_t y) {
+static dispatch_queue_t touch_write_queue(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_touch_write_queue = dispatch_queue_create(
+            "com.rostane.showcase.touch-writer", DISPATCH_QUEUE_SERIAL);
+    });
+    return g_touch_write_queue;
+}
+
+static void send_ipc_payload(uint8_t type, const void *payload,
+                             uint32_t payloadLength) {
     int fd = g_touch_fd;
+    uint32_t epoch = g_touch_epoch;
     if (fd < 0) return;
-    uint8_t msg[10];
-    msg[0]=5; msg[1]=0; msg[2]=0; msg[3]=0;
-    msg[4]=MSG_TOUCH;
-    msg[5]=phase;
-    msg[6]=x & 0xFF; msg[7]=x >> 8;
-    msg[8]=y & 0xFF; msg[9]=y >> 8;
-    write(fd, msg, 10);
+
+    NSMutableData *message =
+        [NSMutableData dataWithLength:(NSUInteger)payloadLength + 5];
+    uint8_t *bytes = message.mutableBytes;
+    bytes[0] = payloadLength & 0xff;
+    bytes[1] = (payloadLength >> 8) & 0xff;
+    bytes[2] = (payloadLength >> 16) & 0xff;
+    bytes[3] = (payloadLength >> 24) & 0xff;
+    bytes[4] = type;
+    if (payloadLength) memcpy(bytes + 5, payload, payloadLength);
+
+    dispatch_async(touch_write_queue(), ^{
+        if (g_touch_fd != fd || g_touch_epoch != epoch) return;
+        const uint8_t *cursor = message.bytes;
+        size_t remaining = message.length;
+        while (remaining > 0) {
+            ssize_t written = write(fd, cursor, remaining);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                ip_log("IPC write failed type=0x%02x: %s",
+                       type, strerror(errno));
+                return;
+            }
+            cursor += written;
+            remaining -= (size_t)written;
+        }
+    });
+}
+
+/* Each record keeps the UIKit sample time even though the current single
+ * touch HID report has no timestamp field. Keeping it in IPC makes ordering
+ * measurable and leaves the transport ready for a richer HID descriptor.
+ * [phase][contact][x LE16][y LE16][timestampNs LE64] */
+static void send_touch_records(NSData *records) {
+    if (records.length == 0 || records.length > UINT32_MAX) return;
+    send_ipc_payload(MSG_TOUCH, records.bytes, (uint32_t)records.length);
+}
+
+static void send_app_visibility(uint8_t visible) {
+    uint8_t payload = visible ? 1 : 0;
+    send_ipc_payload(MSG_APP_VISIBILITY, &payload, sizeof(payload));
+}
+
+static void send_video_resync_request(void) {
+    uint8_t payload = 1;
+    send_ipc_payload(MSG_VIDEO_RESYNC, &payload, sizeof(payload));
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -195,6 +884,106 @@ static BOOL is_ap_up(void) {
     }
     freeifaddrs(ifa);
     return up;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * AWDL suppression during an active session
+ *
+ * AWDL is the radio Apple uses for AirDrop, Handoff and Continuity. It shares
+ * the single Wi-Fi radio with the Personal Hotspot that carries CarPlay, and it
+ * periodically pulls that radio onto its own social channels — 6 in the 2.4 GHz
+ * band, which is where this receiver's low-latency interface was observed
+ * sitting. While the radio is away, nothing is received, and the screen stream
+ * arrives as a late burst afterwards. The published symptom of AWDL contention
+ * is 50-200 ms stalls, which matches the residual lateness spikes measured here.
+ *
+ * This touches no part of pairing, iAP2, BAA or the RTSP negotiation. It is
+ * applied only once a session is fully established and streaming, and undone
+ * when the session ends, so the protocol phase is never affected. Bringing the
+ * interface down costs AirDrop and Handoff for the duration — an acceptable
+ * trade on a device dedicated to being a head unit.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* llw0 does not exist before iOS 13 — verified absent on the iOS 12 receiver
+ * and present on the iOS 15 one — so every entry is probed, never assumed. */
+static const char *const kAWDLInterfaces[] = { "awdl0", "llw0" };
+#define AWDL_INTERFACE_COUNT (sizeof(kAWDLInterfaces) / sizeof(kAWDLInterfaces[0]))
+#define AWDL_REASSERT_SECONDS  10.0
+
+/* Only interfaces this code actually took down are brought back, so a receiver
+ * where the user had already disabled AirDrop is left as it was found. */
+static BOOL g_awdl_was_up[AWDL_INTERFACE_COUNT];
+
+static BOOL interface_exists(const char *name) {
+    return if_nametoindex(name) != 0;
+}
+
+/* Returns YES when the interface ended up in the requested state. */
+static BOOL set_interface_up(const char *name, BOOL up) {
+    if (!name || !interface_exists(name)) return NO;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return NO;
+
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+
+    BOOL ok = NO;
+    if (ioctl(fd, SIOCGIFFLAGS, &request) == 0) {
+        short current = request.ifr_flags;
+        short wanted = up ? (current | IFF_UP) : (current & (short)~IFF_UP);
+        if (wanted == current) {
+            ok = YES;
+        } else {
+            request.ifr_flags = wanted;
+            ok = (ioctl(fd, SIOCSIFFLAGS, &request) == 0);
+            if (!ok)
+                ip_log("AWDL: %s %s failed: %s", name,
+                       up ? "up" : "down", strerror(errno));
+        }
+    }
+    close(fd);
+    return ok;
+}
+
+static BOOL interface_is_up(const char *name) {
+    if (!name || !interface_exists(name)) return NO;
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return NO;
+    struct ifreq request;
+    memset(&request, 0, sizeof(request));
+    strncpy(request.ifr_name, name, IFNAMSIZ - 1);
+    BOOL up = NO;
+    if (ioctl(fd, SIOCGIFFLAGS, &request) == 0)
+        up = (request.ifr_flags & IFF_UP) != 0;
+    close(fd);
+    return up;
+}
+
+/* iOS brings AWDL back on its own whenever a Continuity service wants it, so
+ * the suppression is re-asserted on a slow timer rather than set once. */
+static volatile int32_t g_awdl_suppressed = 0;
+
+static void awdl_suppress(BOOL logEachInterface) {
+    for (size_t i = 0; i < AWDL_INTERFACE_COUNT; i++) {
+        const char *name = kAWDLInterfaces[i];
+        if (!interface_exists(name)) { g_awdl_was_up[i] = NO; continue; }
+        if (!interface_is_up(name)) continue;   /* already down; leave it */
+        g_awdl_was_up[i] = YES;
+        if (set_interface_up(name, NO) && logEachInterface)
+            ip_log("AWDL: %s -> down", name);
+    }
+}
+
+static void awdl_restore(BOOL logEachInterface) {
+    for (size_t i = 0; i < AWDL_INTERFACE_COUNT; i++) {
+        if (!g_awdl_was_up[i]) continue;
+        const char *name = kAWDLInterfaces[i];
+        g_awdl_was_up[i] = NO;
+        if (!interface_exists(name) || interface_is_up(name)) continue;
+        if (set_interface_up(name, YES) && logEachInterface)
+            ip_log("AWDL: %s -> up", name);
+    }
 }
 
 static const char *first_existing_tool(const char *const paths[]) {
@@ -400,7 +1189,7 @@ static void kill_pid(pid_t pid) {
     int status; waitpid(pid, &status, WNOHANG);
 }
 
-static void signal_processes_named(const char *name, int sig) {
+static void signal_processes_named(const char *name, int sig, pid_t preservedPid) {
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
     size_t len = 0;
     if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return;
@@ -417,7 +1206,7 @@ static void signal_processes_named(const char *name, int sig) {
     for (int i = 0; i < count; i++) {
         pid_t pid = procs[i].kp_proc.p_pid;
         const char *comm = procs[i].kp_proc.p_comm;
-        if (pid <= 0 || pid == self) continue;
+        if (pid <= 0 || pid == self || pid == preservedPid) continue;
         if (strcmp(comm, name) != 0) continue;
         ip_log("reap stale helper: kill -%d %s pid=%d", sig, name, pid);
         kill(pid, sig);
@@ -425,7 +1214,7 @@ static void signal_processes_named(const char *name, int sig) {
     free(procs);
 }
 
-static void reap_stale_helpers(void) {
+static void reap_stale_helpers(pid_t preservedPid) {
     const char *names[] = {
         "carplay_services",
         "carplay_bt",
@@ -435,10 +1224,12 @@ static void reap_stale_helpers(void) {
         "BTdaemon"
     };
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-        signal_processes_named(names[i], SIGTERM);
+        signal_processes_named(names[i], SIGTERM, preservedPid);
     usleep(700000);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
-        signal_processes_named(names[i], SIGKILL);
+        signal_processes_named(names[i], SIGKILL, preservedPid);
+    if (preservedPid <= 0)
+        unlink(BAA_BROKER_PATH);
     unlink(SOCK_PATH);
 #ifdef SHOWCASE_ROOTLESS
     unlink(BTSTACK_SOCKET);
@@ -606,6 +1397,664 @@ static NSString *validateSSID(NSString *ssid) {
 @end
 
 /* ═══════════════════════════════════════════════════════════════
+ * CarPlayAudioPlayer — one Audio Queue per negotiated CarPlay stream
+ *
+ * Wireless CarPlay supplies codec packets rather than an audio file.
+ * Audio Queue accepts AAC/AAC-ELD/Opus packets directly and uses the system
+ * codec, avoiding an extra PCM copy and keeping decoding off the IPC path.
+ * ═══════════════════════════════════════════════════════════════ */
+
+@interface CarPlayAudioPlayer : NSObject {
+    AudioQueueRef _audioQueue;
+    AudioConverterRef _audioConverter;
+    uint32_t _streamType;
+    uint64_t _formatMask;
+    uint32_t _framesPerPacket;
+    uint32_t _latencyMs;
+    Float64 _sampleRate;
+    UInt32 _channels;
+    UInt32 _decodedBytesPerFrame;
+    uint64_t _decodedPackets;
+    NSUInteger _queuedPackets;
+    NSUInteger _requiredStartPackets;
+    volatile int32_t _outstandingBuffers;
+    uint64_t _queueDrainCount;
+    BOOL _started;
+    BOOL _paused;
+    BOOL _isPCM;
+    BOOL _decodeAACToPCM;
+    BOOL _haveSequence;
+    uint16_t _lastSequence;
+    uint64_t _lastRenderReportNanos;
+}
+- (instancetype)initWithStreamType:(uint32_t)streamType;
+- (BOOL)configureFormat:(uint64_t)formatMask
+        framesPerPacket:(uint32_t)framesPerPacket
+               latency:(uint32_t)latencyMs;
+- (void)enqueuePacket:(const uint8_t *)bytes
+               length:(uint32_t)length
+             sequence:(uint16_t)sequence;
+- (void)completedBuffer:(AudioQueueBufferRef)buffer
+               forQueue:(AudioQueueRef)queue;
+- (void)reportPlaybackTimeForQueue:(AudioQueueRef)queue;
+- (void)setPlaybackPaused:(BOOL)paused;
+- (void)flushBufferedAudio;
+- (void)stop;
+@end
+
+static void carplay_audio_queue_callback(void *userData, AudioQueueRef queue,
+                                         AudioQueueBufferRef buffer) {
+    CarPlayAudioPlayer *player =
+        (__bridge CarPlayAudioPlayer *)userData;
+    [player completedBuffer:buffer forQueue:queue];
+}
+
+typedef struct {
+    const uint8_t *bytes;
+    UInt32 length;
+    UInt32 channels;
+    BOOL consumed;
+    AudioStreamPacketDescription packet;
+} CarPlayAACInputContext;
+
+static OSStatus carplay_aac_input_callback(
+    AudioConverterRef converter,
+    UInt32 *ioNumberDataPackets,
+    AudioBufferList *ioData,
+    AudioStreamPacketDescription **outPacketDescription,
+    void *userData) {
+    (void)converter;
+    CarPlayAACInputContext *input =
+        (CarPlayAACInputContext *)userData;
+    if (!input || input->consumed || !input->bytes || input->length == 0) {
+        *ioNumberDataPackets = 0;
+        return noErr;
+    }
+
+    ioData->mNumberBuffers = 1;
+    ioData->mBuffers[0].mNumberChannels = input->channels;
+    ioData->mBuffers[0].mDataByteSize = input->length;
+    ioData->mBuffers[0].mData = (void *)input->bytes;
+    input->packet.mStartOffset = 0;
+    input->packet.mVariableFramesInPacket = 0;
+    input->packet.mDataByteSize = input->length;
+    if (outPacketDescription)
+        *outPacketDescription = &input->packet;
+    *ioNumberDataPackets = 1;
+    input->consumed = YES;
+    return noErr;
+}
+
+@implementation CarPlayAudioPlayer
+
+- (instancetype)initWithStreamType:(uint32_t)streamType {
+    if ((self = [super init])) _streamType = streamType;
+    return self;
+}
+
+- (BOOL)configureFormat:(uint64_t)formatMask
+        framesPerPacket:(uint32_t)framesPerPacket
+               latency:(uint32_t)latencyMs {
+    [self stop];
+
+    Float64 sampleRate = 0;
+    UInt32 channels = 0;
+    AudioFormatID formatID = 0;
+    uint32_t defaultFrames = 0;
+    BOOL isPCM = NO;
+    switch (formatMask) {
+        case 0x00000004ULL: /* PCM 8 kHz, 16-bit mono */
+            sampleRate = 8000; channels = 1;
+            formatID = kAudioFormatLinearPCM; defaultFrames = 1;
+            isPCM = YES; break;
+        case 0x00000010ULL: /* PCM 16 kHz, 16-bit mono */
+            sampleRate = 16000; channels = 1;
+            formatID = kAudioFormatLinearPCM; defaultFrames = 1;
+            isPCM = YES; break;
+        case 0x00000040ULL: /* PCM 24 kHz, 16-bit mono */
+            sampleRate = 24000; channels = 1;
+            formatID = kAudioFormatLinearPCM; defaultFrames = 1;
+            isPCM = YES; break;
+        case 0x00000800ULL: /* PCM 44.1 kHz, 16-bit stereo */
+            sampleRate = 44100; channels = 2;
+            formatID = kAudioFormatLinearPCM; defaultFrames = 1;
+            isPCM = YES; break;
+        case 0x00008000ULL: /* PCM 48 kHz, 16-bit stereo */
+            sampleRate = 48000; channels = 2;
+            formatID = kAudioFormatLinearPCM; defaultFrames = 1;
+            isPCM = YES; break;
+        case 0x00400000ULL: /* AAC-LC 44.1 kHz stereo */
+            sampleRate = 44100; channels = 2;
+            formatID = kAudioFormatMPEG4AAC; defaultFrames = 1024; break;
+        case 0x00800000ULL: /* AAC-LC 48 kHz stereo */
+            sampleRate = 48000; channels = 2;
+            formatID = kAudioFormatMPEG4AAC; defaultFrames = 1024; break;
+        case 0x01000000ULL: /* AAC-ELD 44.1 kHz stereo */
+            sampleRate = 44100; channels = 2;
+            formatID = kAudioFormatMPEG4AAC_ELD; defaultFrames = 512; break;
+        case 0x02000000ULL: /* AAC-ELD 48 kHz stereo */
+            sampleRate = 48000; channels = 2;
+            formatID = kAudioFormatMPEG4AAC_ELD; defaultFrames = 512; break;
+        case 0x04000000ULL: /* AAC-ELD 16 kHz mono */
+            sampleRate = 16000; channels = 1;
+            formatID = kAudioFormatMPEG4AAC_ELD; defaultFrames = 512; break;
+        case 0x08000000ULL: /* AAC-ELD 24 kHz mono */
+            sampleRate = 24000; channels = 1;
+            formatID = kAudioFormatMPEG4AAC_ELD; defaultFrames = 512; break;
+        case 0x10000000ULL: /* Opus 16 kHz mono, 20 ms */
+            sampleRate = 16000; channels = 1;
+            formatID = (AudioFormatID)0x6f707573U; defaultFrames = 320; break;
+        case 0x20000000ULL: /* Opus 24 kHz mono, 20 ms */
+            sampleRate = 24000; channels = 1;
+            formatID = (AudioFormatID)0x6f707573U; defaultFrames = 480; break;
+        case 0x40000000ULL: /* Opus 48 kHz mono, 20 ms */
+            sampleRate = 48000; channels = 1;
+            formatID = (AudioFormatID)0x6f707573U; defaultFrames = 960; break;
+        default:
+            ip_log("audio stream %u unsupported format=0x%llx",
+                   _streamType, (unsigned long long)formatMask);
+            return NO;
+    }
+
+    NSError *sessionError = nil;
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    [session setCategory:AVAudioSessionCategoryPlayback
+                    mode:AVAudioSessionModeDefault
+                 options:0 error:&sessionError];
+    if (!sessionError) [session setActive:YES error:&sessionError];
+    if (sessionError) {
+        ip_log("audio session activation failed: %s",
+               sessionError.localizedDescription.UTF8String);
+    }
+
+    AudioStreamBasicDescription asbd;
+    memset(&asbd, 0, sizeof(asbd));
+    asbd.mSampleRate = sampleRate;
+    asbd.mFormatID = formatID;
+    asbd.mChannelsPerFrame = channels;
+    if (isPCM) {
+        /* AirPlay PCM is signed, packed, 16-bit network byte order. */
+        asbd.mFormatFlags =
+            kLinearPCMFormatFlagIsSignedInteger |
+            kLinearPCMFormatFlagIsPacked |
+            kLinearPCMFormatFlagIsBigEndian;
+        asbd.mBitsPerChannel = 16;
+        asbd.mBytesPerFrame = channels * 2;
+        asbd.mFramesPerPacket = 1;
+        asbd.mBytesPerPacket = asbd.mBytesPerFrame;
+    } else {
+        asbd.mFramesPerPacket =
+            framesPerPacket > 0 ? framesPerPacket : defaultFrames;
+    }
+
+    /*
+     * MainHighAudio (type 102) is a one-second-latency UDP media stream.
+     * Apple's receiver decodes its AAC access units to PCM before handing
+     * them to the platform audio device. Keep MainBuffered type 103 on the
+     * proven direct AudioQueue path, but mirror Apple's decode boundary for
+     * type 102. The PCM meter then distinguishes encoded-data problems from
+     * output routing problems in the same run.
+     */
+    AudioStreamBasicDescription queueASBD = asbd;
+    _decodeAACToPCM =
+        _streamType == 102 &&
+        (formatMask == 0x00400000ULL ||
+         formatMask == 0x00800000ULL);
+    if (_decodeAACToPCM) {
+        memset(&queueASBD, 0, sizeof(queueASBD));
+        queueASBD.mSampleRate = sampleRate;
+        queueASBD.mFormatID = kAudioFormatLinearPCM;
+        queueASBD.mFormatFlags =
+            kLinearPCMFormatFlagIsSignedInteger |
+            kLinearPCMFormatFlagIsPacked;
+        queueASBD.mChannelsPerFrame = channels;
+        queueASBD.mBitsPerChannel = 16;
+        queueASBD.mBytesPerFrame = channels * 2;
+        queueASBD.mFramesPerPacket = 1;
+        queueASBD.mBytesPerPacket = queueASBD.mBytesPerFrame;
+        OSStatus converterStatus =
+            AudioConverterNew(&asbd, &queueASBD, &_audioConverter);
+        if (converterStatus != noErr || !_audioConverter) {
+            ip_log("audio stream %u AAC converter create failed status=%d",
+                   _streamType, (int)converterStatus);
+            _audioConverter = NULL;
+            return NO;
+        }
+    }
+
+    OSStatus status = AudioQueueNewOutput(
+        &queueASBD, carplay_audio_queue_callback, (__bridge void *)self,
+        NULL, NULL, 0,
+        &_audioQueue);
+    if (status != noErr || !_audioQueue) {
+        ip_log("audio stream %u queue create failed status=%d",
+               _streamType, (int)status);
+        _audioQueue = NULL;
+        if (_audioConverter) {
+            AudioConverterDispose(_audioConverter);
+            _audioConverter = NULL;
+        }
+        return NO;
+    }
+    AudioQueueSetParameter(_audioQueue, kAudioQueueParam_Volume, 1.0f);
+    _formatMask = formatMask;
+    _framesPerPacket = asbd.mFramesPerPacket;
+    _latencyMs = latencyMs;
+    _sampleRate = sampleRate;
+    _channels = channels;
+    _decodedBytesPerFrame = queueASBD.mBytesPerFrame;
+    _decodedPackets = 0;
+    _isPCM = isPCM || _decodeAACToPCM;
+    _queuedPackets = 0;
+    /*
+     * MainHighAudio is a jitter-buffered media stream. The sender asked for
+     * one second of latency in every observed Spotify SETUP, but starting
+     * after the old six-packet floor left only 139 ms at 44.1 kHz. Video
+     * bursts on the shared IPC path routinely exceed that and drained the
+     * queue. Other stream types retain the proven six-packet start.
+     */
+    _requiredStartPackets = 6;
+    if (_streamType == 102 && latencyMs > 0 &&
+        sampleRate > 0 && _framesPerPacket > 0) {
+        double requestedPackets =
+            ((double)latencyMs * sampleRate) /
+            (1000.0 * (double)_framesPerPacket);
+        _requiredStartPackets =
+            MAX((NSUInteger)6, (NSUInteger)ceil(requestedPackets));
+    }
+    _outstandingBuffers = 0;
+    _queueDrainCount = 0;
+    _started = NO;
+    _paused = NO;
+    _haveSequence = NO;
+    _lastRenderReportNanos = 0;
+    ip_log("audio stream %u configured format=0x%llx %.0fHz/%uch "
+           "framesPerPacket=%u latency=%ums startPackets=%lu output=%s",
+           _streamType, (unsigned long long)_formatMask, sampleRate,
+           (unsigned)channels, _framesPerPacket, _latencyMs,
+           (unsigned long)_requiredStartPackets,
+           _decodeAACToPCM ? "decoded-pcm" : "direct");
+    return YES;
+}
+
+- (void)enqueuePacket:(const uint8_t *)bytes
+               length:(uint32_t)length
+             sequence:(uint16_t)sequence {
+    if (!_audioQueue || !bytes || length == 0) return;
+    if (_haveSequence && sequence != (uint16_t)(_lastSequence + 1)) {
+        ip_log("audio stream %u RTP gap expected=%u got=%u",
+               _streamType, (uint16_t)(_lastSequence + 1), sequence);
+    }
+    _lastSequence = sequence;
+    _haveSequence = YES;
+
+    UInt32 queueLength = _decodeAACToPCM
+        ? _framesPerPacket * _decodedBytesPerFrame : length;
+    AudioQueueBufferRef buffer = NULL;
+    OSStatus status =
+        AudioQueueAllocateBuffer(_audioQueue, queueLength, &buffer);
+    if (status != noErr || !buffer) {
+        ip_log("audio stream %u buffer allocation failed status=%d",
+               _streamType, (int)status);
+        return;
+    }
+
+    if (_decodeAACToPCM) {
+        CarPlayAACInputContext input = {
+            .bytes = bytes,
+            .length = length,
+            .channels = _channels,
+            .consumed = NO
+        };
+        AudioBufferList output;
+        memset(&output, 0, sizeof(output));
+        output.mNumberBuffers = 1;
+        output.mBuffers[0].mNumberChannels = _channels;
+        output.mBuffers[0].mDataByteSize = queueLength;
+        output.mBuffers[0].mData = buffer->mAudioData;
+        UInt32 outputPackets = _framesPerPacket;
+        status = AudioConverterFillComplexBuffer(
+            _audioConverter, carplay_aac_input_callback, &input,
+            &outputPackets, &output, NULL);
+        if (status != noErr || output.mBuffers[0].mDataByteSize == 0) {
+            AudioQueueFreeBuffer(_audioQueue, buffer);
+            ip_log("audio stream %u AAC decode failed status=%d bytes=%u",
+                   _streamType, (int)status, length);
+            return;
+        }
+        buffer->mAudioDataByteSize =
+            output.mBuffers[0].mDataByteSize;
+        _decodedPackets++;
+        if (_decodedPackets <= 3 || (_decodedPackets % 250) == 0) {
+            const int16_t *samples =
+                (const int16_t *)buffer->mAudioData;
+            size_t sampleCount =
+                buffer->mAudioDataByteSize / sizeof(int16_t);
+            double squareSum = 0.0;
+            for (size_t index = 0; index < sampleCount; index++) {
+                double value = (double)samples[index] / 32768.0;
+                squareSum += value * value;
+            }
+            double rms = sampleCount > 0
+                ? sqrt(squareSum / (double)sampleCount) : 0.0;
+            ip_log("audio stream %u decoded #%llu in=%u out=%u "
+                   "frames=%u rms=%.6f",
+                   _streamType,
+                   (unsigned long long)_decodedPackets,
+                   length, buffer->mAudioDataByteSize,
+                   outputPackets, rms);
+        }
+    } else {
+        memcpy(buffer->mAudioData, bytes, length);
+        buffer->mAudioDataByteSize = length;
+    }
+    if (_isPCM) {
+        status = AudioQueueEnqueueBuffer(_audioQueue, buffer, 0, NULL);
+    } else {
+        AudioStreamPacketDescription packet = {
+            .mStartOffset = 0,
+            .mVariableFramesInPacket = _framesPerPacket,
+            .mDataByteSize = length
+        };
+        status = AudioQueueEnqueueBuffer(_audioQueue, buffer, 1, &packet);
+    }
+    if (status != noErr) {
+        AudioQueueFreeBuffer(_audioQueue, buffer);
+        ip_log("audio stream %u enqueue failed status=%d",
+               _streamType, (int)status);
+        return;
+    }
+
+    int32_t outstanding =
+        __sync_add_and_fetch(&_outstandingBuffers, 1);
+    _queuedPackets++;
+    if (!_started && !_paused &&
+        outstanding >= (int32_t)_requiredStartPackets) {
+        UInt32 preparedFrames = 0;
+        AudioQueuePrime(_audioQueue, 0, &preparedFrames);
+        status = AudioQueueStart(_audioQueue, NULL);
+        _started = status == noErr;
+        if (_started) _paused = NO;
+        ip_log("audio stream %u playback start status=%d primed=%u "
+               "buffered=%d/%lu",
+               _streamType, (int)status, preparedFrames, outstanding,
+               (unsigned long)_requiredStartPackets);
+    }
+    if ((_queuedPackets % 500) == 0) {
+        ip_log("audio stream %u live packets=%lu",
+               _streamType, (unsigned long)_queuedPackets);
+    }
+}
+
+- (void)completedBuffer:(AudioQueueBufferRef)buffer
+               forQueue:(AudioQueueRef)queue {
+    [self reportPlaybackTimeForQueue:queue];
+    int32_t outstanding =
+        __sync_sub_and_fetch(&_outstandingBuffers, 1);
+    if (_started && !_paused && outstanding == 0) {
+        _queueDrainCount++;
+        ip_log("audio stream %u queue drained #%llu packets=%lu",
+               _streamType, (unsigned long long)_queueDrainCount,
+               (unsigned long)_queuedPackets);
+    }
+    AudioQueueFreeBuffer(queue, buffer);
+}
+
+- (void)setPlaybackPaused:(BOOL)paused {
+    if (!_audioQueue) return;
+
+    if (paused) {
+        _paused = YES;
+        OSStatus status = _started
+            ? AudioQueuePause(_audioQueue) : noErr;
+        ip_log("audio stream %u pause status=%d started=%d queued=%lu",
+               _streamType, (int)status, (int)_started,
+               (unsigned long)_queuedPackets);
+        return;
+    }
+
+    _paused = NO;
+    OSStatus status = noErr;
+    UInt32 preparedFrames = 0;
+    if (_started) {
+        status = AudioQueueStart(_audioQueue, NULL);
+    } else if (_outstandingBuffers >= (int32_t)_requiredStartPackets) {
+        AudioQueuePrime(_audioQueue, 0, &preparedFrames);
+        status = AudioQueueStart(_audioQueue, NULL);
+        _started = status == noErr;
+    }
+    ip_log("audio stream %u resume status=%d started=%d queued=%lu primed=%u",
+           _streamType, (int)status, (int)_started,
+           (unsigned long)_queuedPackets, preparedFrames);
+}
+
+- (void)flushBufferedAudio {
+    if (!_audioQueue) return;
+
+    /*
+     * AudioQueueFlush drains already-enqueued buffers, which is the opposite
+     * of AirPlay's FLUSHBUFFERED transition. Reset returns those buffers
+     * immediately and preserves the queue's negotiated format. Keep the
+     * paused state established by SETRATEANCHORTIME rate=0; the new RTP epoch
+     * will not start until the following rate=1 command.
+     */
+    BOOL wasPaused = _paused;
+    _started = NO;
+    _queuedPackets = 0;
+    _haveSequence = NO;
+    _lastRenderReportNanos = 0;
+    OSStatus status = AudioQueueReset(_audioQueue);
+    _outstandingBuffers = 0;
+    if (_audioConverter) AudioConverterReset(_audioConverter);
+    _paused = wasPaused;
+    ip_log("audio stream %u buffered flush status=%d paused=%d",
+           _streamType, (int)status, (int)_paused);
+}
+
+- (void)reportPlaybackTimeForQueue:(AudioQueueRef)queue {
+    if (!queue || queue != _audioQueue || !_started) return;
+
+    uint64_t nowNanos = monotonic_nanos_now();
+    if (_lastRenderReportNanos != 0 &&
+        nowNanos - _lastRenderReportNanos < 250 * NSEC_PER_MSEC) {
+        return;
+    }
+
+    AudioTimeStamp audioTime;
+    memset(&audioTime, 0, sizeof(audioTime));
+    Boolean discontinuity = false;
+    OSStatus status = AudioQueueGetCurrentTime(
+        queue, NULL, &audioTime, &discontinuity);
+    if (status != noErr ||
+        !(audioTime.mFlags & kAudioTimeStampSampleTimeValid)) {
+        return;
+    }
+
+    int64_t sampleTime = (int64_t)llround(audioTime.mSampleTime);
+    uint64_t hostTicks =
+        (audioTime.mFlags & kAudioTimeStampHostTimeValid)
+            ? audioTime.mHostTime : mach_absolute_time();
+    uint8_t payload[20] = {0};
+    memcpy(payload, &_streamType, 4);
+    memcpy(payload + 4, &sampleTime, 8);
+    memcpy(payload + 12, &hostTicks, 8);
+    send_ipc_payload(MSG_AUDIO_RENDER, payload, sizeof(payload));
+    _lastRenderReportNanos = nowNanos;
+
+    if (discontinuity) {
+        ip_log("audio stream %u render clock discontinuity sample=%lld",
+               _streamType, (long long)sampleTime);
+    }
+}
+
+- (void)stop {
+    if (_audioQueue) {
+        AudioQueueStop(_audioQueue, true);
+        AudioQueueDispose(_audioQueue, true);
+        _audioQueue = NULL;
+    }
+    if (_audioConverter) {
+        AudioConverterDispose(_audioConverter);
+        _audioConverter = NULL;
+    }
+    _decodeAACToPCM = NO;
+    _decodedPackets = 0;
+    _sampleRate = 0;
+    _latencyMs = 0;
+    _requiredStartPackets = 6;
+    _outstandingBuffers = 0;
+    _queueDrainCount = 0;
+    _started = NO;
+    _paused = NO;
+    _queuedPackets = 0;
+    _haveSequence = NO;
+    _lastRenderReportNanos = 0;
+}
+
+- (void)dealloc {
+    [self stop];
+}
+@end
+
+/* Full-screen pause-menu scrim. It consumes ordinary touches so CarPlay
+ * receives no input until another three-finger tap dismisses it. */
+@interface ControlsOverlayView : UIView
+@end
+@implementation ControlsOverlayView
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {}
+@end
+
+/* A bounded, scrollable compatibility report. Bluetooth failures used to
+ * return the state machine to Idle with no user-visible explanation; a long
+ * raw daemon log also does not belong in a UIAlertController message. */
+@interface CompatibilityErrorViewController : UIViewController
+@property (nonatomic, copy) NSString *errorTitle;
+@property (nonatomic, copy) NSString *explanation;
+@property (nonatomic, copy) NSString *diagnostic;
+@property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UILabel *explanationLabel;
+@property (nonatomic, strong) UITextView *diagnosticView;
+@property (nonatomic, strong) UIButton *diagnosticCopyButton;
+@property (nonatomic, strong) UIButton *closeButton;
+@end
+
+@implementation CompatibilityErrorViewController
+
+- (void)loadView {
+    UIView *root = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    root.backgroundColor = [UIColor colorWithWhite:0 alpha:0.82];
+    self.view = root;
+
+    self.panel = [[UIView alloc] init];
+    self.panel.backgroundColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+    self.panel.layer.cornerRadius = 16;
+    self.panel.layer.masksToBounds = YES;
+    [root addSubview:self.panel];
+
+    self.titleLabel = [[UILabel alloc] init];
+    self.titleLabel.textColor = [UIColor whiteColor];
+    self.titleLabel.font =
+        [UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];
+    self.titleLabel.textAlignment = NSTextAlignmentCenter;
+    [self.panel addSubview:self.titleLabel];
+
+    self.explanationLabel = [[UILabel alloc] init];
+    self.explanationLabel.textColor =
+        [UIColor colorWithWhite:1.0 alpha:0.72];
+    self.explanationLabel.font = [UIFont systemFontOfSize:14];
+    self.explanationLabel.numberOfLines = 3;
+    self.explanationLabel.textAlignment = NSTextAlignmentCenter;
+    [self.panel addSubview:self.explanationLabel];
+
+    self.diagnosticView = [[UITextView alloc] init];
+    self.diagnosticView.editable = NO;
+    self.diagnosticView.selectable = YES;
+    self.diagnosticView.alwaysBounceVertical = YES;
+    self.diagnosticView.backgroundColor =
+        [UIColor colorWithWhite:0 alpha:0.38];
+    self.diagnosticView.textColor =
+        [UIColor colorWithWhite:1.0 alpha:0.88];
+    self.diagnosticView.font =
+        [UIFont fontWithName:@"Menlo-Regular" size:11] ?:
+            [UIFont systemFontOfSize:11];
+    self.diagnosticView.layer.cornerRadius = 8;
+    self.diagnosticView.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    [self.panel addSubview:self.diagnosticView];
+
+    self.diagnosticCopyButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.diagnosticCopyButton.backgroundColor = [UIColor whiteColor];
+    [self.diagnosticCopyButton setTitleColor:[UIColor blackColor]
+                                    forState:UIControlStateNormal];
+    [self.diagnosticCopyButton setTitle:@"Copy Diagnostic"
+                               forState:UIControlStateNormal];
+    self.diagnosticCopyButton.titleLabel.font =
+        [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    self.diagnosticCopyButton.layer.cornerRadius = 9;
+    [self.diagnosticCopyButton addTarget:self action:@selector(copyDiagnostic)
+                        forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:self.diagnosticCopyButton];
+
+    self.closeButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.closeButton.backgroundColor = [UIColor colorWithWhite:1 alpha:0.13];
+    [self.closeButton setTitleColor:[UIColor whiteColor]
+                           forState:UIControlStateNormal];
+    [self.closeButton setTitle:@"Close" forState:UIControlStateNormal];
+    self.closeButton.titleLabel.font =
+        [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+    self.closeButton.layer.cornerRadius = 9;
+    [self.closeButton addTarget:self action:@selector(close)
+               forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:self.closeButton];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    self.titleLabel.text = self.errorTitle;
+    self.explanationLabel.text = self.explanation;
+    self.diagnosticView.text = self.diagnostic;
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGSize size = self.view.bounds.size;
+    CGFloat panelWidth = MIN(size.width - 32.0, 720.0);
+    CGFloat panelHeight = MIN(size.height - 24.0, 520.0);
+    self.panel.frame = CGRectMake((size.width - panelWidth) / 2.0,
+                                  (size.height - panelHeight) / 2.0,
+                                  panelWidth, panelHeight);
+    CGFloat inset = 18.0;
+    self.titleLabel.frame = CGRectMake(inset, 14, panelWidth - inset * 2, 32);
+    self.explanationLabel.frame =
+        CGRectMake(inset, 48, panelWidth - inset * 2, 58);
+    CGFloat buttonsY = panelHeight - 56;
+    self.diagnosticView.frame =
+        CGRectMake(inset, 112, panelWidth - inset * 2,
+                   MAX(56, buttonsY - 122));
+    CGFloat gap = 12;
+    CGFloat buttonWidth = (panelWidth - inset * 2 - gap) / 2.0;
+    self.diagnosticCopyButton.frame =
+        CGRectMake(inset, buttonsY, buttonWidth, 40);
+    self.closeButton.frame =
+        CGRectMake(inset + buttonWidth + gap, buttonsY, buttonWidth, 40);
+}
+
+- (void)copyDiagnostic {
+    [UIPasteboard generalPasteboard].string = self.diagnostic ?: @"";
+    [self.diagnosticCopyButton setTitle:@"Copied"
+                               forState:UIControlStateNormal];
+}
+
+- (void)close {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+/* ═══════════════════════════════════════════════════════════════
  * RootViewController — landscape-only, both directions, touch routing
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -672,15 +2121,46 @@ static NSString *validateSSID(NSString *ssid) {
     *outY = (uint16_t)(ny * ch);
     return YES;
 }
-- (void)handleTouches:(NSSet<UITouch *> *)t phase:(uint8_t)p {
-    UITouch *touch = [t anyObject];
-    uint16_t x, y;
-    if ([self mapTouch:touch toX:&x y:&y]) send_touch(p, x, y);
+- (void)handleTouches:(NSSet<UITouch *> *)touches
+                event:(UIEvent *)event
+                phase:(uint8_t)phase {
+    NSMutableData *records = [NSMutableData data];
+    for (UITouch *touch in touches) {
+        NSArray<UITouch *> *samples = nil;
+        if (phase == TOUCH_MOVE) {
+            samples = [event coalescedTouchesForTouch:touch];
+        }
+        if (samples.count == 0) samples = @[touch];
+
+        uint8_t contact = (uint8_t)(touch.hash & 0xff);
+        for (UITouch *sample in samples) {
+            uint16_t x = 0, y = 0;
+            if (![self mapTouch:sample toX:&x y:&y]) continue;
+            uint64_t timestampNs =
+                (uint64_t)llround(sample.timestamp * (double)NSEC_PER_SEC);
+            uint8_t record[14] = { phase, contact };
+            record[2] = x & 0xff;
+            record[3] = x >> 8;
+            record[4] = y & 0xff;
+            record[5] = y >> 8;
+            memcpy(record + 6, &timestampNs, sizeof(timestampNs));
+            [records appendBytes:record length:sizeof(record)];
+        }
+    }
+    send_touch_records(records);
 }
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self handleTouches:t phase:TOUCH_DOWN]; }
-- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self handleTouches:t phase:TOUCH_MOVE]; }
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self handleTouches:t phase:TOUCH_UP]; }
-- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self handleTouches:t phase:TOUCH_UP]; }
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    [self handleTouches:t event:e phase:TOUCH_DOWN];
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    [self handleTouches:t event:e phase:TOUCH_MOVE];
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    [self handleTouches:t event:e phase:TOUCH_UP];
+}
+- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    [self handleTouches:t event:e phase:TOUCH_CANCEL];
+}
 @end
 
 /* ═══════════════════════════════════════════════════════════════
@@ -693,6 +2173,8 @@ static NSString *validateSSID(NSString *ssid) {
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) RootViewController *vc;
 @property (nonatomic, strong) VideoView *videoView;
+@property (nonatomic, strong)
+    NSMutableDictionary<NSNumber *, CarPlayAudioPlayer *> *audioPlayers;
 
 /* Setup overlay */
 @property (nonatomic, strong) UIView   *setupOverlay;
@@ -707,16 +2189,15 @@ static NSString *validateSSID(NSString *ssid) {
 
 /* Floating chrome */
 @property (nonatomic, strong) UIButton *closeButton;       /* top-right, only ACTIVE */
-@property (nonatomic, strong) UIButton *infoButton;        /* top-left, always (iPad); pinch-revealed (iPhone Active) */
-@property (nonatomic, strong) NSTimer  *chromeHideTimer;
+@property (nonatomic, strong) UIButton *infoButton;        /* top-left, revealed with close during Active */
+@property (nonatomic, strong) ControlsOverlayView *controlsOverlay;
+@property (nonatomic, strong) UILabel *controlsHintLabel;
 
-/* iPhone Active: fullscreen video + pinch to reveal chrome */
-@property (nonatomic, strong) UIPinchGestureRecognizer *phonePinch;
-@property (nonatomic, assign) BOOL phoneChromeRevealed;
-@property (nonatomic, assign) BOOL phonePinchValid;
+/* Three-finger tap is reserved for Showcase chrome and leaves pinch to CarPlay. */
+@property (nonatomic, strong) UITapGestureRecognizer *controlsGesture;
+@property (nonatomic, assign) BOOL chromeVisible;
 
 /* Lifecycle */
-@property (nonatomic, strong) NSTimer *backgroundStopTimer;
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
 
 /* State */
@@ -726,6 +2207,7 @@ static NSString *validateSSID(NSString *ssid) {
 @property (nonatomic, assign) pid_t btdaemonPid;
 @property (nonatomic, assign) pid_t carplayBtPid;
 @property (nonatomic, assign) pid_t carplayServicesPid;
+@property (nonatomic, assign) pid_t baaBrokerPid;
 
 /* bridge100 tcpdump capture */
 @property (nonatomic, assign) pid_t tcpdumpPid;
@@ -734,14 +2216,26 @@ static NSString *validateSSID(NSString *ssid) {
 @property (nonatomic, assign) BOOL tcpdumpMissingPromptShown;
 @property (nonatomic, assign) BOOL diagnosticsEnabled;
 @property (nonatomic, assign) BOOL helpersLoggedThisRun;
+@property (nonatomic, assign) BOOL bluetoothHandedOff;
+@property (nonatomic, assign) BOOL bluetoothRetryAttempted;
+@property (nonatomic, copy) NSString *pendingBluetoothErrorTitle;
+@property (nonatomic, copy) NSString *pendingBluetoothErrorExplanation;
+@property (nonatomic, copy) NSString *pendingBluetoothDiagnostic;
 
 /* Networking */
 @property (nonatomic, assign) int listenFd;
 @property (nonatomic, assign) int clientFd;
 @property (nonatomic, strong) dispatch_queue_t bgQueue;
+@property (nonatomic, strong) dispatch_queue_t videoQueue;
+
+/* BAA preheater and local signing broker */
+@property (nonatomic, assign) BOOL baaReady;
+@property (nonatomic, assign) BOOL baaLoading;
+@property (nonatomic, copy) NSString *baaError;
 
 /* AP polling */
 @property (nonatomic, strong) NSTimer *apPollTimer;
+@property (nonatomic, strong) dispatch_source_t awdlReassertTimer;
 
 /* Cars */
 @property (nonatomic, strong) CarStore *cars;
@@ -766,6 +2260,15 @@ static NSString *validateSSID(NSString *ssid) {
     didFinishLaunchingWithOptions:(NSDictionary *)opts {
 
     self.bgQueue = dispatch_queue_create("com.reng.showcase.bg", DISPATCH_QUEUE_SERIAL);
+    self.videoQueue = dispatch_queue_create(
+        "com.reng.showcase.video", DISPATCH_QUEUE_SERIAL);
+    dispatch_set_target_queue(self.videoQueue,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0));
+    self.audioPlayers = [NSMutableDictionary dictionary];
+    /* No crash-recovery pass is needed here: iOS re-enables AWDL by itself
+     * whenever a Continuity service wants it, which is exactly why the
+     * suppression below has to be re-asserted on a timer. A run killed
+     * mid-session therefore heals on its own. */
     self.state = StateIdle;
     self.listenFd = -1;
     self.clientFd = -1;
@@ -805,47 +2308,120 @@ static NSString *validateSSID(NSString *ssid) {
         name:UIApplicationWillEnterForegroundNotification object:nil];
 
     [self transitionTo:StateIdle];
+    if (![self startBAABroker]) {
+        self.baaError = @"The local authentication broker could not start.";
+        ip_log("BAA broker failed to start");
+    } else {
+        [self preheatBAA];
+    }
     return YES;
+}
+
+- (BOOL)startBAABroker {
+    reap_stale_helpers(0);
+    NSString *helper = [[[NSBundle mainBundle] bundlePath]
+        stringByAppendingPathComponent:@SVC_HELPER_NAME];
+    char *argv[] = {
+        (char *)SVC_HELPER_NAME,
+        (char *)"--baa-broker",
+        NULL
+    };
+    self.baaBrokerPid = spawn_daemon([helper UTF8String], argv,
+                                     LOG_DIR "/baa_broker.log");
+    if (self.baaBrokerPid <= 0) return NO;
+    ip_log("BAA preheat helper pid=%d", self.baaBrokerPid);
+    return YES;
+}
+
+- (void)preheatBAA {
+    if (self.baaLoading || self.baaReady || self.baaBrokerPid <= 0) return;
+    self.baaLoading = YES;
+    self.baaError = nil;
+    [self renderState];
+    ip_log("BAA preheat started before hotspot");
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        int rc = -1;
+        uint8_t *leaf = NULL, *intermediate = NULL;
+        int leafLength = 0, intermediateLength = 0;
+        for (int attempt = 0; attempt < 450; attempt++) {
+            if (!pid_alive(self.baaBrokerPid)) {
+                rc = -1;
+                break;
+            }
+            rc = baa_broker_get_certs(&leaf, &leafLength,
+                                      &intermediate, &intermediateLength);
+            if (rc == 0) break;
+            usleep(100000);
+        }
+        uint8_t *signature = NULL;
+        int signatureLength = 0;
+        static const uint8_t probe[] = "Showcase BAA preheat";
+        if (rc == 0) {
+            rc = baa_broker_sign(probe, (uint32_t)(sizeof(probe) - 1),
+                                 &signature, &signatureLength);
+        }
+        BOOL success = rc == 0 && signatureLength > 0;
+        free(leaf);
+        free(intermediate);
+        free(signature);
+        if (success) {
+            ip_log("BAA preheat helper ready: leaf=%d intermediate=%d signature=%d",
+                   leafLength, intermediateLength, signatureLength);
+        } else {
+            ip_log("BAA preheat helper failed rc=%d", rc);
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.baaLoading = NO;
+            self.baaReady = success;
+            self.baaError = success ? nil :
+                @"Unable to prepare CarPlay authentication. Check the internet connection.";
+            [self renderState];
+        });
+    });
 }
 
 - (void)handleBackground {
     if (self.state != StateIdle && self.state != StateStopping) {
-        ip_log("backgrounded — deferring stop");
-        [self.backgroundStopTimer invalidate];
-        self.backgroundStopTimer = nil;
-        UIApplication *app = [UIApplication sharedApplication];
-        if (self.bgTask == UIBackgroundTaskInvalid) {
-            self.bgTask = [app beginBackgroundTaskWithExpirationHandler:^{
-                ip_log("background task expired");
-                [self endBackgroundTask];
-            }];
-        }
-        self.backgroundStopTimer = [NSTimer scheduledTimerWithTimeInterval:90.0
-            target:self selector:@selector(backgroundStopExpired) userInfo:nil repeats:NO];
+        ip_log("backgrounded — preserving CarPlay session");
+        g_video_suspended = 1;
+        g_video_needs_resync = 1;
+        send_app_visibility(0);
+        dispatch_async(self.videoQueue, ^{
+            AVSampleBufferDisplayLayer *layer =
+                (AVSampleBufferDisplayLayer *)self.videoView.layer;
+            [layer flushAndRemoveImage];
+        });
     }
 }
 
 - (void)handleForeground {
-    [self.backgroundStopTimer invalidate];
-    self.backgroundStopTimer = nil;
     [self endBackgroundTask];
     ip_log("foregrounded — continuing state=%ld", (long)self.state);
+    if (self.state == StateActive || self.state == StateAwaitingPhone) {
+        g_video_needs_resync = 1;
+        g_video_suspended = 0;
+        dispatch_async(self.videoQueue, ^{
+            AVSampleBufferDisplayLayer *layer =
+                (AVSampleBufferDisplayLayer *)self.videoView.layer;
+            [layer flush];
+        });
+        send_app_visibility(1);
+        ip_log("foreground video resync requested");
+    }
     if (self.state == StateAwaitingAP) [self pollAP];
     [self renderState];
+    [self presentPendingBluetoothCompatibilityError];
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application {
     (void)application;
+    [self endAWDLSuppression];
     [self stopNetworkDumpCaptureWithReason:@"app terminating"];
-}
-
-- (void)backgroundStopExpired {
-    self.backgroundStopTimer = nil;
-    if (self.state != StateIdle && self.state != StateStopping) {
-        ip_log("background grace expired — stopping");
-        [self stopFlow];
-    }
-    [self endBackgroundTask];
+    kill_pid(self.baaBrokerPid);
+    self.baaBrokerPid = 0;
+    unlink(BAA_BROKER_PATH);
 }
 
 - (void)endBackgroundTask {
@@ -993,6 +2569,26 @@ static NSString *validateSSID(NSString *ssid) {
     CGFloat margin = 18;
     CGSize bs = content.bounds.size;
 
+    self.controlsOverlay = [[ControlsOverlayView alloc]
+        initWithFrame:content.bounds];
+    self.controlsOverlay.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.controlsOverlay.backgroundColor =
+        [UIColor colorWithWhite:0 alpha:0.52];
+    self.controlsOverlay.hidden = YES;
+    [content addSubview:self.controlsOverlay];
+
+    self.controlsHintLabel = [[UILabel alloc]
+        initWithFrame:CGRectMake(20, bs.height - 58, bs.width - 40, 30)];
+    self.controlsHintLabel.autoresizingMask =
+        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
+    self.controlsHintLabel.text = @"Three-finger tap to return to CarPlay";
+    self.controlsHintLabel.textAlignment = NSTextAlignmentCenter;
+    self.controlsHintLabel.textColor = [UIColor colorWithWhite:1 alpha:0.72];
+    self.controlsHintLabel.font =
+        [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [self.controlsOverlay addSubview:self.controlsHintLabel];
+
     /* Close button — top-right, hidden by default */
     self.closeButton = [UIButton buttonWithType:UIButtonTypeCustom];
     self.closeButton.frame = CGRectMake(bs.width - sz - margin, margin, sz, sz);
@@ -1022,78 +2618,22 @@ static NSString *validateSSID(NSString *ssid) {
     [self.infoButton addTarget:self action:@selector(infoTapped) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:self.infoButton];
 
-    /* Tap recognizer — used during ACTIVE to wake chrome (iPad) */
-    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
-        initWithTarget:self action:@selector(revealChrome)];
-    tap.cancelsTouchesInView = NO;
-    [content addGestureRecognizer:tap];
-
-    /* iPhone Active uses a different model: video is fullscreen, chrome hidden;
-     * pinch-in dezooms the video and shows the buttons; pinch-out hides. */
-    if ([self isPhone]) {
-        self.phonePinch = [[UIPinchGestureRecognizer alloc]
-            initWithTarget:self action:@selector(handlePhonePinch:)];
-        self.phonePinch.cancelsTouchesInView = NO;
-        self.phonePinch.delaysTouchesBegan = NO;
-        self.phonePinch.delaysTouchesEnded = NO;
-        self.phonePinch.enabled = NO; /* enabled only in Active */
-        [self.vc.view addGestureRecognizer:self.phonePinch];
-    }
+    self.controlsGesture = [[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(toggleChrome:)];
+    self.controlsGesture.numberOfTouchesRequired = 3;
+    self.controlsGesture.numberOfTapsRequired = 1;
+    self.controlsGesture.cancelsTouchesInView = YES;
+    self.controlsGesture.delaysTouchesBegan = NO;
+    /* UIGestureRecognizer delays touch-up delivery by default while it
+     * decides whether a gesture matches. That made every ordinary CarPlay
+     * tap wait on the three-finger menu recognizer. */
+    self.controlsGesture.delaysTouchesEnded = NO;
+    self.controlsGesture.enabled = NO;
+    [content addGestureRecognizer:self.controlsGesture];
 }
 
 - (BOOL)isPhone {
     return UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPhone;
-}
-
-- (void)handlePhonePinch:(UIPinchGestureRecognizer *)g {
-    if (self.state != StateActive) return;
-    switch (g.state) {
-        case UIGestureRecognizerStateBegan:
-            self.phonePinchValid = (g.numberOfTouches >= 2);
-            break;
-        case UIGestureRecognizerStateChanged:
-            if (g.numberOfTouches >= 2) self.phonePinchValid = YES;
-            break;
-        case UIGestureRecognizerStateEnded:
-            if (!self.phonePinchValid) break;
-            if (g.scale < 0.85 && !self.phoneChromeRevealed) {
-                [self setPhoneChromeRevealed:YES animated:YES];
-            } else if (g.scale > 1.15 && self.phoneChromeRevealed) {
-                [self setPhoneChromeRevealed:NO animated:YES];
-            }
-            break;
-        case UIGestureRecognizerStateCancelled:
-        case UIGestureRecognizerStateFailed:
-            self.phonePinchValid = NO;
-            break;
-        default: break;
-    }
-}
-
-- (void)setPhoneChromeRevealed:(BOOL)revealed animated:(BOOL)animated {
-    self.phoneChromeRevealed = revealed;
-    [self.chromeHideTimer invalidate]; self.chromeHideTimer = nil;
-    CGAffineTransform target = revealed
-        ? CGAffineTransformMakeScale(0.78, 0.78)
-        : CGAffineTransformIdentity;
-    void (^apply)(void) = ^{
-        self.videoView.transform = target;
-        self.infoButton.alpha = revealed ? 1.0 : 0.0;
-        self.closeButton.alpha = revealed ? 1.0 : 0.0;
-    };
-    self.infoButton.hidden = NO;
-    self.closeButton.hidden = NO;
-    if (animated) {
-        [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseInOut animations:apply completion:^(BOOL ok){
-            if (!revealed) {
-                self.infoButton.hidden = YES;
-                self.closeButton.hidden = YES;
-            }
-        }];
-    } else {
-        apply();
-        if (!revealed) { self.infoButton.hidden = YES; self.closeButton.hidden = YES; }
-    }
 }
 
 /* ─── State machine ────────────────────────────────────────── */
@@ -1104,11 +2644,8 @@ static NSString *validateSSID(NSString *ssid) {
 
     if (s == StateAwaitingPhone && old != StateAwaitingPhone) {
         ip_log("[HANDOFF] Awaiting sender; CarPlay should perform Wi-Fi association through iAP2 handoff");
-        if (self.diagnosticsEnabled) {
-            dispatch_async(dispatch_get_main_queue(), ^{
-                [self startNetworkDumpCapture];
-            });
-        }
+        if (self.diagnosticsEnabled)
+            ip_log("diagnostics active; tcpdump remains off unless requested manually");
     } else if ((s == StateStopping || s == StateIdle) && old != s) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self stopNetworkDumpCaptureWithReason:@"flow stopped"];
@@ -1123,15 +2660,17 @@ static NSString *validateSSID(NSString *ssid) {
 
     self.setupOverlay.hidden = NO;
     self.closeButton.hidden = YES;
-    if ([self isPhone] && self.state != StateActive) {
+    self.controlsGesture.enabled = (self.state == StateActive);
+    if (self.state != StateActive) {
         /* Restore the 1024x768 canvas in every non-Active state. */
-        if (self.vc.fullscreenMode) {
+        if ([self isPhone] && self.vc.fullscreenMode) {
             self.vc.fullscreenMode = NO;
             [self.vc.view setNeedsLayout];
         }
         self.videoView.transform = CGAffineTransformIdentity;
-        self.phonePinch.enabled = NO;
-        self.phoneChromeRevealed = NO;
+        self.chromeVisible = NO;
+        self.controlsOverlay.hidden = YES;
+        self.controlsOverlay.alpha = 1;
         self.infoButton.hidden = NO;
         self.infoButton.alpha = 1.0;
         self.closeButton.alpha = 1.0;
@@ -1166,11 +2705,27 @@ static NSString *validateSSID(NSString *ssid) {
                 self.carHintLabel.text = @"";
                 self.carHintLabel.hidden = YES;
             } else {
-                /* Configured: classic view, Start CarPlay is the headline CTA. */
-                self.headlineLabel.text = @"Wireless CarPlay for iPad";
-                self.subtitleLabel.text = @"Connect your iPhone wirelessly\nto your iPad as a CarPlay screen.";
-
-                [self.primaryButton setTitle:@"Start CarPlay" forState:UIControlStateNormal];
+                if (self.baaLoading) {
+                    self.headlineLabel.text = @"Preparing secure authentication";
+                    self.subtitleLabel.text = @"Keep this device online for a moment.\nThis happens before Personal Hotspot starts.";
+                    [self.primaryButton setTitle:@"Preparing…" forState:UIControlStateNormal];
+                    self.primaryButton.enabled = NO;
+                    self.primaryButton.alpha = 0.55;
+                    self.spinner.hidden = NO;
+                    [self.spinner startAnimating];
+                } else if (!self.baaReady) {
+                    self.headlineLabel.text = @"Internet connection required";
+                    self.subtitleLabel.text = self.baaError.length
+                        ? @"Showcase could not prepare CarPlay authentication.\nConnect to the internet, then retry."
+                        : @"Showcase needs internet once before Personal Hotspot starts.";
+                    [self.primaryButton setTitle:@"Retry Authentication"
+                                       forState:UIControlStateNormal];
+                } else {
+                    self.headlineLabel.text = @"Wireless CarPlay";
+                    self.subtitleLabel.text = @"Connect your iPhone wirelessly\nto this device as a CarPlay screen.";
+                    [self.primaryButton setTitle:@"Start CarPlay"
+                                       forState:UIControlStateNormal];
+                }
 
                 NSString *wifiTitle = [NSString stringWithFormat:@"Wi-Fi: %@", self.cars.apSSID];
                 [self.secondaryButton setTitle:wifiTitle forState:UIControlStateNormal];
@@ -1225,19 +2780,15 @@ static NSString *validateSSID(NSString *ssid) {
         case StateActive:
             self.setupOverlay.hidden = YES;
             if ([self isPhone]) {
-                /* Fullscreen video, no chrome by default. Pinch-in reveals it. */
                 self.vc.fullscreenMode = YES;
                 [self.vc.view setNeedsLayout];
-                self.phoneChromeRevealed = NO;
-                self.phonePinchValid = NO;
-                self.phonePinch.enabled = YES;
-                self.videoView.transform = CGAffineTransformIdentity;
-                self.infoButton.hidden = YES;
-                self.closeButton.hidden = YES;
-            } else {
-                self.closeButton.hidden = NO;
-                [self scheduleChromeHide];
             }
+            self.videoView.transform = CGAffineTransformIdentity;
+            self.chromeVisible = NO;
+            self.controlsOverlay.hidden = YES;
+            self.controlsOverlay.alpha = 1;
+            self.infoButton.hidden = YES;
+            self.closeButton.hidden = YES;
             break;
 
         case StateStopping:
@@ -1276,24 +2827,36 @@ static NSString *validateSSID(NSString *ssid) {
 - (void)closeTapped { [self stopFlow]; }
 - (void)infoTapped  { [self showAbout]; }
 
-- (void)revealChrome {
-    if (self.state != StateActive) return;
-    if ([self isPhone]) return; /* iPhone Active uses pinch, not tap, to control chrome */
+- (void)toggleChrome:(UITapGestureRecognizer *)gesture {
+    if (self.state != StateActive ||
+        gesture.state != UIGestureRecognizerStateRecognized) return;
+    if (self.chromeVisible) {
+        [self hideChrome];
+        return;
+    }
+    self.chromeVisible = YES;
+    self.controlsOverlay.alpha = 0;
+    self.controlsOverlay.hidden = NO;
+    self.infoButton.hidden = NO;
     self.closeButton.hidden = NO;
-    self.closeButton.alpha = 1;
-    [self scheduleChromeHide];
-}
-
-- (void)scheduleChromeHide {
-    [self.chromeHideTimer invalidate];
-    self.chromeHideTimer = [NSTimer scheduledTimerWithTimeInterval:3.0
-        target:self selector:@selector(hideChrome) userInfo:nil repeats:NO];
+    [UIView animateWithDuration:0.18 animations:^{
+        self.controlsOverlay.alpha = 1;
+        self.infoButton.alpha = 1;
+        self.closeButton.alpha = 1;
+    }];
 }
 - (void)hideChrome {
-    [UIView animateWithDuration:0.3 animations:^{
+    self.chromeVisible = NO;
+    [UIView animateWithDuration:0.18 animations:^{
+        self.controlsOverlay.alpha = 0;
+        self.infoButton.alpha = 0;
         self.closeButton.alpha = 0;
     } completion:^(BOOL d) {
-        if (self.state == StateActive) self.closeButton.hidden = YES;
+        if (self.state == StateActive) {
+            self.controlsOverlay.hidden = YES;
+            self.infoButton.hidden = YES;
+            self.closeButton.hidden = YES;
+        }
     }];
 }
 
@@ -1303,6 +2866,10 @@ static NSString *validateSSID(NSString *ssid) {
     /* Should never be reachable when AP not ready (button is disabled) — defensive */
     if (![self.cars apReady]) { [self showWifiSetup]; return; }
     if (self.cars.cars.count == 0) return;
+    if (!self.baaReady) {
+        [self preheatBAA];
+        return;
+    }
     [self startFlow];
 }
 
@@ -1310,11 +2877,46 @@ static NSString *validateSSID(NSString *ssid) {
     ip_log("startFlow: car='%s' ssid='%s'",
            [self.cars.selected.name UTF8String],
            [self.cars.apSSID UTF8String]);
+    self.bluetoothHandedOff = NO;
     [self transitionTo:StateAwaitingAP];
     [self.apPollTimer invalidate];
     self.apPollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
         target:self selector:@selector(pollAP) userInfo:nil repeats:YES];
     [self pollAP];
+}
+
+- (void)beginAWDLSuppression {
+    if (__sync_bool_compare_and_swap(&g_awdl_suppressed, 0, 1)) {
+        awdl_suppress(YES);
+        ip_log("AWDL suppressed for the duration of the session");
+    }
+    if (self.awdlReassertTimer) return;
+    dispatch_source_t timer = dispatch_source_create(
+        DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+        dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0));
+    if (!timer) return;
+    dispatch_source_set_timer(
+        timer,
+        dispatch_time(DISPATCH_TIME_NOW,
+                      (int64_t)(AWDL_REASSERT_SECONDS * NSEC_PER_SEC)),
+        (uint64_t)(AWDL_REASSERT_SECONDS * NSEC_PER_SEC),
+        (uint64_t)(NSEC_PER_SEC));
+    dispatch_source_set_event_handler(timer, ^{
+        if (g_awdl_suppressed) awdl_suppress(NO);
+    });
+    dispatch_resume(timer);
+    self.awdlReassertTimer = timer;
+}
+
+- (void)endAWDLSuppression {
+    if (self.awdlReassertTimer) {
+        dispatch_source_cancel(self.awdlReassertTimer);
+        self.awdlReassertTimer = nil;
+    }
+    if (__sync_bool_compare_and_swap(&g_awdl_suppressed, 1, 0)) {
+        awdl_restore(YES);
+        ip_log("AWDL restored");
+    }
 }
 
 - (void)pollAP {
@@ -1336,10 +2938,55 @@ static NSString *validateSSID(NSString *ssid) {
     Car *sel = self.cars.selected;
     ip_log("bgPrepareBT: euid=%u, name='%s' ssid='%s'",
            geteuid(), [sel.name UTF8String], [self.cars.apSSID UTF8String]);
+    self.bluetoothRetryAttempted = NO;
 
     if (geteuid() != 0) {
-        [self failWith:@"App is not running as root (must be chmod 4755)"];
+        [self failBluetoothWithReason:
+            @"The Showcase executable is not running as root (setuid setup failed)."
+                             unsupported:NO];
         return;
+    }
+    if (access([btPath fileSystemRepresentation], X_OK) != 0) {
+        [self failBluetoothWithReason:
+            @"The bundled Bluetooth helper is missing or is not executable."
+                             unsupported:NO];
+        return;
+    }
+    if (access(BTDAEMON_PATH, X_OK) != 0) {
+        [self failBluetoothWithReason:
+            @"The BTstack daemon is missing or is not executable."
+                             unsupported:NO];
+        return;
+    }
+    if (access(BTSTACK_DYLIB_PATH, R_OK) != 0) {
+        [self failBluetoothWithReason:
+            @"The bundled BTstack library is missing or is not readable."
+                             unsupported:NO];
+        return;
+    }
+    if (access(BTSTACK_PLIST, R_OK) != 0) {
+        [self failBluetoothWithReason:
+            @"The BTstack launch daemon configuration is missing or unreadable."
+                             unsupported:NO];
+        return;
+    }
+
+    BluetoothRegistryProbeState registry = bluetooth_registry_probe();
+    ip_log("[BT-COMPAT] registry probe=%s",
+           registry == BluetoothRegistryProbeLegacyUART
+               ? "legacy-uart-present"
+               : (registry == BluetoothRegistryProbeMissing
+                   ? "legacy-uart-missing" : "unavailable"));
+    if (registry == BluetoothRegistryProbeMissing) {
+        [self failBluetoothWithReason:
+            @"The Bluetooth transport required by Showcase is not present in IOKit."
+                             unsupported:YES];
+        return;
+    }
+    if (registry == BluetoothRegistryProbeUnavailable) {
+        /* A missing ioreg utility must not create a false rejection. The
+         * controller takeover below is the authoritative runtime probe. */
+        ip_log("[BT-COMPAT] static probe unavailable; continuing to runtime HCI probe");
     }
 
     if (self.diagnosticsEnabled) {
@@ -1350,12 +2997,13 @@ static NSString *validateSSID(NSString *ssid) {
     self.helpersLoggedThisRun = self.diagnosticsEnabled;
     unlink(BT_READY_PATH);
 
-    reap_stale_helpers();
+    reap_stale_helpers(self.baaBrokerPid);
 
     /* 1. Unload bluetoothd */
     const char *launchctl = launchctl_path();
     if (!launchctl) {
-        [self failWith:@"launchctl not found"];
+        [self failBluetoothWithReason:@"launchctl was not found."
+                             unsupported:NO];
         return;
     }
     ip_log("launchctl path: %s", launchctl);
@@ -1381,11 +3029,15 @@ static NSString *validateSSID(NSString *ssid) {
                                 (char*)BTSTACK_PLIST, NULL };
     rc = run_blocking(launchctl, loadBTstackArgv);
     if (rc != 0) {
-        [self failWith:@"BTstack launch daemon failed to load"];
+        [self failBluetoothWithReason:
+            @"The BTstack launch daemon failed to load."
+                             unsupported:NO];
         return;
     }
     if (!wait_for_path(BTSTACK_SOCKET, 8, "BTstack socket")) {
-        [self failWith:@"BTstack socket not available"];
+        [self failBluetoothWithReason:
+            @"The BTstack daemon did not create its control socket."
+                             unsupported:NO];
         return;
     }
     self.btdaemonPid = 0;
@@ -1404,14 +3056,47 @@ static NSString *validateSSID(NSString *ssid) {
     };
     self.carplayBtPid = spawn_daemon([btPath UTF8String], btArgv,
                                      LOG_DIR "/carplay_bt.log");
-    if (self.carplayBtPid <= 0) { [self failWith:@"carplay_bt failed to start"]; return; }
+    if (self.carplayBtPid <= 0) {
+        [self failBluetoothWithReason:
+            @"The Bluetooth helper could not be started."
+                             unsupported:NO];
+        return;
+    }
     if (!wait_for_pid_alive(self.carplayBtPid, 8, "carplay_bt")) {
-        [self failWith:@"carplay_bt exited during setup"];
+        [self failBluetoothWithReason:
+            @"The Bluetooth helper exited during setup."
+                             unsupported:YES];
         return;
     }
     if (!wait_for_bt_ready_or_exit(self.carplayBtPid, 12)) {
-        [self failWith:@"Bluetooth takeover failed. BTStack could not power on the controller."];
-        return;
+        /* On some rootless boots BlueTool releases the controller after its
+         * launchd job has already exited. BTstack then accepts a client and
+         * its power command, but emits no HCI events. A complete daemon/client
+         * restart is deterministic and preserves pairing data. */
+        ip_log("[BT] first controller takeover produced no events; "
+               "performing one clean retry");
+        self.bluetoothRetryAttempted = YES;
+        kill_pid(self.carplayBtPid);
+        self.carplayBtPid = 0;
+        run_blocking(launchctl, unloadBTstackArgv);
+        unlink(BTSTACK_SOCKET);
+        sleep(2);
+        rc = run_blocking(launchctl, loadBTstackArgv);
+        if (rc == 0 &&
+            wait_for_path(BTSTACK_SOCKET, 8, "BTstack retry socket")) {
+            unlink(BT_READY_PATH);
+            self.carplayBtPid =
+                spawn_daemon([btPath UTF8String], btArgv,
+                             LOG_DIR "/carplay_bt-retry.log");
+        }
+        if (self.carplayBtPid <= 0 ||
+            !wait_for_bt_ready_or_exit(self.carplayBtPid, 20)) {
+            [self failBluetoothWithReason:
+                @"Bluetooth takeover failed after one clean retry; no HCI "
+                 "controller-ready event was received."
+                                 unsupported:YES];
+            return;
+        }
     }
 
     [self transitionTo:StatePreparingNet];
@@ -1427,26 +3112,109 @@ static NSString *validateSSID(NSString *ssid) {
     if (![self startIPCListener]) { [self failWith:@"IPC listener failed"]; return; }
 
     char nameBuf[64];
+    char widthBuf[16], heightBuf[16], fpsBuf[16], receiveBufferBuf[16];
+    CarPlayDisplayProfile display = preferred_carplay_display_profile();
+    uint16_t displayWidth = display.width;
+    uint16_t displayHeight = display.height;
+    /*
+     * Older HSIC-attached WLAN chips need enough TCP headroom to absorb the
+     * iPhone encoder's burst rate during brief loss recovery. Faster radios
+     * retain a shallower window to avoid unnecessary queueing latency. A
+     * 30-Hz non-HSIC display gets the middle tier, covering devices whose
+     * screen refresh—not WLAN transport—sets the frame-rate ceiling.
+     */
+    int screenReceiveBuffer =
+        display.wlanAttachment == CarPlayWLANAttachmentHSIC
+            ? 2 * 1024 * 1024
+            : (display.framesPerSecond <= 30 ? 1024 * 1024 : 512 * 1024);
     snprintf(nameBuf, sizeof(nameBuf), "%s", [sel.name UTF8String]);
+    snprintf(widthBuf, sizeof(widthBuf), "%u", displayWidth);
+    snprintf(heightBuf, sizeof(heightBuf), "%u", displayHeight);
+    snprintf(fpsBuf, sizeof(fpsBuf), "%u", display.framesPerSecond);
+    snprintf(receiveBufferBuf, sizeof(receiveBufferBuf), "%d",
+             screenReceiveBuffer);
+    ip_log("display profile: native=%ux%u memory=%lluMB cores=%lu "
+           "budget=%llu pixels selected=%ux%u@%u wlan=%s rcvbuf=%d "
+           "policy=hardware-only layout=ignored",
+           display.nativeLong, display.nativeShort,
+           (unsigned long long)(display.physicalMemory / (1024ULL * 1024ULL)),
+           (unsigned long)display.activeProcessors,
+           (unsigned long long)display.pixelBudget,
+           displayWidth, displayHeight, display.framesPerSecond,
+           carplay_wlan_attachment_name(display.wlanAttachment),
+           screenReceiveBuffer);
     char *svcArgv[] = {
         (char*)SVC_HELPER_NAME,
         (char*)"--name", nameBuf,
+        (char*)"--width", widthBuf,
+        (char*)"--height", heightBuf,
+        (char*)"--fps", fpsBuf,
+        (char*)"--screen-rcvbuf", receiveBufferBuf,
         NULL
     };
-    self.carplayServicesPid = spawn_daemon([svcPath UTF8String], svcArgv,
-                                           self.diagnosticsEnabled ? LOG_DIR "/carplay_services.log" : "/dev/null");
+    /*
+     * The service log is the only record of encrypted RTSP negotiation and
+     * transport arrival. Keep it for every run; spawn_daemon truncates the
+     * file at launch, so this has bounded storage cost and cannot silently
+     * erase the evidence needed to diagnose a failed session.
+     */
+    self.carplayServicesPid = spawn_daemon(
+        [svcPath UTF8String], svcArgv, LOG_DIR "/carplay_services.log");
     if (self.carplayServicesPid <= 0) { [self failWith:@"carplay_services failed to start"]; return; }
     if (!wait_for_pid_alive(self.carplayServicesPid, 4, "carplay_services")) {
         [self failWith:@"carplay_services exited during setup"];
         return;
     }
 
-    [self transitionTo:StateAwaitingPhone];
+    /* A paired phone can resume quickly enough to deliver video while the
+     * helper-alive check above is still running. Do not overwrite Active
+     * with the older setup state when that happens. */
+    if (self.state != StateActive) {
+        [self transitionTo:StateAwaitingPhone];
+    } else {
+        ip_log("[HANDOFF] Existing paired session resumed during startup");
+    }
+}
+
+- (void)completeBluetoothHandoff {
+    dispatch_async(self.bgQueue, ^{
+        if (self.bluetoothHandedOff ||
+            self.state == StateStopping || self.state == StateIdle) {
+            return;
+        }
+
+        /*
+         * The controller has completed Bluetooth discovery and moved the
+         * CarPlay session onto Wi-Fi. Own teardown here, outside BTstack's
+         * callback and signal contexts. Leaving BTstack active forces the
+         * combo radio to arbitrate 2.4 GHz airtime while the H.264 TCP stream
+         * is running, which turns individual Wi-Fi losses into visible
+         * head-of-line stalls.
+         */
+        ip_log("[HANDOFF] Wi-Fi session established; stopping Bluetooth helper");
+        kill_pid(self.carplayBtPid);
+        self.carplayBtPid = 0;
+
+        const char *launchctl = launchctl_path();
+        int rc = -1;
+        if (launchctl) {
+            char *unloadBTstackArgv[] = {
+                (char *)"launchctl", (char *)"unload",
+                (char *)BTSTACK_PLIST, NULL
+            };
+            rc = run_blocking(launchctl, unloadBTstackArgv);
+        }
+        unlink(BTSTACK_SOCKET);
+
+        self.bluetoothHandedOff = YES;
+        ip_log("[HANDOFF] Bluetooth transport stopped (BTstack unload=%d); "
+               "system Bluetooth remains disabled until CarPlay stops", rc);
+    });
 }
 
 - (void)stopFlow {
+    [self endAWDLSuppression];
     [self stopNetworkDumpCaptureWithReason:@"user cancelled / stopping flow"];
-    [self.backgroundStopTimer invalidate]; self.backgroundStopTimer = nil;
     [self endBackgroundTask];
     [self.apPollTimer invalidate]; self.apPollTimer = nil;
     [self transitionTo:StateStopping];
@@ -1455,11 +3223,15 @@ static NSString *validateSSID(NSString *ssid) {
         if (self.listenFd >= 0) { close(self.listenFd); self.listenFd = -1; }
         unlink(SOCK_PATH);
         g_touch_fd = -1;
+        __sync_add_and_fetch(&g_touch_epoch, 1);
         g_carplay_w = 0; g_carplay_h = 0;
+        g_video_suspended = 0;
+        g_video_needs_resync = 0;
 
         kill_pid(self.carplayServicesPid); self.carplayServicesPid = 0;
         kill_pid(self.carplayBtPid);       self.carplayBtPid = 0;
         self.btdaemonPid = 0;
+        self.bluetoothHandedOff = NO;
 
         const char *launchctl = launchctl_path();
         if (launchctl) {
@@ -1485,7 +3257,62 @@ static NSString *validateSSID(NSString *ssid) {
         });
 
         [self transitionTo:StateIdle];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentPendingBluetoothCompatibilityError];
+        });
     });
+}
+
+- (void)failBluetoothWithReason:(NSString *)reason
+                    unsupported:(BOOL)unsupported {
+    BluetoothRegistryProbeState registry = bluetooth_registry_probe();
+    NSString *report = bluetooth_diagnostic_report(
+        reason, self.bluetoothRetryAttempted, registry);
+    NSString *failureClass =
+        bluetooth_failure_class(reason, report, registry);
+    ip_log("[BT-COMPAT] failure class=%s reason=%s\n%s",
+           [failureClass UTF8String], [reason UTF8String],
+           [report UTF8String]);
+
+    self.pendingBluetoothErrorTitle = unsupported
+        ? @"Bluetooth Hardware Not Supported"
+        : @"Bluetooth Setup Failed";
+    self.pendingBluetoothErrorExplanation = unsupported
+        ? @"Showcase could not take over this device's Bluetooth controller. "
+          "Tell the developer or community that this model is not yet supported "
+          "and include the diagnostic below."
+        : @"Showcase's Bluetooth components are incomplete or could not start. "
+          "Copy the diagnostic below before reinstalling or reporting the problem.";
+    self.pendingBluetoothDiagnostic = report;
+    [self stopFlow];
+}
+
+- (void)presentPendingBluetoothCompatibilityError {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentPendingBluetoothCompatibilityError];
+        });
+        return;
+    }
+    if (!self.pendingBluetoothDiagnostic.length ||
+        [UIApplication sharedApplication].applicationState !=
+            UIApplicationStateActive ||
+        self.vc.presentedViewController) {
+        return;
+    }
+
+    CompatibilityErrorViewController *error =
+        [[CompatibilityErrorViewController alloc] init];
+    error.errorTitle = self.pendingBluetoothErrorTitle;
+    error.explanation = self.pendingBluetoothErrorExplanation;
+    error.diagnostic = self.pendingBluetoothDiagnostic;
+    error.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    error.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+
+    self.pendingBluetoothErrorTitle = nil;
+    self.pendingBluetoothErrorExplanation = nil;
+    self.pendingBluetoothDiagnostic = nil;
+    [self.vc presentViewController:error animated:YES completion:nil];
 }
 
 - (void)failWith:(NSString *)reason {
@@ -1796,20 +3623,26 @@ static NSString *validateSSID(NSString *ssid) {
     posix_spawn_file_actions_addopen(&actions, 1, TCPDUMP_LOG, O_WRONLY|O_CREAT|O_APPEND, 0644);
     posix_spawn_file_actions_adddup2(&actions, 1, 2);
 
+    /* Diagnostics must not become part of the performance problem. Full
+     * screen packets plus -U forced hundreds of pcap writes per second on
+     * older flash. A 256-byte snap length retains Ethernet/IP/TCP/UDP
+     * headers and enough protocol prefix for flow, ACK, retransmission, and
+     * RTP timing analysis. The larger capture buffer is flushed normally
+     * when SIGINT stops tcpdump. */
     char *argvTimed[] = {
         (char*)"tcpdump", (char*)"-i", (char*)AP_INTERFACE,
-        (char*)"-s", (char*)"0", (char*)"-U",
+        (char*)"-B", (char*)"4096", (char*)"-s", (char*)"256",
         (char*)"-G", (char*)"300", (char*)"-W", (char*)"1",
         (char*)"-w", (char*)[pcapPath UTF8String], NULL
     };
     char *argvPlain[] = {
         (char*)"tcpdump", (char*)"-i", (char*)AP_INTERFACE,
-        (char*)"-s", (char*)"0", (char*)"-U",
+        (char*)"-B", (char*)"4096", (char*)"-s", (char*)"256",
         (char*)"-w", (char*)[pcapPath UTF8String], NULL
     };
 
     char **argv = useSelfTimeout ? argvPlain : argvTimed;
-    ip_log("tcpdump spawn: %s -i %s -s 0 -U %s-w %s",
+    ip_log("tcpdump spawn: %s -i %s -B 4096 -s 256 %s-w %s",
            tcpdump, AP_INTERFACE, useSelfTimeout ? "" : "-G 300 -W 1 ",
            [pcapPath UTF8String]);
 
@@ -1933,8 +3766,9 @@ static NSString *validateSSID(NSString *ssid) {
             [self promptInstallTcpdumpIfNeeded];
             return;
         }
-        [self presentAlertWithTitle:@"No Network Dump Yet"
-                            message:@"Enable Diagnostics, start CarPlay, then wait until the screen says Connect from your iPhone. Showcase will capture bridge100 for up to 5 minutes."];
+        [self startNetworkDumpCapture];
+        [self presentAlertWithTitle:@"Network Capture Started"
+                            message:@"Reproduce the issue, then return here and choose Stop & Send Network Dump. Performance tests should leave this capture off."];
         return;
     }
 
@@ -2147,7 +3981,7 @@ static NSString *validateSSID(NSString *ssid) {
 }
 
 - (void)showAbout {
-    NSString *msg = [NSString stringWithFormat:@"Version %s\nby %s\nDiagnostics: %@",
+    NSString *msg = [NSString stringWithFormat:@"Version %s\nby %s\n\nDuring CarPlay, tap with three fingers to show Info and Stop.\nDiagnostics: %@",
                      APP_VERSION, APP_AUTHOR,
                      self.diagnosticsEnabled ? @"On" : @"Off"];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@APP_NAME
@@ -2175,13 +4009,13 @@ static NSString *validateSSID(NSString *ssid) {
     } else {
         NSString *title = (self.tcpdumpPid > 0 && pid_alive(self.tcpdumpPid))
             ? @"Stop & Send Network Dump"
-            : @"Send Network Dump";
+            : (([self latestNetworkDumpPath] != nil)
+                ? @"Send Network Dump" : @"Start Network Dump");
         UIAlertAction *dump = [UIAlertAction actionWithTitle:title
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
                 [self exportNetworkDump];
             }];
-        dump.enabled = ([self latestNetworkDumpPath] != nil) ||
-                       (self.tcpdumpPid > 0 && pid_alive(self.tcpdumpPid));
+        dump.enabled = YES;
         [ac addAction:dump];
     }
 
@@ -2233,14 +4067,22 @@ static NSString *validateSSID(NSString *ssid) {
     while (self.listenFd >= 0) {
         int c = accept(self.listenFd, NULL, NULL);
         if (c < 0) { if (errno == EINTR) continue; break; }
+        int noSigPipe = 1;
+        setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE,
+                   &noSigPipe, sizeof(noSigPipe));
         ip_log("services connected");
         self.clientFd = c;
+        __sync_add_and_fetch(&g_touch_epoch, 1);
         g_touch_fd = c;
         [self ipcHandleConnection:c];
         g_touch_fd = -1;
+        __sync_add_and_fetch(&g_touch_epoch, 1);
         close(c);
         self.clientFd = -1;
         ip_log("services disconnected");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self endAWDLSuppression];
+        });
         if (self.state == StateActive || self.state == StateAwaitingPhone) {
             [self stopFlow]; break;
         }
@@ -2260,6 +4102,13 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
 - (void)ipcHandleConnection:(int)fd {
     CMFormatDescriptionRef fmtDesc = NULL;
     bool gotFirstFrame = false;
+    uint64_t receivedFrameCount = 0;
+    uint64_t lateFrameCount = 0;      /* slot already passed on arrival */
+    uint64_t lateFrameCountAtReport = 0;
+    double   latenessSumMs = 0;       /* magnitude is the metric, not count */
+    double   latenessMaxMs = 0;
+    uint64_t previousSenderTimestamp = 0;
+    bool decodeOnlyCatchupActive = false;
 
     while (1) {
         uint8_t hdr[5];
@@ -2299,48 +4148,386 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
                 if (ps[0] && ps[1]) {
                     if (fmtDesc) { CFRelease(fmtDesc); fmtDesc = NULL; }
                     CMVideoFormatDescriptionCreateFromH264ParameterSets(NULL, 2, ps, psSize, 4, &fmtDesc);
-                    dispatch_async(dispatch_get_main_queue(), ^{
+                    /* A new parameter set means a new stream; the previous
+                     * sender-timeline offset no longer describes it. */
+                    video_clock_reset();
+                    dispatch_async(self.videoQueue, ^{
                         AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)self.videoView.layer;
                         [layer flush];
+                        if (g_video_respect_timestamps)
+                            video_install_timebase(layer);
+                        else
+                            layer.controlTimebase = NULL;
                     });
                     gotFirstFrame = false;
+                    g_video_needs_resync = 1;
+                    previousSenderTimestamp = 0;
                 }
             }
             free(payload);
 
         } else if (type == MSG_VIDEO_FRAME) {
-            if (!fmtDesc) { free(payload); continue; }
+            if (!fmtDesc || len <= VIDEO_FRAME_METADATA_SIZE) {
+                free(payload);
+                continue;
+            }
+            uint64_t senderTimestamp = 0;
+            memcpy(&senderTimestamp, payload, sizeof(senderTimestamp));
+            BOOL isIDR = payload[8] != 0;
+            uint32_t serviceSequence = 0;
+            uint64_t serviceArrivalNanos = 0;
+            uint32_t arrivalGapMicros = 0;
+            uint32_t tcpPendingBytes = 0;
+            uint32_t tcpReceiveWindow = 0;
+            uint32_t tcpSmoothedRTT = 0;
+            uint32_t tcpCurrentRTT = 0;
+            uint32_t tcpFlags = 0;
+            uint32_t decryptMicros = 0;
+            memcpy(&serviceSequence, payload + 12, sizeof(serviceSequence));
+            memcpy(&serviceArrivalNanos, payload + 16,
+                   sizeof(serviceArrivalNanos));
+            memcpy(&arrivalGapMicros, payload + 24,
+                   sizeof(arrivalGapMicros));
+            memcpy(&tcpPendingBytes, payload + 28,
+                   sizeof(tcpPendingBytes));
+            memcpy(&tcpReceiveWindow, payload + 32,
+                   sizeof(tcpReceiveWindow));
+            memcpy(&tcpSmoothedRTT, payload + 36,
+                   sizeof(tcpSmoothedRTT));
+            memcpy(&tcpCurrentRTT, payload + 40,
+                   sizeof(tcpCurrentRTT));
+            memcpy(&tcpFlags, payload + 44, sizeof(tcpFlags));
+            memcpy(&decryptMicros, payload + 48, sizeof(decryptMicros));
+            uint64_t appReadNanos = monotonic_nanos_now();
+            double serviceToAppMs = serviceArrivalNanos > 0 &&
+                appReadNanos >= serviceArrivalNanos
+                ? (double)(appReadNanos - serviceArrivalNanos) / 1000000.0
+                : -1.0;
+            double senderSeconds =
+                (double)senderTimestamp / 4294967296.0;
+            double senderDeltaMs = NAN;
+            if (previousSenderTimestamp != 0 &&
+                senderTimestamp >= previousSenderTimestamp) {
+                senderDeltaMs =
+                    (double)(senderTimestamp - previousSenderTimestamp) /
+                    4294967.296;
+            }
+            previousSenderTimestamp = senderTimestamp;
+            double hostAtRead = video_host_now();
+            double presentationAgeMs = NAN;
+            if (senderTimestamp != 0 && g_video_timing_offset_valid) {
+                presentationAgeMs =
+                    (hostAtRead -
+                     (senderSeconds + g_video_sender_to_host_offset)) * 1000.0;
+            }
+            if (arrivalGapMicros > 50000 || serviceSequence % 300 == 0 ||
+                serviceToAppMs > 20.0) {
+                ip_log("[VIDEO-TL] seq=%u gap=%.1fms serviceToApp=%.2fms "
+                       "decrypt=%.2fms pending=%u rcvWnd=%u srtt=%ums "
+                       "rtt=%ums tcpFlags=0x%x sender=%.6fs "
+                       "senderDelta=%.1fms host=%.6fs ptsAge=%.1fms "
+                       "timing=%d idr=%d",
+                       serviceSequence,
+                       (double)arrivalGapMicros / 1000.0, serviceToAppMs,
+                       (double)decryptMicros / 1000.0, tcpPendingBytes,
+                       tcpReceiveWindow, tcpSmoothedRTT, tcpCurrentRTT,
+                       tcpFlags, senderSeconds, senderDeltaMs, hostAtRead,
+                       presentationAgeMs,
+                       (int)g_video_timing_offset_valid, isIDR ? 1 : 0);
+            }
+            const uint8_t *frameBytes =
+                payload + VIDEO_FRAME_METADATA_SIZE;
+            size_t frameLength = len - VIDEO_FRAME_METADATA_SIZE;
+
+            if (g_video_suspended) {
+                free(payload);
+                continue;
+            }
+
+            if (g_video_needs_resync) {
+                if (!isIDR) {
+                    free(payload);
+                    continue;
+                }
+                g_video_needs_resync = 0;
+                decodeOnlyCatchupActive = false;
+                ip_log("video resynchronized on IDR frame age=%.1fms",
+                       presentationAgeMs);
+            }
+
+            /*
+             * TCP preserves the H.264 dependency chain but can release it
+             * hundreds of milliseconds late after a missing segment. Do not
+             * flush that valid chain or request another large IDR over the
+             * same congested path. AVSampleBufferDisplayLayer documents that
+             * DoNotDisplay still decodes the sample, so feed stale frames to
+             * the decoder without presenting them. The last current image
+             * remains visible until the chain catches up.
+             */
+            double staleThresholdMs =
+                MAX(VIDEO_STALE_RECOVERY_MIN_MS,
+                    (double)g_video_target_latency_ms * 2.0);
+            BOOL decodeOnlyCatchup =
+                g_video_timing_offset_valid &&
+                isfinite(presentationAgeMs) &&
+                presentationAgeMs > staleThresholdMs &&
+                isfinite(senderDeltaMs) &&
+                senderDeltaMs <= 100.0;
+            if (decodeOnlyCatchup && !decodeOnlyCatchupActive) {
+                decodeOnlyCatchupActive = true;
+                ip_log("video decode-only catch-up started seq=%u age=%.1fms "
+                       "arrivalGap=%.1fms senderDelta=%.1fms",
+                       serviceSequence, presentationAgeMs,
+                       (double)arrivalGapMicros / 1000.0, senderDeltaMs);
+            } else if (!decodeOnlyCatchup && decodeOnlyCatchupActive) {
+                decodeOnlyCatchupActive = false;
+                ip_log("video decode-only catch-up complete seq=%u age=%.1fms",
+                       serviceSequence, presentationAgeMs);
+            }
+
             if (!gotFirstFrame) {
                 gotFirstFrame = true;
                 [self transitionTo:StateActive];
                 ip_log("first video frame");
+                /* Deferred to here on purpose: pairing, iAP2 handoff and the
+                 * whole RTSP negotiation have already completed, so radio
+                 * suppression cannot influence them. */
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    [self beginAWDLSuppression];
+                });
             }
 
             CMBlockBufferRef block = NULL;
             OSStatus st = CMBlockBufferCreateWithMemoryBlock(
-                NULL, NULL, len, kCFAllocatorDefault, NULL, 0, len,
+                NULL, NULL, frameLength, kCFAllocatorDefault, NULL, 0,
+                frameLength,
                 kCMBlockBufferAssureMemoryNowFlag, &block);
-            if (st == noErr) CMBlockBufferReplaceDataBytes(payload, block, 0, len);
+            if (st == noErr) {
+                CMBlockBufferReplaceDataBytes(frameBytes, block, 0,
+                                              frameLength);
+            }
             free(payload); payload = NULL;
             if (st != noErr || !block) continue;
 
+            /* Schedule on the sender's timeline when it says its timestamps are
+             * authoritative. A frame whose slot has already passed is still
+             * enqueued, just immediately: dropping it would break the H.264
+             * reference chain and corrupt every frame up to the next IDR. */
+            BOOL scheduled = (g_video_respect_timestamps && senderTimestamp != 0);
+            double displayHost = 0.0;
+            if (scheduled) {
+                bool missedSlot = false;
+                double latenessSeconds = 0.0;
+                displayHost = video_clock_schedule(senderTimestamp,
+                                                   video_host_now(),
+                                                   &missedSlot,
+                                                   &latenessSeconds);
+                if (missedSlot) {
+                    lateFrameCount++;
+                    double latenessMs = latenessSeconds * 1000.0;
+                    latenessSumMs += latenessMs;
+                    if (latenessMs > latenessMaxMs) latenessMaxMs = latenessMs;
+                }
+            }
+
+            CMSampleTimingInfo timing;
+            /* Follow the sender's real cadence — it drops to 30 Hz on
+             * link-limited receivers, and a hardcoded 1/60 would retire each
+             * frame half an interval early. */
+            timing.duration = scheduled
+                ? CMTimeMakeWithSeconds(g_video_frame_interval, 1000000)
+                : CMTimeMake(1, 60);
+            timing.presentationTimeStamp = scheduled
+                ? CMTimeMakeWithSeconds(displayHost, 1000000)
+                : kCMTimeInvalid;
+            timing.decodeTimeStamp = kCMTimeInvalid;
+
             CMSampleBufferRef sample = NULL;
-            const size_t sz = len;
-            st = CMSampleBufferCreateReady(NULL, block, fmtDesc, 1, 0, NULL, 1, &sz, &sample);
+            const size_t sz = frameLength;
+            st = CMSampleBufferCreateReady(NULL, block, fmtDesc, 1,
+                                           1, &timing, 1, &sz, &sample);
             CFRelease(block);
             if (st != noErr || !sample) continue;
 
             CFArrayRef att = CMSampleBufferGetSampleAttachmentsArray(sample, true);
             if (att && CFArrayGetCount(att) > 0) {
                 CFMutableDictionaryRef d = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(att, 0);
-                CFDictionarySetValue(d, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+                CFDictionarySetValue(d, kCMSampleAttachmentKey_NotSync,
+                                     isIDR ? kCFBooleanFalse : kCFBooleanTrue);
+                if (decodeOnlyCatchup)
+                    CFDictionarySetValue(
+                        d, kCMSampleAttachmentKey_DoNotDisplay,
+                        kCFBooleanTrue);
+                /* DisplayImmediately overrides the timebase, so it is only
+                 * correct on the unscheduled path. */
+                if (!scheduled)
+                    CFDictionarySetValue(
+                        d, kCMSampleAttachmentKey_DisplayImmediately,
+                        kCFBooleanTrue);
             }
 
-            AVSampleBufferDisplayLayer *layer = (AVSampleBufferDisplayLayer *)self.videoView.layer;
-            if (layer.status == AVQueuedSampleBufferRenderingStatusFailed) [layer flush];
-            [layer enqueueSampleBuffer:sample];
-            CFRelease(sample);
+            uint64_t frameNumber = ++receivedFrameCount;
+            uint64_t lateSoFar = lateFrameCount;
+            uint64_t lateSinceReport = lateFrameCount - lateFrameCountAtReport;
+            double lateMeanMs = lateSinceReport
+                ? (latenessSumMs / (double)lateSinceReport) : 0.0;
+            double lateMaxMs = latenessMaxMs;
+            if (frameNumber % 300 == 0) {
+                lateFrameCountAtReport = lateFrameCount;
+                latenessSumMs = 0;
+                latenessMaxMs = 0;
+            }
+            double clockOffset = g_video_clock_offset;
+            double budgetMs = g_video_budget_seconds * 1000.0;
+            BOOL scheduledFrame = scheduled;
+            CFAbsoluteTime receivedAt = CFAbsoluteTimeGetCurrent();
+            dispatch_async(self.videoQueue, ^{
+                AVSampleBufferDisplayLayer *layer =
+                    (AVSampleBufferDisplayLayer *)self.videoView.layer;
+                if (layer.status ==
+                    AVQueuedSampleBufferRenderingStatusFailed) {
+                    ip_log("video renderer failed: %@",
+                           layer.error.localizedDescription ?: @"unknown");
+                    g_video_needs_resync = 1;
+                    [layer flushAndRemoveImage];
+                    send_video_resync_request();
+                    CFRelease(sample);
+                    return;
+                }
+                /* The timing message can arrive after the parameter sets, so
+                 * confirm the timebase on the first scheduled frame too. */
+                if (scheduledFrame && !layer.controlTimebase)
+                    video_install_timebase(layer);
+                [layer enqueueSampleBuffer:sample];
+                if (frameNumber % 300 == 0) {
+                    double queueDelayMs =
+                        (CFAbsoluteTimeGetCurrent() - receivedAt) * 1000.0;
+                    ip_log("video live #%llu: IPC→enqueue %.1fms ready=%d status=%ld "
+                           "mode=%s late=%llu(+%llu/300 mean %.1fms max %.1fms) "
+                           "budget=%.1fms offset=%.3fs",
+                           frameNumber, queueDelayMs,
+                           layer.readyForMoreMediaData,
+                           (long)layer.status,
+                           scheduledFrame ? "scheduled" : "immediate",
+                           lateSoFar, lateSinceReport, lateMeanMs, lateMaxMs,
+                           budgetMs, clockOffset);
+                }
+                CFRelease(sample);
+            });
             continue;
+        } else if (type == MSG_VIDEO_TIMING) {
+            if (len >= sizeof(uint32_t)) {
+                uint32_t latencyMs = 0;
+                memcpy(&latencyMs, payload, sizeof(latencyMs));
+                if (latencyMs >= 20 && latencyMs <= 500)
+                    g_video_target_latency_ms = latencyMs;
+
+                int32_t respect = g_video_respect_timestamps;
+                if (len >= 5) respect = payload[4] ? 1 : 0;
+                int32_t offsetValid = 0;
+                double senderToHostOffset = 0.0;
+                if (len >= 14) {
+                    memcpy(&senderToHostOffset, payload + 5,
+                           sizeof(senderToHostOffset));
+                    offsetValid = payload[13] ? 1 : 0;
+                }
+                if (offsetValid != g_video_timing_offset_valid ||
+                    (offsetValid &&
+                     fabs(senderToHostOffset -
+                          g_video_sender_to_host_offset) > 0.000001)) {
+                    g_video_sender_to_host_offset = senderToHostOffset;
+                    g_video_timing_offset_valid = offsetValid;
+                    video_clock_reset();
+                }
+                if (respect != g_video_respect_timestamps) {
+                    g_video_respect_timestamps = respect;
+                    video_clock_reset();
+                    dispatch_async(self.videoQueue, ^{
+                        AVSampleBufferDisplayLayer *layer =
+                            (AVSampleBufferDisplayLayer *)self.videoView.layer;
+                        if (respect) video_install_timebase(layer);
+                        else layer.controlTimebase = NULL;
+                    });
+                }
+                ip_log("screen presentation: latency=%u ms respectTimestamps=%d "
+                       "timingOffset=%s%.3fms (%s)",
+                       g_video_target_latency_ms,
+                       (int)g_video_respect_timestamps,
+                       g_video_timing_offset_valid ? "" : "unavailable/",
+                       g_video_sender_to_host_offset * 1000.0,
+                       g_video_respect_timestamps
+                           ? (g_video_timing_offset_valid
+                               ? "frames scheduled with synchronized NTP"
+                               : "frames scheduled with arrival-clock fallback")
+                           : "frames displayed on arrival");
+            }
+            free(payload);
+        } else if (type == MSG_AUDIO_CONFIG) {
+            if (len >= 20) {
+                uint32_t streamType = 0;
+                uint64_t formatMask = 0;
+                uint32_t framesPerPacket = 0;
+                uint32_t latencyMs = 0;
+                memcpy(&streamType, payload, 4);
+                memcpy(&formatMask, payload + 4, 8);
+                memcpy(&framesPerPacket, payload + 12, 4);
+                memcpy(&latencyMs, payload + 16, 4);
+                NSNumber *key = @(streamType);
+                CarPlayAudioPlayer *player = self.audioPlayers[key];
+                if (!player) {
+                    player = [[CarPlayAudioPlayer alloc]
+                        initWithStreamType:streamType];
+                    self.audioPlayers[key] = player;
+                }
+                ip_log("AudioConfig: stream=%u format=0x%llx "
+                       "framesPerPacket=%u latency=%ums",
+                       streamType, (unsigned long long)formatMask,
+                       framesPerPacket, latencyMs);
+                [player configureFormat:formatMask
+                        framesPerPacket:framesPerPacket
+                               latency:latencyMs];
+            }
+            free(payload);
+        } else if (type == MSG_AUDIO_PACKET) {
+            if (len > 12) {
+                uint32_t streamType = 0;
+                uint16_t sequence = 0;
+                memcpy(&streamType, payload, 4);
+                memcpy(&sequence, payload + 4, 2);
+                CarPlayAudioPlayer *player = self.audioPlayers[@(streamType)];
+                [player enqueuePacket:payload + 12
+                               length:len - 12
+                             sequence:sequence];
+            }
+            free(payload);
+        } else if (type == MSG_AUDIO_CONTROL) {
+            if (len >= 5) {
+                uint32_t streamType = 0;
+                memcpy(&streamType, payload, 4);
+                uint8_t action = payload[4];
+                CarPlayAudioPlayer *player =
+                    self.audioPlayers[@(streamType)];
+                if (action == AUDIO_CONTROL_PAUSE) {
+                    [player setPlaybackPaused:YES];
+                } else if (action == AUDIO_CONTROL_RESUME) {
+                    [player setPlaybackPaused:NO];
+                } else if (action == AUDIO_CONTROL_FLUSH) {
+                    [player flushBufferedAudio];
+                } else if (action == AUDIO_CONTROL_STOP) {
+                    [player stop];
+                    [self.audioPlayers removeObjectForKey:@(streamType)];
+                    ip_log("audio stream %u stopped by sender teardown",
+                           streamType);
+                } else {
+                    ip_log("audio stream %u unknown control=%u",
+                           streamType, action);
+                }
+            }
+            free(payload);
+        } else if (type == MSG_BT_HANDOFF) {
+            ip_log("[HANDOFF] services requested app-owned Bluetooth teardown");
+            [self completeBluetoothHandoff];
+            free(payload);
         } else if (type == MSG_STATUS) {
             if (len >= 1) {
                 uint8_t code = payload[0];
@@ -2374,6 +4561,10 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
         }
     }
     if (fmtDesc) CFRelease(fmtDesc);
+    for (CarPlayAudioPlayer *player in self.audioPlayers.allValues) {
+        [player stop];
+    }
+    [self.audioPlayers removeAllObjects];
 }
 
 @end

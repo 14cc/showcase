@@ -62,6 +62,7 @@ if ! LDID="$(ldid_path)"; then
 fi
 
 if [ -d "$APP" ]; then
+    rm -f "$APP/carplay_bt.real" "$APP/carplay_services.real"
     chown -R root:wheel "$APP" 2>/dev/null || true
 
     chmod 0755 "$APP" 2>/dev/null || true

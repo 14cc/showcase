@@ -29,25 +29,136 @@
  * Adapted from UxPlay (LGPL/MIT) srp.c/pairing.c/crypto.c
  * SRP-6a core from csrp by Tom Cocagne (MIT license)
  *
- * Dependencies: OpenSSL libcrypto
- *   - BN, SHA-1/SHA-512, EVP/GCM, RAND (any version >= 1.0.1)
- *   - EVP_PKEY_ED25519/X25519 for pair-verify (requires 1.1.1+)
+ * Crypto is embedded so the package has no external OpenSSL dependency:
+ *   - Monocypher 4.0.2: SHA-512/HKDF, ChaCha20-Poly1305, X25519, Ed25519
+ *   - LibTomMath 1.3.0: SRP 3072-bit modular arithmetic
+ *   - Security.framework: system CSPRNG
  */
 
 #include "carplay_pair.h"
 
-#include <openssl/bn.h>
-#include <openssl/evp.h>
-#include <openssl/sha.h>
-#include <openssl/hmac.h>
-#include <openssl/rand.h>
-#include <openssl/err.h>
-#include <openssl/opensslv.h>
+#include "vendor/monocypher/monocypher.h"
+#include "vendor/monocypher/monocypher-ed25519.h"
+#include "vendor/libtommath/tommath.h"
+#include <Security/SecRandom.h>
 
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <assert.h>
+
+/* carplay_services owns the process-wide, monotonic line logger. */
+extern int showcase_service_log_printf(const char *format, ...);
+#define printf showcase_service_log_printf
+
+#define SHA512_DIGEST_LENGTH 64
+
+/* Small OpenSSL-BN compatibility layer backed by LibTomMath. Keeping the
+ * existing SRP code unchanged makes the replacement easy to audit against
+ * the already-working protocol implementation. */
+typedef mp_int BIGNUM;
+typedef struct { int unused; } BN_CTX;
+
+static BIGNUM *BN_new(void) {
+    BIGNUM *value = malloc(sizeof(*value));
+    if (!value || mp_init(value) != MP_OKAY) {
+        free(value);
+        return NULL;
+    }
+    return value;
+}
+
+static void BN_free(BIGNUM *value) {
+    if (!value) return;
+    mp_clear(value);
+    free(value);
+}
+
+static BN_CTX *BN_CTX_new(void) {
+    return calloc(1, sizeof(BN_CTX));
+}
+
+static void BN_CTX_free(BN_CTX *ctx) {
+    free(ctx);
+}
+
+static int BN_hex2bn(BIGNUM **value, const char *hex) {
+    if (!value || !hex) return 0;
+    if (!*value) *value = BN_new();
+    if (!*value || mp_read_radix(*value, hex, 16) != MP_OKAY) return 0;
+    return (int)strlen(hex);
+}
+
+static int BN_num_bytes(const BIGNUM *value) {
+    return value ? (int)mp_ubin_size(value) : 0;
+}
+
+static int BN_bn2bin(const BIGNUM *value, unsigned char *out) {
+    if (!value || !out) return 0;
+    size_t length = mp_ubin_size(value);
+    return mp_to_ubin(value, out, length, NULL) == MP_OKAY
+        ? (int)length : 0;
+}
+
+static BIGNUM *BN_bin2bn(const unsigned char *bytes, int length,
+                         BIGNUM *value) {
+    if (!bytes || length < 0) return NULL;
+    if (!value) value = BN_new();
+    if (!value || mp_from_ubin(value, bytes, (size_t)length) != MP_OKAY) {
+        BN_free(value);
+        return NULL;
+    }
+    return value;
+}
+
+static int BN_rand(BIGNUM *value, int bits, int top, int bottom) {
+    (void)top;
+    (void)bottom;
+    if (!value || bits <= 0) return 0;
+    size_t length = (size_t)((bits + 7) / 8);
+    unsigned char *bytes = malloc(length);
+    if (!bytes) return 0;
+    int ok = SecRandomCopyBytes(kSecRandomDefault, length, bytes) == errSecSuccess;
+    if (ok && (bits & 7)) bytes[0] &= (uint8_t)((1U << (bits & 7)) - 1U);
+    if (ok) ok = mp_from_ubin(value, bytes, length) == MP_OKAY;
+    crypto_wipe(bytes, length);
+    free(bytes);
+    return ok;
+}
+
+static int BN_mod_exp(BIGNUM *r, const BIGNUM *a, const BIGNUM *p,
+                      const BIGNUM *m, BN_CTX *ctx) {
+    (void)ctx;
+    return mp_exptmod(a, p, m, r) == MP_OKAY;
+}
+
+static int BN_mod_mul(BIGNUM *r, const BIGNUM *a, const BIGNUM *b,
+                      const BIGNUM *m, BN_CTX *ctx) {
+    (void)ctx;
+    return mp_mulmod(a, b, m, r) == MP_OKAY;
+}
+
+static int BN_mod_add(BIGNUM *r, const BIGNUM *a, const BIGNUM *b,
+                      const BIGNUM *m, BN_CTX *ctx) {
+    (void)ctx;
+    return mp_addmod(a, b, m, r) == MP_OKAY;
+}
+
+static int BN_mod(BIGNUM *r, const BIGNUM *a, const BIGNUM *m,
+                  BN_CTX *ctx) {
+    (void)ctx;
+    return mp_mod(a, m, r) == MP_OKAY;
+}
+
+static int BN_mul(BIGNUM *r, const BIGNUM *a, const BIGNUM *b,
+                  BN_CTX *ctx) {
+    (void)ctx;
+    return mp_mul(a, b, r) == MP_OKAY;
+}
+
+static int BN_is_zero(const BIGNUM *value) {
+    return mp_iszero(value) == MP_YES;
+}
 
 /* ═══════════════════════════════════════════════════════════════
  * 1. Configuration
@@ -60,6 +171,8 @@
 #define SRP_SKEY_LEN     SRP_HASH_LEN         /* 64 (single SHA-512 for 3072-bit) */
 #define GCM_TAG_LEN      16
 #define ED25519_KEY_LEN  32
+#define MAX_PAIRED_PEERS 8
+#define MAX_PEER_IDENTIFIER_LEN 128
 
 /* TLV8 type constants */
 #define TLV_METHOD          0x00
@@ -113,41 +226,40 @@ static void ng_free(ng_t *ng) {
     }
 }
 
-/* --- Hash utilities (SHA-512 via OpenSSL EVP) --- */
+/* --- Hash utilities (SHA-512 via embedded Monocypher) --- */
 
-typedef struct { EVP_MD_CTX *ctx; } hctx_t;
+typedef struct { crypto_sha512_ctx ctx; } hctx_t;
 
 static hctx_t *hctx_new(void) {
-    hctx_t *h = calloc(1, sizeof(hctx_t));
-    if (!h) return NULL;
-    h->ctx = EVP_MD_CTX_new();
-    if (!h->ctx) { free(h); return NULL; }
-    return h;
+    return calloc(1, sizeof(hctx_t));
 }
 
 static void hctx_free(hctx_t *h) {
-    if (h) { EVP_MD_CTX_free(h->ctx); free(h); }
+    if (h) {
+        crypto_wipe(h, sizeof(*h));
+        free(h);
+    }
 }
 
 static int hctx_init(hctx_t *h) {
-    return EVP_DigestInit_ex(h->ctx, EVP_sha512(), NULL);
+    crypto_sha512_init(&h->ctx);
+    return 1;
 }
 
 static int hctx_update(hctx_t *h, const void *data, size_t len) {
-    return EVP_DigestUpdate(h->ctx, data, len);
+    crypto_sha512_update(&h->ctx, data, len);
+    return 1;
 }
 
 static int hctx_final(hctx_t *h, unsigned char *md, unsigned int *len) {
-    return EVP_DigestFinal_ex(h->ctx, md, len);
-}
-
-static int hctx_reset(hctx_t *h) {
-    return EVP_MD_CTX_reset(h->ctx);
+    crypto_sha512_final(&h->ctx, md);
+    if (len) *len = SHA512_DIGEST_LENGTH;
+    return 1;
 }
 
 /* Quick SHA-512 hash */
 static void hash_bytes(const unsigned char *d, size_t n, unsigned char *md) {
-    SHA512(d, n, md);
+    crypto_sha512(md, d, n);
 }
 
 /* --- BIGNUM hash helpers --- */
@@ -344,17 +456,7 @@ typedef struct {
 } srp_verifier_t;
 
 static void srp_init_random(void) {
-    static int done = 0;
-    if (done) return;
-    unsigned char buf[64];
-    FILE *fp = fopen("/dev/urandom", "r");
-    if (fp) {
-        if (fread(buf, sizeof(buf), 1, fp) == 1) {
-            RAND_seed(buf, sizeof(buf));
-            done = 1;
-        }
-        fclose(fp);
-    }
+    /* SecRandomCopyBytes is ready without application-managed seeding. */
 }
 
 /* Create salt + verifier from username/password */
@@ -688,59 +790,7 @@ static uint8_t *tlv_build(const tlv_item_t *items, int count, size_t *out_len) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * 4. AES-128-GCM
- * ═══════════════════════════════════════════════════════════════ */
-
-static int gcm_encrypt(const unsigned char *plaintext, int pt_len,
-                        unsigned char *ciphertext,
-                        const unsigned char *key, const unsigned char *iv,
-                        unsigned char tag[GCM_TAG_LEN]) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
-    int len = 0, ct_len = 0;
-
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) != 1) goto fail;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL) != 1) goto fail;
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto fail;
-    if (EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, pt_len) != 1) goto fail;
-    ct_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) goto fail;
-    ct_len += len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) goto fail;
-    EVP_CIPHER_CTX_free(ctx);
-    return ct_len;
-
-fail:
-    EVP_CIPHER_CTX_free(ctx);
-    return -1;
-}
-
-static int gcm_decrypt(const unsigned char *ciphertext, int ct_len,
-                        unsigned char *plaintext,
-                        const unsigned char *key, const unsigned char *iv,
-                        unsigned char tag[GCM_TAG_LEN]) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
-    int len = 0, pt_len = 0;
-
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, NULL, NULL) != 1) goto fail;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 16, NULL) != 1) goto fail;
-    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto fail;
-    if (EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ct_len) != 1) goto fail;
-    pt_len = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, (void *)tag) != 1) goto fail;
-    int ret = EVP_DecryptFinal_ex(ctx, plaintext + len, &len);
-    EVP_CIPHER_CTX_free(ctx);
-    if (ret > 0) { pt_len += len; return pt_len; }
-    return -1;  /* tag verification failed */
-
-fail:
-    EVP_CIPHER_CTX_free(ctx);
-    return -1;
-}
-
-/* ═══════════════════════════════════════════════════════════════
- * 5. HKDF-SHA512 + ChaCha20-Poly1305 (for pair-setup M5/M6)
+ * 4. HKDF-SHA512 + ChaCha20-Poly1305 (for pair-setup M5/M6)
  *    Apple HAP uses HKDF for key derivation and ChaCha20-Poly1305
  *    for M5/M6 encryption (not AES-GCM).
  * ═══════════════════════════════════════════════════════════════ */
@@ -751,24 +801,10 @@ static int hkdf_sha512(const unsigned char *ikm, int ikm_len,
                         const unsigned char *salt, int salt_len,
                         const unsigned char *info, int info_len,
                         unsigned char *okm, int okm_len) {
-    /* Extract: PRK = HMAC-SHA512(salt, IKM) */
-    unsigned char prk[SHA512_DIGEST_LENGTH];
-    unsigned int prk_len = sizeof(prk);
-    HMAC(EVP_sha512(), salt, salt_len, ikm, ikm_len, prk, &prk_len);
-
-    /* Expand: T(1) = HMAC-SHA512(PRK, info || 0x01) */
-    unsigned char t_buf[SHA512_DIGEST_LENGTH];
-    unsigned int t_len;
-    HMAC_CTX *hctx = HMAC_CTX_new();
-    HMAC_Init_ex(hctx, prk, prk_len, EVP_sha512(), NULL);
-    HMAC_Update(hctx, info, info_len);
-    unsigned char one = 0x01;
-    HMAC_Update(hctx, &one, 1);
-    HMAC_Final(hctx, t_buf, &t_len);
-    HMAC_CTX_free(hctx);
-
-    int copy = okm_len < (int)t_len ? okm_len : (int)t_len;
-    memcpy(okm, t_buf, copy);
+    crypto_sha512_hkdf(okm, (size_t)okm_len,
+                       ikm, (size_t)ikm_len,
+                       salt, (size_t)salt_len,
+                       info, (size_t)info_len);
     return 0;
 }
 
@@ -795,22 +831,12 @@ static int chacha_decrypt(const unsigned char key[32],
     unsigned char nonce12[12] = {0};
     memcpy(nonce12 + 4, nonce8, 8);
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
-    int len = 0, pt_len = 0;
-
-    if (EVP_DecryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1) goto fail;
-    if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, nonce12) != 1) goto fail;
-    if (EVP_DecryptUpdate(ctx, pt, &len, ct, ct_len) != 1) goto fail;
-    pt_len = len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG, 16, (void *)tag) != 1) goto fail;
-    int ret = EVP_DecryptFinal_ex(ctx, pt + len, &len);
-    EVP_CIPHER_CTX_free(ctx);
-    if (ret > 0) { pt_len += len; return pt_len; }
-    return -1;
-fail:
-    EVP_CIPHER_CTX_free(ctx);
-    return -1;
+    crypto_aead_ctx ctx;
+    crypto_aead_init_ietf(&ctx, key, nonce12);
+    int result = crypto_aead_read(&ctx, pt, tag, NULL, 0,
+                                  ct, (size_t)ct_len);
+    crypto_wipe(&ctx, sizeof(ctx));
+    return result == 0 ? ct_len : -1;
 }
 
 /* ChaCha20-Poly1305 encrypt. */
@@ -822,22 +848,11 @@ static int chacha_encrypt(const unsigned char key[32],
     unsigned char nonce12[12] = {0};
     memcpy(nonce12 + 4, nonce8, 8);
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return -1;
-    int len = 0, ct_len = 0;
-
-    if (EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) != 1) goto fail;
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce12) != 1) goto fail;
-    if (EVP_EncryptUpdate(ctx, ct, &len, pt, pt_len) != 1) goto fail;
-    ct_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) goto fail;
-    ct_len += len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) != 1) goto fail;
-    EVP_CIPHER_CTX_free(ctx);
-    return ct_len;
-fail:
-    EVP_CIPHER_CTX_free(ctx);
-    return -1;
+    crypto_aead_ctx ctx;
+    crypto_aead_init_ietf(&ctx, key, nonce12);
+    crypto_aead_write(&ctx, ct, tag, NULL, 0, pt, (size_t)pt_len);
+    crypto_wipe(&ctx, sizeof(ctx));
+    return pt_len;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -861,21 +876,77 @@ struct pair_ctx_s {
     /* Client's Ed25519 pk (learned in M5) */
     uint8_t client_pk[32];
     int     client_pk_set;
+    struct {
+        uint8_t identifier[MAX_PEER_IDENTIFIER_LEN];
+        size_t identifier_len;
+        uint8_t public_key[ED25519_KEY_LEN];
+    } peers[MAX_PAIRED_PEERS];
+    size_t peer_count;
 
     /* State machines */
     int setup_state;   /* 0=idle, 2=M2 sent, 4=M4 sent, 6=done */
     int verify_state;  /* 0=idle, 2=M2 sent, 4=done */
 
     /* Pair-verify ECDH state (persists M1→M3) */
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-    EVP_PKEY *verify_ecdh_ours;     /* our X25519 key */
+    uint8_t   verify_ecdh_sk[32];   /* our X25519 secret key */
     uint8_t   verify_shared[32];    /* ECDH shared secret */
     uint8_t   verify_enc_key[32];   /* HKDF-derived ChaCha key for M2/M3 */
     uint8_t   verify_our_ecdh_pk[32]; /* our X25519 public key (for M3) */
     uint8_t   client_ecdh_pk[32];   /* client's X25519 public key from M1 */
     int       client_ecdh_pk_set;
-#endif
 };
+
+static int find_peer_index(const pair_ctx_t *ctx, const uint8_t *identifier,
+                           size_t identifier_len) {
+    if (!ctx || !identifier || identifier_len == 0) return -1;
+    for (size_t i = 0; i < ctx->peer_count; i++) {
+        if (ctx->peers[i].identifier_len == identifier_len &&
+            memcmp(ctx->peers[i].identifier, identifier, identifier_len) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+int pair_ctx_add_peer(pair_ctx_t *ctx, const uint8_t *identifier,
+                      size_t identifier_len, const uint8_t public_key[32]) {
+    if (!ctx || !identifier || !public_key || identifier_len == 0 ||
+        identifier_len > MAX_PEER_IDENTIFIER_LEN)
+        return -1;
+    int existing = find_peer_index(ctx, identifier, identifier_len);
+    size_t index;
+    if (existing >= 0) {
+        index = (size_t)existing;
+    } else if (ctx->peer_count < MAX_PAIRED_PEERS) {
+        index = ctx->peer_count++;
+    } else {
+        /* Keep the registry bounded. The oldest slot is replaced only when
+         * somebody intentionally completes a new authenticated pair-setup. */
+        memmove(&ctx->peers[0], &ctx->peers[1],
+                sizeof(ctx->peers[0]) * (MAX_PAIRED_PEERS - 1));
+        index = MAX_PAIRED_PEERS - 1;
+    }
+    memcpy(ctx->peers[index].identifier, identifier, identifier_len);
+    ctx->peers[index].identifier_len = identifier_len;
+    memcpy(ctx->peers[index].public_key, public_key, ED25519_KEY_LEN);
+    return 0;
+}
+
+size_t pair_ctx_peer_count(const pair_ctx_t *ctx) {
+    return ctx ? ctx->peer_count : 0;
+}
+
+int pair_ctx_get_peer(const pair_ctx_t *ctx, size_t index,
+                      uint8_t *identifier, size_t identifier_capacity,
+                      size_t *identifier_len, uint8_t public_key[32]) {
+    if (!ctx || index >= ctx->peer_count || !identifier_len || !public_key)
+        return -1;
+    size_t length = ctx->peers[index].identifier_len;
+    *identifier_len = length;
+    if (!identifier || identifier_capacity < length) return -1;
+    memcpy(identifier, ctx->peers[index].identifier, length);
+    memcpy(public_key, ctx->peers[index].public_key, ED25519_KEY_LEN);
+    return 0;
+}
 
 pair_ctx_t *pair_ctx_create(const uint8_t sk[32], const uint8_t pk[32], const char *pin) {
     pair_ctx_t *ctx = calloc(1, sizeof(pair_ctx_t));
@@ -965,11 +1036,7 @@ int pair_derive_stream_key(pair_ctx_t *ctx, uint64_t streamConnectionID, uint8_t
 void pair_ctx_destroy(pair_ctx_t *ctx) {
     if (ctx) {
         free(ctx->srp_verifier);
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-        if (ctx->verify_ecdh_ours)
-            EVP_PKEY_free(ctx->verify_ecdh_ours);
-#endif
-        memset(ctx, 0, sizeof(*ctx));
+        crypto_wipe(ctx, sizeof(*ctx));
         free(ctx);
     }
 }
@@ -1014,7 +1081,11 @@ static uint8_t *handle_setup_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
 
     /* Generate random server private ephemeral key (b) */
     srp_init_random();
-    RAND_bytes(ctx->srp_b, 32);
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(ctx->srp_b),
+                           ctx->srp_b) != errSecSuccess) {
+        printf("[PAIR] ERROR: secure random generation failed\n");
+        return make_error_response(2, 1, out_len);
+    }
 
     /* Compute server public ephemeral key (B) */
     unsigned char *B = NULL;
@@ -1179,6 +1250,11 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
             printf("[PAIR]   Client Ed25519 pk: ");
             for (int i = 0; i < ED25519_KEY_LEN; i++) printf("%02x", ctx->client_pk[i]);
             printf("\n");
+            if (ident && pair_ctx_add_peer(ctx, ident->data, ident->len,
+                                          ctx->client_pk) == 0) {
+                printf("[PAIR]   Controller saved in registry (%zu total)\n",
+                       ctx->peer_count);
+            }
         }
         if (sig) {
             printf("[PAIR]   Signature (%zu bytes)\n", sig->len);
@@ -1231,23 +1307,16 @@ static uint8_t *handle_setup_m5(pair_ctx_t *ctx, const tlv_t *in, size_t *out_le
     /* Ed25519 sign */
     unsigned char signature[64];
     size_t sig_len = 64;
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-    EVP_PKEY *sign_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
-                                                        ctx->our_sk, 32);
-    if (sign_key) {
-        EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-        EVP_DigestSignInit(mdctx, NULL, NULL, NULL, sign_key);
-        EVP_DigestSign(mdctx, signature, &sig_len, sign_msg, sign_msg_len);
-        EVP_MD_CTX_free(mdctx);
-        EVP_PKEY_free(sign_key);
-        printf("[PAIR] M6 Ed25519 signature computed (%zu bytes)\n", sig_len);
-    } else {
-        memset(signature, 0, 64);
-        printf("[PAIR] WARNING: Could not create Ed25519 key for signing\n");
-    }
-#else
-    memset(signature, 0, 64);
-#endif
+    uint8_t signingSeed[32];
+    uint8_t signingSecret[64];
+    uint8_t signingPublic[32];
+    memcpy(signingSeed, ctx->our_sk, sizeof(signingSeed));
+    crypto_ed25519_key_pair(signingSecret, signingPublic, signingSeed);
+    crypto_ed25519_sign(signature, signingSecret, sign_msg,
+                        (size_t)sign_msg_len);
+    crypto_wipe(signingSecret, sizeof(signingSecret));
+    crypto_wipe(signingPublic, sizeof(signingPublic));
+    printf("[PAIR] M6 Ed25519 signature computed (%zu bytes)\n", sig_len);
     free(sign_msg);
 
     tlv_item_t sub_items[3] = {
@@ -1346,24 +1415,8 @@ uint8_t *pair_setup_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,
 
 /* ═══════════════════════════════════════════════════════════════
  * 8. Pair-Verify Handler (M1→M4)
- *    Requires OpenSSL 1.1.1+ for Ed25519 / X25519 EVP APIs.
+ *    X25519 and standard Ed25519 are provided by embedded Monocypher.
  * ═══════════════════════════════════════════════════════════════ */
-
-#if OPENSSL_VERSION_NUMBER >= 0x10101000L
-
-/* SHA-512 derive key from shared secret + salt string */
-static void derive_verify_key(const unsigned char *secret, int secret_len,
-                                const char *salt, int salt_len,
-                                unsigned char *out, int out_len) {
-    unsigned char hash[SHA512_DIGEST_LENGTH];
-    SHA512_CTX sha;
-    SHA512_Init(&sha);
-    SHA512_Update(&sha, salt, salt_len);
-    SHA512_Update(&sha, secret, secret_len);
-    SHA512_Final(hash, &sha);
-    if (out_len > SHA512_DIGEST_LENGTH) out_len = SHA512_DIGEST_LENGTH;
-    memcpy(out, hash, out_len);
-}
 
 /* M1 → M2: Generate X25519 ECDH, sign with Ed25519, send encrypted signature */
 static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
@@ -1384,55 +1437,29 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     memcpy(ctx->client_ecdh_pk, pk_item->data, 32);
     ctx->client_ecdh_pk_set = 1;
 
-    /* Generate our X25519 keypair */
-    EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-    if (!pctx) {
-        printf("[PAIR] ERROR: EVP_PKEY_CTX_new_id(X25519) failed\n");
-        return make_error_response(2, 1, out_len);
-    }
-    EVP_PKEY_keygen_init(pctx);
-    EVP_PKEY *our_ecdh = NULL;
-    EVP_PKEY_keygen(pctx, &our_ecdh);
-    EVP_PKEY_CTX_free(pctx);
-
-    if (!our_ecdh) {
-        printf("[PAIR] ERROR: X25519 keygen failed\n");
+    /* Generate our X25519 keypair. */
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(ctx->verify_ecdh_sk),
+                           ctx->verify_ecdh_sk) != errSecSuccess) {
+        printf("[PAIR] ERROR: X25519 secure random generation failed\n");
         return make_error_response(2, 1, out_len);
     }
 
-    /* Get our X25519 public key */
     unsigned char our_ecdh_pk[32];
-    size_t pk_len = 32;
-    EVP_PKEY_get_raw_public_key(our_ecdh, our_ecdh_pk, &pk_len);
+    crypto_x25519_public_key(our_ecdh_pk, ctx->verify_ecdh_sk);
 
     printf("[PAIR] Our X25519 pk: ");
     for (int i = 0; i < 32; i++) printf("%02x", our_ecdh_pk[i]);
     printf("\n");
 
-    /* Client's X25519 public key */
-    EVP_PKEY *their_ecdh = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL,
-                                                         pk_item->data, 32);
-    if (!their_ecdh) {
-        printf("[PAIR] ERROR: Failed to load client X25519 pk\n");
-        EVP_PKEY_free(our_ecdh);
+    /* ECDH shared secret */
+    crypto_x25519(ctx->verify_shared, ctx->verify_ecdh_sk, pk_item->data);
+    static const uint8_t zeroSecret[32] = {0};
+    if (crypto_verify32(ctx->verify_shared, zeroSecret) == 0) {
+        printf("[PAIR] ERROR: X25519 produced an invalid all-zero secret\n");
         return make_error_response(2, 2, out_len);
     }
 
-    /* ECDH shared secret */
-    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(our_ecdh, NULL);
-    EVP_PKEY_derive_init(dctx);
-    EVP_PKEY_derive_set_peer(dctx, their_ecdh);
-    size_t secret_len = 32;
-    EVP_PKEY_derive(dctx, ctx->verify_shared, &secret_len);
-    EVP_PKEY_CTX_free(dctx);
-    EVP_PKEY_free(their_ecdh);
-
     printf("[PAIR] ECDH shared secret established\n");
-
-    /* Save our ECDH key for M3 processing */
-    if (ctx->verify_ecdh_ours)
-        EVP_PKEY_free(ctx->verify_ecdh_ours);
-    ctx->verify_ecdh_ours = our_ecdh;
 
     /* Save our ECDH public key for M3 */
     memcpy(ctx->verify_our_ecdh_pk, our_ecdh_pk, 32);
@@ -1447,28 +1474,24 @@ static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     memcpy(sig_msg + 32, our_ident, our_ident_len);
     memcpy(sig_msg + 32 + our_ident_len, pk_item->data, 32);
 
-    EVP_PKEY *ed_key = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
-                                                      ctx->our_sk, 32);
-    if (!ed_key) {
-        free(sig_msg);
-        printf("[PAIR] ERROR: Failed to create Ed25519 key from seed\n");
-        return make_error_response(2, 1, out_len);
-    }
-
     unsigned char signature[64];
     size_t sig_len = sizeof(signature);
-    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
-    EVP_DigestSignInit(mdctx, NULL, NULL, NULL, ed_key);
-    EVP_DigestSign(mdctx, signature, &sig_len, sig_msg, sig_msg_len);
-    EVP_MD_CTX_free(mdctx);
-    EVP_PKEY_free(ed_key);
+    uint8_t signingSeed[32];
+    uint8_t signingSecret[64];
+    uint8_t signingPublic[32];
+    memcpy(signingSeed, ctx->our_sk, sizeof(signingSeed));
+    crypto_ed25519_key_pair(signingSecret, signingPublic, signingSeed);
+    crypto_ed25519_sign(signature, signingSecret, sig_msg,
+                        (size_t)sig_msg_len);
+    crypto_wipe(signingSecret, sizeof(signingSecret));
+    crypto_wipe(signingPublic, sizeof(signingPublic));
     free(sig_msg);
 
     printf("[PAIR] Ed25519 signature (%zu bytes)\n", sig_len);
 
     /* Build sub-TLV: Identifier + Signature */
     tlv_item_t sub_items[2] = {
-        { TLV_IDENTIFIER, (const uint8_t *)our_ident, (size_t)our_ident_len },
+        { TLV_IDENTIFIER, (uint8_t *)our_ident,       (size_t)our_ident_len },
         { TLV_SIGNATURE,  signature,                  sig_len }
     };
     size_t sub_len = 0;
@@ -1587,9 +1610,14 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
            ident_item->len, (int)ident_item->len, ident_item->data);
     printf("[PAIR]   Client signature (64 bytes)\n");
 
-    /* Verify: Ed25519_verify(client_ecdh_pk || identifier || our_ecdh_pk)
-     * using client's Ed25519 pk (learned during pair-setup M5) */
-    if (ctx->client_pk_set && ctx->client_ecdh_pk_set) {
+    /* Verify against the identifier-specific key restored from persistent
+     * storage. A just-completed pair-setup has populated the same registry. */
+    int peer_index = find_peer_index(ctx, ident_item->data, ident_item->len);
+    const uint8_t *verify_pk = peer_index >= 0
+        ? ctx->peers[peer_index].public_key
+        : (ctx->client_pk_set ? ctx->client_pk : NULL);
+    bool signature_valid = false;
+    if (verify_pk && ctx->client_ecdh_pk_set) {
         int verify_msg_len = 32 + (int)ident_item->len + 32;
         unsigned char *verify_msg = malloc(verify_msg_len);
         if (verify_msg) {
@@ -1597,34 +1625,29 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
             memcpy(verify_msg + 32, ident_item->data, ident_item->len);
             memcpy(verify_msg + 32 + ident_item->len, ctx->verify_our_ecdh_pk, 32);
 
-            EVP_PKEY *client_ed = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-                                                                ctx->client_pk, 32);
-            if (client_ed) {
-                EVP_MD_CTX *vctx = EVP_MD_CTX_new();
-                EVP_DigestVerifyInit(vctx, NULL, NULL, NULL, client_ed);
-                int vret = EVP_DigestVerify(vctx, sig_item->data, 64, verify_msg, verify_msg_len);
-                EVP_MD_CTX_free(vctx);
-                EVP_PKEY_free(client_ed);
-
-                if (vret == 1) {
-                    printf("[PAIR] *** Ed25519 signature verification PASSED ***\n");
-                } else {
-                    printf("[PAIR] WARNING: Ed25519 signature verification FAILED\n");
-                    printf("[PAIR] Proceeding anyway (accepting client)\n");
-                }
+            int vret = crypto_ed25519_check(
+                sig_item->data, verify_pk, verify_msg,
+                (size_t)verify_msg_len);
+            if (vret == 0) {
+                printf("[PAIR] *** Ed25519 signature verification PASSED ***\n");
+                signature_valid = true;
             } else {
-                printf("[PAIR] WARNING: Could not load client Ed25519 pk for verification\n");
+                printf("[PAIR] ERROR: Ed25519 signature verification FAILED\n");
             }
             free(verify_msg);
         }
     } else {
         printf("[PAIR] WARNING: Skipping signature verification ");
-        if (!ctx->client_pk_set) printf("(no client Ed25519 pk from pair-setup) ");
+        if (!verify_pk) printf("(identifier is not paired) ");
         if (!ctx->client_ecdh_pk_set) printf("(no client ECDH pk) ");
         printf("\n");
     }
 
     tlv_free(sub_tlv);
+    if (!signature_valid) {
+        printf("[PAIR] Rejecting unpaired or unauthenticated controller\n");
+        return make_error_response(4, 2, out_len);
+    }
 
     /* Build M4 response: State=4 (success) */
     uint8_t state = 4;
@@ -1638,21 +1661,6 @@ static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_l
     printf("[PAIR] pair-verify M4 sent (State=4, success)\n");
     return resp;
 }
-
-#else /* OpenSSL < 1.1.1 — no Ed25519/X25519 support */
-
-static uint8_t *handle_verify_m1(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
-    printf("[PAIR] ERROR: pair-verify requires OpenSSL 1.1.1+ for Ed25519/X25519\n");
-    printf("[PAIR] Current OpenSSL version: 0x%08lx\n", (unsigned long)OPENSSL_VERSION_NUMBER);
-    printf("[PAIR] Install a newer OpenSSL or use standalone Ed25519/X25519 implementation\n");
-    return make_error_response(2, 6, out_len);  /* Unavailable */
-}
-
-static uint8_t *handle_verify_m3(pair_ctx_t *ctx, const tlv_t *in, size_t *out_len) {
-    return make_error_response(4, 6, out_len);
-}
-
-#endif /* OPENSSL_VERSION_NUMBER >= 0x10101000L */
 
 /* Main pair-verify dispatcher */
 uint8_t *pair_verify_handle(pair_ctx_t *ctx, const uint8_t *body, size_t bodyLen,

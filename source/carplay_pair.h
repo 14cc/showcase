@@ -5,7 +5,7 @@
  *   Pair-setup: SRP-6a (M1→M6) + ChaCha20-Poly1305 key exchange
  *   Pair-verify: X25519 ECDH + Ed25519 signatures (M1→M4)
  *
- * Dependencies: OpenSSL libcrypto (BN, SHA, EVP)
+ * Crypto dependencies are embedded in source/vendor.
  */
 
 #ifndef CARPLAY_PAIR_H
@@ -38,6 +38,16 @@ bool pair_setup_is_complete(pair_ctx_t *ctx);
 
 /* True if pair-verify completed successfully (M4 sent) */
 bool pair_verify_is_complete(pair_ctx_t *ctx);
+
+/* Persisted controller registry. Pair-setup adds or refreshes a controller;
+ * callers can serialize the registry and restore it in a new process so
+ * returning iPhones can use pair-verify without repeating pair-setup. */
+int pair_ctx_add_peer(pair_ctx_t *ctx, const uint8_t *identifier,
+                      size_t identifier_len, const uint8_t public_key[32]);
+size_t pair_ctx_peer_count(const pair_ctx_t *ctx);
+int pair_ctx_get_peer(const pair_ctx_t *ctx, size_t index,
+                      uint8_t *identifier, size_t identifier_capacity,
+                      size_t *identifier_len, uint8_t public_key[32]);
 
 /* Derive control channel encryption keys after pair-verify.
  * readKey: 32 bytes — decrypt iPhone→us (HKDF "Control-Write-Encryption-Key")

@@ -62,10 +62,16 @@ need_file "$REPO_ROOT/source/carplay_bt.m"
 need_file "$REPO_ROOT/source/carplay_services.m"
 need_file "$REPO_ROOT/source/carplay_pair.c"
 need_file "$REPO_ROOT/source/carplay_pair.h"
+need_file "$REPO_ROOT/source/baa_broker.h"
+need_file "$REPO_ROOT/source/vendor/monocypher/monocypher.c"
+need_file "$REPO_ROOT/source/vendor/monocypher/monocypher-ed25519.c"
+need_file "$REPO_ROOT/source/vendor/libtommath/tommath.c"
 need_file "$REPO_ROOT/source/Info.plist"
 need_file "$REPO_ROOT/source/ent_app.xml"
 need_file "$REPO_ROOT/source/ent_bt.xml"
 need_file "$REPO_ROOT/source/ent_svc.xml"
+need_file "$REPO_ROOT/icon/generated/Icon-OEM-104.png"
+need_file "$REPO_ROOT/icon/generated/Icon-OEM-120.png"
 
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
@@ -85,12 +91,15 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/carplay_services.m" \
    "$REPO_ROOT/source/carplay_pair.c" \
    "$REPO_ROOT/source/carplay_pair.h" \
+   "$REPO_ROOT/source/baa_broker.h" \
    "$REPO_ROOT/source/Info.plist" \
    "$REPO_ROOT/source/ent_app.xml" \
    "$REPO_ROOT/source/ent_bt.xml" \
    "$REPO_ROOT/source/ent_svc.xml" \
    "$WORK/send/"
 cp "$BTSTACK_DYLIB" "$WORK/send/libBTstack.dylib"
+COPYFILE_DISABLE=1 tar --format ustar -C "$REPO_ROOT/source" \
+  -cf "$WORK/send/crypto-vendor.tar" vendor
 
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" \
   "rm -rf '$REMOTE_BASE' && mkdir -p '$REMOTE_BASE'"
@@ -102,28 +111,27 @@ sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
 sshpass -p "$IPAD_PASS" ssh "${SSH_OPTS[@]}" "$IPAD_USER@$IPAD_HOST" "
 set -e
 cd '$REMOTE_BASE'
+tar -xf crypto-vendor.tar
 
-clang -fobjc-arc -isysroot '$SDK_REMOTE' \
+clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o Showcase Showcase.m \
-    -framework UIKit -framework AVFoundation \
-    -framework CoreMedia -framework Foundation \
+    -framework UIKit -framework AVFoundation -framework AudioToolbox \
+    -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
 
-clang -fobjc-arc -isysroot '$SDK_REMOTE' \
+clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o carplay_bt carplay_bt.m \
     ./libBTstack.dylib \
     -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
 
-clang -fobjc-arc -isysroot '$SDK_REMOTE' -I/usr/include \
+clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     -o carplay_services carplay_services.m carplay_pair.c \
+    vendor/monocypher/monocypher.c \
+    vendor/monocypher/monocypher-ed25519.c \
+    vendor/libtommath/tommath.c \
     -framework Foundation -framework Security \
-    /usr/lib/libcrypto.dylib \
-    -Wl,-undefined,dynamic_lookup \
-    || clang -fobjc-arc -isysroot '$SDK_REMOTE' -I/usr/include -L/usr/lib \
-        -o carplay_services carplay_services.m carplay_pair.c \
-        -framework Foundation -framework Security -lcrypto \
-        -Wl,-undefined,dynamic_lookup
+    -Wl,-undefined,dynamic_lookup
 "
 
 cp -R "$PAYLOAD"/. "$WORK/rootfs"/
@@ -133,6 +141,10 @@ for bin in Showcase carplay_bt carplay_services; do
     "$WORK/rootfs/Applications/Showcase.app/$bin"
 done
 cp "$REPO_ROOT/source/Info.plist" "$WORK/rootfs/Applications/Showcase.app/Info.plist"
+cp "$REPO_ROOT/icon/generated/Icon-OEM-104.png" \
+   "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-104.png"
+cp "$REPO_ROOT/icon/generated/Icon-OEM-120.png" \
+   "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-120.png"
 
 cp "$ROOT/control/control" "$WORK/rootfs/DEBIAN/control"
 cp "$ROOT/control/postinst" "$WORK/rootfs/DEBIAN/postinst"

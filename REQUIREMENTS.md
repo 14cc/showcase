@@ -1,26 +1,33 @@
 # Requirements
 
-End users who install the `.deb` need a rootful iPad, Personal Hotspot, and the runtime packages declared by APT. They do not need a compiler, SDK, headers, or signing tools.
+End users who install the `.deb` need a compatible jailbroken cellular iPhone or iPad, Personal Hotspot, and the runtime packages declared by APT. They do not need a compiler, SDK, headers, signing tools, or OpenSSL.
 
 ## Runtime
 
 | Item | Requirement |
 | --- | --- |
-| Device | Cellular iPad with Personal Hotspot |
-| Tested model | iPad Air 1 cellular, A1475, iPad4,2 |
-| Tested firmware | iOS 12.5.8 |
-| Jailbreak | Rootful |
+| Device | Cellular iPhone or iPad with Personal Hotspot |
+| Tested rootful device | iPad Air 1 cellular, iPad4,2, iOS 12.5.8 |
+| Tested rootless device | iPhone 7, iPhone9,3, iOS 15.8.4 |
+| Jailbreak | Rootful or rootless, iOS 12 or newer |
 | Package manager | Sileo, Cydia, Zebra, or APT-compatible frontend |
 
-The package declares these dependencies.
+The rootful package declares the following dependencies.
 
 ```text
 firmware (>= 12.0)
-libssl3 (>= 3.2.1)
 uikittools
 ```
 
-The package bundles the BTstack runtime files it needs.
+The rootless package declares the following dependencies.
+
+```text
+firmware (>= 12.0)
+uikittools
+ldid
+```
+
+Both packages bundle the BTstack runtime files they need. The rootful paths follow.
 
 ```text
 /usr/bin/BTdaemon
@@ -36,10 +43,11 @@ Source builds need these tools on the iPad.
 | --- | --- |
 | `/usr/bin/clang` | Objective-C and C build |
 | `/usr/bin/ldid` | Entitlement signing |
-| `/usr/include/openssl/*.h` | OpenSSL headers |
 | `/tmp/iPhoneOS10.3.sdk` | clang sysroot |
 
-The Mac-side helper scripts use USB SSH forwarding. `IPAD_PORT` means the local forwarded port on the Mac.
+Showcase vendors Monocypher and LibTomMath under `source/vendor`, so builds need no OpenSSL headers or libraries.
+
+The Mac-side helper scripts use USB SSH forwarding. `IPAD_PORT` holds the local forwarded port on the Mac.
 
 ```text
 IPAD_HOST=localhost

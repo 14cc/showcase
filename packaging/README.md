@@ -27,9 +27,11 @@ The rootless package installs the same app and runtime files under `/var/jb`.
 ```
 
 If `payload-rootless/usr/bin/BTdaemon` exists, the rootless build uses that
-arm64 daemon instead of thinning the historical rootful BTdaemon. This keeps
-the iOS 15+ Bluetooth transport fix separate from the iOS 12-14 package.
+arm64 daemon instead of thinning the historical rootful BTdaemon. Each package
+keeps the Bluetooth transport that matches its filesystem layout.
 
-APT metadata declares `libssl3` and `uikittools` as dependencies. Rootful packages use `iphoneos-arm`; rootless packages use `iphoneos-arm64`.
+The rootful package depends on `uikittools`. The rootless package depends on `uikittools` and `ldid`. Showcase can use `tcpdump` for opt-in diagnostics when the user installs it. Both packages embed their CarPlay cryptography and have no OpenSSL dependency.
+
+Rootful packages use `iphoneos-arm`; rootless packages use `iphoneos-arm64`. Both set iOS 12.0 as the deployment target.
 
 Do not commit `payload/`, `build/`, or `repo/` to the source branch. Publish the generated `repo/` directory to the web path that serves `https://aminerostane.com/repo`.

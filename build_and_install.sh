@@ -9,7 +9,8 @@
 #                                 ../iPhoneOS10.3.sdk.tar
 #                                 /tmp/iPhoneOS10.3.sdk.tar
 #                                 /tmp/os/iOS-SDK/iPhoneOS10.3.sdk    (will tar)
-#   - iPad jailbroken with: clang, ldid, libcrypto.dylib
+#                                 ../iOS-SDKs/iPhoneOS10.3.sdk        (will tar)
+#   - iPad jailbroken with: clang and ldid
 
 set -e
 
@@ -45,7 +46,7 @@ else
         fi
     done
     if [ -z "$SDK_TAR" ]; then
-        for tree in "/tmp/os/iOS-SDK/iPhoneOS10.3.sdk" "$DIR/iPhoneOS10.3.sdk" "$DIR/../iPhoneOS10.3.sdk"; do
+        for tree in "/tmp/os/iOS-SDK/iPhoneOS10.3.sdk" "$DIR/iPhoneOS10.3.sdk" "$DIR/../iPhoneOS10.3.sdk" "$DIR/../iOS-SDKs/iPhoneOS10.3.sdk"; do
             if [ -d "$tree" ]; then
                 echo "       found SDK tree at $tree, tarring..."
                 parent="$(dirname "$tree")"
@@ -68,17 +69,22 @@ fi
 # ── Step 1: Send sources + entitlements + plist ───────────────────
 echo ""
 echo "[1/7] Sending sources + icons"
+COPYFILE_DISABLE=1 tar --format ustar -C "$SRC" \
+    -cf /tmp/showcase-crypto-vendor.tar vendor
 scp_cmd "$SRC/Showcase.m" \
         "$SRC/carplay_bt.m" \
         "$SRC/carplay_services.m" \
         "$SRC/carplay_pair.c" \
         "$SRC/carplay_pair.h" \
+        "$SRC/baa_broker.h" \
         "$SRC/Info.plist" \
         "$SRC/ent_app.xml" \
         "$SRC/ent_bt.xml" \
         "$SRC/ent_svc.xml" \
+        /tmp/showcase-crypto-vendor.tar \
         "$ICON"/*.png \
         "$IPAD_USER@$IPAD_HOST:/tmp/"
+ssh_cmd "cd /tmp && tar -xf showcase-crypto-vendor.tar"
 
 BTSTACK_LINK="/usr/lib/libBTstack.dylib"
 if [ -f "$BTSTACK_DYLIB" ]; then
@@ -98,17 +104,17 @@ echo "[2/7] Compiling Showcase"
 # Note: -Wl,-undefined,dynamic_lookup needed because the iPad-side ld treats
 # the SDK's .tbd stubs as 'out of sync' for libSystem (memset/strcmp etc).
 # Symbols resolve at runtime via dyld through libSystem.B.dylib (linked via Foundation).
-ssh_cmd "clang -fobjc-arc -isysroot $SDK_REMOTE \
+ssh_cmd "clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot $SDK_REMOTE \
     -o /tmp/Showcase /tmp/Showcase.m \
-    -framework UIKit -framework AVFoundation \
-    -framework CoreMedia -framework Foundation \
+    -framework UIKit -framework AVFoundation -framework AudioToolbox \
+    -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup 2>&1" || { echo "FAIL"; exit 1; }
 echo "       OK"
 
 # ── Step 3: Compile carplay_bt ────────────────────────────────────
 echo ""
 echo "[3/7] Compiling carplay_bt"
-ssh_cmd "clang -fobjc-arc -isysroot $SDK_REMOTE \
+ssh_cmd "clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot $SDK_REMOTE \
     -o /tmp/carplay_bt /tmp/carplay_bt.m \
     $BTSTACK_LINK \
     -framework Foundation -framework Security \
@@ -118,16 +124,13 @@ echo "       OK"
 # ── Step 4: Compile carplay_services ──────────────────────────────
 echo ""
 echo "[4/7] Compiling carplay_services"
-ssh_cmd "clang -fobjc-arc -isysroot $SDK_REMOTE -I/usr/include \
+ssh_cmd "clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot $SDK_REMOTE \
     -o /tmp/carplay_services /tmp/carplay_services.m /tmp/carplay_pair.c \
+    /tmp/vendor/monocypher/monocypher.c \
+    /tmp/vendor/monocypher/monocypher-ed25519.c \
+    /tmp/vendor/libtommath/tommath.c \
     -framework Foundation -framework Security \
-    /usr/lib/libcrypto.dylib \
-    -Wl,-undefined,dynamic_lookup 2>&1" \
-    || ssh_cmd "clang -fobjc-arc -isysroot $SDK_REMOTE -I/usr/include -L/usr/lib \
-        -o /tmp/carplay_services /tmp/carplay_services.m /tmp/carplay_pair.c \
-        -framework Foundation -framework Security -lcrypto \
-        -Wl,-undefined,dynamic_lookup 2>&1" \
-    || { echo "FAIL"; exit 1; }
+    -Wl,-undefined,dynamic_lookup 2>&1" || { echo "FAIL"; exit 1; }
 echo "       OK"
 
 # ── Step 5: Assemble Showcase.app ─────────────────────────────────

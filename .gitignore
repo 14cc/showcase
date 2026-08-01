@@ -12,6 +12,7 @@ packaging/repo/
 
 report/
 AGENT_RELEASE_GUIDE.md
+evidence-*/
 
 source/*.o
 source/*.dSYM/
