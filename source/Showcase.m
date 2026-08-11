@@ -96,7 +96,11 @@ static void ip_log_open(void) {
  * ═══════════════════════════════════════════════════════════════ */
 
 #define APP_NAME          "Showcase"
+#ifdef SHOWCASE_ROOTLESS
+#define APP_VERSION       "1.0 beta 3-1 (skywalk)"
+#else
 #define APP_VERSION       "1.0 beta 3"
+#endif
 #define APP_AUTHOR        "Amine Rostane"
 #define SOCK_PATH         "/tmp/ipadplay.sock"   /* IPC socket — kept for compat with carplay_services */
 #define BLUETOOTHD_PLIST  "/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
@@ -104,16 +108,35 @@ static void ip_log_open(void) {
 #ifdef SHOWCASE_ROOTLESS
 #define JB_PREFIX         "/var/jb"
 #define BLUETOOL_PLIST    "/System/Library/LaunchDaemons/com.apple.BlueTool.plist"
-#define BTSTACK_PLIST     JB_PATH("/Library/LaunchDaemons/ch.ringwald.BTstack.plist")
-#define BTSTACK_SOCKET    "/tmp/BTstack"
+#ifndef SHOWCASE_BTSTACK_PLIST
+#define SHOWCASE_BTSTACK_PLIST JB_PATH("/Library/LaunchDaemons/ch.ringwald.BTstack.plist")
+#endif
+#ifndef SHOWCASE_BTSTACK_SOCKET
+#define SHOWCASE_BTSTACK_SOCKET "/tmp/BTstack"
+#endif
 #else
 #define JB_PREFIX         ""
-#define BTSTACK_PLIST     "/Library/LaunchDaemons/ch.ringwald.BTstack.plist"
-#define BTSTACK_SOCKET    "/tmp/BTstack"
+#ifndef SHOWCASE_BTSTACK_PLIST
+#define SHOWCASE_BTSTACK_PLIST "/Library/LaunchDaemons/ch.ringwald.BTstack.plist"
+#endif
+#ifndef SHOWCASE_BTSTACK_SOCKET
+#define SHOWCASE_BTSTACK_SOCKET "/tmp/BTstack"
+#endif
 #endif
 #define JB_PATH(path)     JB_PREFIX path
-#define BTDAEMON_PATH     JB_PATH("/usr/bin/BTdaemon")
-#define BTSTACK_DYLIB_PATH JB_PATH("/usr/lib/libBTstack.dylib")
+#define BTSTACK_PLIST     SHOWCASE_BTSTACK_PLIST
+#define BTSTACK_SOCKET    SHOWCASE_BTSTACK_SOCKET
+#ifndef SHOWCASE_BTDAEMON_PATH
+#define SHOWCASE_BTDAEMON_PATH JB_PATH("/usr/bin/BTdaemon")
+#endif
+#define BTDAEMON_PATH     SHOWCASE_BTDAEMON_PATH
+#ifndef SHOWCASE_BTSTACK_DYLIB_PATH
+#define SHOWCASE_BTSTACK_DYLIB_PATH JB_PATH("/usr/lib/libBTstack.dylib")
+#endif
+#define BTSTACK_DYLIB_PATH SHOWCASE_BTSTACK_DYLIB_PATH
+#ifndef SHOWCASE_BTSTACK_LOG_PATH
+#define SHOWCASE_BTSTACK_LOG_PATH "/var/log/BTstack.log"
+#endif
 #ifdef SHOWCASE_ROOTLESS
 #define BT_HELPER_NAME    "CarDisplaySim"
 #define SVC_HELPER_NAME   "CarPlay Simulator"
@@ -543,6 +566,7 @@ typedef NS_ENUM(NSInteger, BluetoothRegistryProbeState) {
     BluetoothRegistryProbeUnavailable = -1,
     BluetoothRegistryProbeMissing = 0,
     BluetoothRegistryProbeLegacyUART = 1,
+    BluetoothRegistryProbeSkywalk = 2,
 };
 
 static BluetoothRegistryProbeState bluetooth_registry_probe(void) {
@@ -560,6 +584,26 @@ static BluetoothRegistryProbeState bluetooth_registry_probe(void) {
                 NSNotFound ||
             [tree rangeOfString:@"com.apple.uart.bluetooth"].location !=
                 NSNotFound;
+        BOOL convergedInterface =
+            [tree rangeOfString:@"AppleConvergedIPCRTIInterface"].location !=
+                NSNotFound ||
+            [tree rangeOfString:@"AppleConvergedIPCInterface"].location !=
+                NSNotFound;
+        BOOL skywalkTransport =
+            [tree rangeOfString:@"\"ACIPCInterfaceTransport\" = \"skywalk\""]
+                    .location != NSNotFound;
+        BOOL hciProtocol =
+            [tree rangeOfString:@"\"ACIPCInterfaceProtocol\" = \"hci\""]
+                    .location != NSNotFound;
+        BOOL aclProtocol =
+            [tree rangeOfString:@"\"ACIPCInterfaceProtocol\" = \"acl\""]
+                    .location != NSNotFound;
+        BOOL nexusUUID =
+            [tree rangeOfString:@"IOSkywalkNexusUUID"].location != NSNotFound;
+        if (convergedInterface && skywalkTransport && hciProtocol &&
+            aclProtocol && nexusUUID) {
+            return BluetoothRegistryProbeSkywalk;
+        }
         return uartService && bluetoothEndpoint
             ? BluetoothRegistryProbeLegacyUART
             : BluetoothRegistryProbeMissing;
@@ -610,12 +654,25 @@ static NSString *bounded_log_tail(NSString *path, NSUInteger maxBytes,
 }
 
 static NSString *bluetooth_failure_class(NSString *reason,
-                                         NSString *combinedLogs,
-                                         BluetoothRegistryProbeState registry) {
+                                          NSString *combinedLogs,
+                                          BluetoothRegistryProbeState registry) {
     NSString *lower = [[NSString stringWithFormat:@"%@\n%@",
                         reason ?: @"", combinedLogs ?: @""] lowercaseString];
+    NSString *reasonLower = [reason.lowercaseString copy] ?: @"";
+    if ([reasonLower containsString:@"btstack daemon is missing"])
+        return @"btstack-daemon-missing";
+    if ([reasonLower containsString:@"btstack library is missing"])
+        return @"btstack-library-missing";
+    if ([reasonLower containsString:@"launch daemon configuration is missing"])
+        return @"btstack-launch-configuration-missing";
     if (registry == BluetoothRegistryProbeMissing)
-        return @"legacy-uart-transport-not-present";
+        return @"supported-bluetooth-transport-not-present";
+    if ([lower containsString:@"skywalk is present"] &&
+        [lower containsString:@"userspace api is unavailable"])
+        return @"converged-skywalk-api-unavailable";
+    if ([lower containsString:@"skywalk:"] &&
+        [lower containsString:@"channel create failed"])
+        return @"converged-skywalk-channel-open-failed";
     if ([lower containsString:@"h4_open: ioctl failed"])
         return @"private-uart-endpoint-unavailable";
     if ([lower containsString:@"h4_open: socket failed"])
@@ -647,15 +704,17 @@ static NSString *bluetooth_diagnostic_report(
     NSString *retry = retryAttempted
         ? bounded_log_tail(@LOG_DIR "/carplay_bt-retry.log", 8192, 18)
         : @"";
-    NSString *daemon = bounded_log_tail(@"/var/log/BTstack.log", 8192, 18);
+    NSString *daemon = bounded_log_tail(@SHOWCASE_BTSTACK_LOG_PATH, 8192, 18);
     NSString *combined = [NSString stringWithFormat:@"%@\n%@\n%@",
                           initial ?: @"", retry ?: @"", daemon ?: @""];
     NSString *failureClass =
         bluetooth_failure_class(reason, combined, registry);
     NSString *registryText = registry == BluetoothRegistryProbeLegacyUART
         ? @"legacy-uart-present"
-        : (registry == BluetoothRegistryProbeMissing
-            ? @"legacy-uart-missing" : @"unavailable");
+        : (registry == BluetoothRegistryProbeSkywalk
+            ? @"converged-skywalk-present"
+            : (registry == BluetoothRegistryProbeMissing
+                ? @"supported-transport-missing" : @"unavailable"));
 #ifdef SHOWCASE_ROOTLESS
     NSString *layout = @"rootless";
 #else
@@ -2054,8 +2113,31 @@ static OSStatus carplay_aac_input_callback(
 
 @end
 
+/* The interface-orientation names describe the content rotation, not the
+ * physical device rotation. LandscapeLeft therefore places the top edge
+ * (and a notch or Dynamic Island) on the right side of the display. Long
+ * phone panels are used as the hardware signal so this remains independent
+ * of model identifier, OS version, and jailbreak layout. */
+static BOOL showcase_phone_has_landscape_cutout(void) {
+    if (UI_USER_INTERFACE_IDIOM() != UIUserInterfaceIdiomPhone) return NO;
+    CGSize pixels = [UIScreen mainScreen].nativeBounds.size;
+    CGFloat shortEdge = MIN(pixels.width, pixels.height);
+    CGFloat longEdge = MAX(pixels.width, pixels.height);
+    return shortEdge > 0.0 && (longEdge / shortEdge) > 2.0;
+}
+
+static UIInterfaceOrientationMask showcase_orientation_mask(void) {
+    return showcase_phone_has_landscape_cutout()
+        ? UIInterfaceOrientationMaskLandscapeLeft
+        : UIInterfaceOrientationMaskLandscape;
+}
+
+static UIInterfaceOrientation showcase_preferred_orientation(void) {
+    return UIInterfaceOrientationLandscapeLeft;
+}
+
 /* ═══════════════════════════════════════════════════════════════
- * RootViewController — landscape-only, both directions, touch routing
+ * RootViewController — landscape-only touch routing
  * ═══════════════════════════════════════════════════════════════ */
 
 @class AppDelegate;
@@ -2101,9 +2183,12 @@ static OSStatus carplay_aac_input_callback(
 
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;  /* both Left and Right */
+    return showcase_orientation_mask();
 }
 - (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    return showcase_preferred_orientation();
+}
 
 - (BOOL)mapTouch:(UITouch *)touch toX:(uint16_t *)outX y:(uint16_t *)outY {
     if (g_carplay_w <= 0 || g_carplay_h <= 0) return NO;
@@ -2251,6 +2336,13 @@ static OSStatus carplay_aac_input_callback(
 @end
 
 @implementation AppDelegate
+
+- (UIInterfaceOrientationMask)application:(UIApplication *)application
+        supportedInterfaceOrientationsForWindow:(UIWindow *)window {
+    (void)application;
+    (void)window;
+    return showcase_orientation_mask();
+}
 
 - (UIView *)rootContentView {
     return self.vc.contentView ?: self.vc.view;
@@ -2975,8 +3067,10 @@ static OSStatus carplay_aac_input_callback(
     ip_log("[BT-COMPAT] registry probe=%s",
            registry == BluetoothRegistryProbeLegacyUART
                ? "legacy-uart-present"
-               : (registry == BluetoothRegistryProbeMissing
-                   ? "legacy-uart-missing" : "unavailable"));
+               : (registry == BluetoothRegistryProbeSkywalk
+                   ? "converged-skywalk-present"
+                   : (registry == BluetoothRegistryProbeMissing
+                       ? "supported-transport-missing" : "unavailable")));
     if (registry == BluetoothRegistryProbeMissing) {
         [self failBluetoothWithReason:
             @"The Bluetooth transport required by Showcase is not present in IOKit."
@@ -3563,7 +3657,7 @@ static OSStatus carplay_aac_input_callback(
         @TCPDUMP_DIR,
         @"/var/mobile/Library/Showcase/diagnostics",
         @"/tmp/hci_dump.pklg",
-        @"/var/log/BTstack.log"
+        @SHOWCASE_BTSTACK_LOG_PATH
     ];
     for (NSString *path in paths) {
         [fm removeItemAtPath:path error:nil];
@@ -3898,7 +3992,7 @@ static OSStatus carplay_aac_input_callback(
 
     [self copyLogDirectoryToDiagnosticsDir:work];
     [self copyPath:@"/tmp/hci_dump.pklg" toDiagnosticsDir:work name:@"hci_dump.pklg"];
-    [self copyPath:@"/var/log/BTstack.log" toDiagnosticsDir:work name:@"BTstack.log"];
+    [self copyPath:@SHOWCASE_BTSTACK_LOG_PATH toDiagnosticsDir:work name:@"BTstack.log"];
     [self copyPath:@TCPDUMP_LOG toDiagnosticsDir:work name:@"tcpdump.log"];
     [self copyPath:[NSString stringWithUTF8String:BTSTACK_PREFS]
   toDiagnosticsDir:work name:@"ch.ringwald.btstack.plist"];
@@ -4580,7 +4674,10 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
 @implementation CarsViewController
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;
+    return showcase_orientation_mask();
+}
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    return showcase_preferred_orientation();
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 
@@ -4792,7 +4889,10 @@ static bool read_exact(int fd, uint8_t *buf, size_t len) {
 }
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations {
-    return UIInterfaceOrientationMaskLandscape;
+    return showcase_orientation_mask();
+}
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation {
+    return showcase_preferred_orientation();
 }
 - (BOOL)prefersStatusBarHidden { return YES; }
 

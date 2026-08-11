@@ -1,5 +1,23 @@
 # Showcase
 
+## Updates
+
+This repository contains the Showcase source. Install the packaged tweak from the Rostane source in Sileo.
+
+```text
+https://aminerostane.com/repo
+```
+
+- Routes navigation, call, radio, and media audio through the receiver.
+- Fits CarPlay to the receiver's native aspect ratio without model presets.
+- Improves frame pacing, transport-stall recovery, and touch response.
+- Restores paired sessions after reconnects and app lifecycle changes.
+- Adds a named Showcase vehicle app and removes the stray ETC indicator.
+- Bundles CarPlay cryptography and removes the OpenSSL package dependency.
+- Reports unsupported Bluetooth hardware instead of stalling during setup.
+- Adds Apple ConvergedIPC/Skywalk HCI and ACL support while retaining the legacy UART backend.
+- Keeps the display cutout away from CarPlay controls on modern iPhones.
+
 Showcase turns an older jailbroken Apple device into a software wireless CarPlay receiver. The iPhone pairs through Settings, joins the receiver's hotspot, sends the encrypted CarPlay video stream, and receives touch input from the receiver.
 
 Showcase beta 3 ships in rootful and rootless package layouts. Both use iOS 12 as the deployment minimum.

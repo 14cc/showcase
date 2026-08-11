@@ -1,6 +1,6 @@
 Package: com.rostane.showcase
 Name: Showcase (Rootless)
-Version: 1.0~beta3
+Version: 1.0~beta3-1
 Architecture: iphoneos-arm64
 Section: Utilities
 Maintainer: Amine Rostane <amine.rostane@outlook.com>
@@ -17,5 +17,5 @@ Description: Wireless CarPlay receiver for rootless jailbreaks.
  receiver. This package uses the rootless layout under /var/jb and supports
  iOS 12 or newer.
  .
- Beta 3 adds receiver audio, hardware-aware HD video, responsive touch,
- lifecycle recovery, a Showcase vehicle app, and BTstack compatibility checks.
+ Beta 3-1 adds Apple ConvergedIPC/Skywalk Bluetooth support and keeps the
+ display cutout away from CarPlay controls on modern iPhones.

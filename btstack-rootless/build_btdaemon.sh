@@ -16,7 +16,9 @@ SRC_C=(
   $ROOT/platform/daemon/src/btstack.c $ROOT/platform/daemon/src/daemon.c
   $ROOT/platform/daemon/src/daemon_cmds.c $ROOT/platform/daemon/src/socket_connection.c
   $ROOT/platform/posix/btstack_run_loop_posix.c $ROOT/platform/posix/btstack_tlv_posix.c
-  $ROOT/port/ios/src/hci_transport_h4_iphone.c $ROOT/port/ios/SpringBoardAccess/SpringBoardAccess.c
+  $ROOT/port/ios/src/hci_transport_h4_iphone.c
+  $ROOT/port/ios/src/hci_transport_skywalk_iphone.c
+  $ROOT/port/ios/SpringBoardAccess/SpringBoardAccess.c
 )
 SRC_M=(
   $ROOT/platform/corefoundation/btstack_device_name_db_corefoundation.m

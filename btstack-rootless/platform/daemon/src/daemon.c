@@ -111,6 +111,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <notify.h>
 #include "../port/ios/src/btstack_control_iphone.h"
+#include "../port/ios/src/hci_transport_skywalk_iphone.h"
 #include "../port/ios/src/platform_iphone.h"
 // support for "enforece wake device" in h4 - used by iOS power management
 extern void hci_transport_h4_iphone_set_enforce_wake_device(char *path);
@@ -2026,6 +2027,7 @@ int btstack_server_run(int tcp_flag){
 
     btstack_control_t * control = NULL;
     const btstack_uart_block_t * uart_block_implementation = NULL;
+    int iphone_skywalk_transport = 0;
     (void) uart_block_implementation;
     
 #ifdef HAVE_TRANSPORT_H4
@@ -2049,7 +2051,24 @@ int btstack_server_run(int tcp_flag){
 #endif
 
     config = &hci_transport_config_uart;
+#ifdef HAVE_PLATFORM_IPHONE_OS
+    iphone_skywalk_transport = hci_transport_skywalk_iphone_present();
+    if (iphone_skywalk_transport &&
+        !hci_transport_skywalk_iphone_available()) {
+        printf("BTstack transport error: Apple ConvergedIPC/Skywalk is "
+               "present, but the required userspace API is unavailable\n");
+        return -1;
+    }
+    if (iphone_skywalk_transport) {
+        transport = hci_transport_skywalk_iphone_instance();
+        printf("BTstack transport: Apple ConvergedIPC/Skywalk\n");
+    } else {
+        transport = hci_transport_h4_instance(uart_block_implementation);
+        printf("BTstack transport: legacy iOS UART\n");
+    }
+#else
     transport = hci_transport_h4_instance(uart_block_implementation);
+#endif
 #endif
 
 #ifdef HAVE_TRANSPORT_USB
@@ -2058,7 +2077,8 @@ int btstack_server_run(int tcp_flag){
 
 #ifdef HAVE_PLATFORM_IPHONE_OS
     control = &btstack_control_iphone;
-    if (btstack_control_iphone_power_management_supported()){
+    if (!iphone_skywalk_transport &&
+        btstack_control_iphone_power_management_supported()){
         hci_transport_h4_iphone_set_enforce_wake_device("/dev/btwake");
     }
     bluetooth_status_handler = platform_iphone_status_handler;

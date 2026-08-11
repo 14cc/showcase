@@ -11,6 +11,7 @@ The bundled daemon comes from the historical iOS BTstack port by Matthias Ringwa
 - `platform/daemon/src/daemon.c` registers the incoming RFCOMM cid immediately after `RFCOMM_ACCEPT_CONNECTION`.
 - BLE-only TLV setup calls in `daemon.c` sit behind `#ifdef ENABLE_BLE`, which lets the classic-only iOS daemon link.
 - `build_btdaemon.sh` builds the arm64 daemon against the Procursus SDK and signs it with the Showcase BTdaemon entitlement file.
+- `port/ios/src/hci_transport_skywalk_iphone.c` supports AppleConvergedIPC devices by opening their published HCI and ACL Skywalk channels. The daemon selects it from live IOKit properties and keeps the legacy UART transport as the fallback.
 
 ## Build On Device
 

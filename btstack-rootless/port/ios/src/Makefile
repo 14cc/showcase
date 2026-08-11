@@ -41,6 +41,7 @@ BTdaemon_FILES = \
 	$(BTSTACK_ROOT)/platform/daemon/src/daemon.c  		  \
 	btstack_control_iphone.m  \
 	hci_transport_h4_iphone.c \
+	hci_transport_skywalk_iphone.c \
 	platform_iphone.m         \
 	../SpringBoardAccess/SpringBoardAccess.c       \
 
