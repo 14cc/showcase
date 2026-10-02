@@ -13,5 +13,11 @@
     <!-- Open URLs (for prefs:root= deep link to Personal Hotspot) -->
     <key>com.apple.private.applesupport.allow-url-handling</key>
     <true/>
+    <!-- Pause other Wi-Fi networks while the radio hosts CarPlay -->
+    <key>com.apple.wifi.manager-access</key>
+    <true/>
+    <!-- Start and stop Personal Hotspot for the CarPlay session -->
+    <key>com.apple.MobileInternetSharing.allow</key>
+    <true/>
 </dict>
 </plist>

@@ -1,6 +1,6 @@
 Package: com.rostane.showcase
 Name: Showcase (Rootful)
-Version: 1.0~beta3
+Version: 1.0~beta3-2
 Architecture: iphoneos-arm
 Section: Utilities
 Maintainer: Amine Rostane <amine.rostane@outlook.com>

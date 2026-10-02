@@ -63,6 +63,8 @@ need_file "$REPO_ROOT/source/carplay_services.m"
 need_file "$REPO_ROOT/source/carplay_pair.c"
 need_file "$REPO_ROOT/source/carplay_pair.h"
 need_file "$REPO_ROOT/source/baa_broker.h"
+need_file "$REPO_ROOT/source/ShowcaseRadio.c"
+need_file "$REPO_ROOT/source/ShowcaseRadio.plist"
 need_file "$REPO_ROOT/source/vendor/monocypher/monocypher.c"
 need_file "$REPO_ROOT/source/vendor/monocypher/monocypher-ed25519.c"
 need_file "$REPO_ROOT/source/vendor/libtommath/tommath.c"
@@ -92,6 +94,7 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/carplay_pair.c" \
    "$REPO_ROOT/source/carplay_pair.h" \
    "$REPO_ROOT/source/baa_broker.h" \
+   "$REPO_ROOT/source/ShowcaseRadio.c" \
    "$REPO_ROOT/source/Info.plist" \
    "$REPO_ROOT/source/ent_app.xml" \
    "$REPO_ROOT/source/ent_bt.xml" \
@@ -132,9 +135,19 @@ clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     vendor/libtommath/tommath.c \
     -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
+
+clang -dynamiclib -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
+    -o ShowcaseRadio.dylib ShowcaseRadio.c \
+    -Wl,-undefined,dynamic_lookup
 "
 
 cp -R "$PAYLOAD"/. "$WORK/rootfs"/
+mkdir -p "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries"
+sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
+  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/ShowcaseRadio.dylib" \
+  "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib"
+cp "$REPO_ROOT/source/ShowcaseRadio.plist" \
+   "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.plist"
 for bin in Showcase carplay_bt carplay_services; do
   sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
     "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/$bin" \
@@ -182,6 +195,10 @@ chmod 0644 Applications/Showcase.app/Info.plist Applications/Showcase.app/Icon*.
 chmod 4755 Applications/Showcase.app/Showcase Applications/Showcase.app/carplay_bt Applications/Showcase.app/carplay_services
 chmod 0755 usr/bin/BTdaemon usr/lib/libBTstack.dylib
 chmod 0644 Library/LaunchDaemons/ch.ringwald.BTstack.plist
+chmod 0755 Library/MobileSubstrate Library/MobileSubstrate/DynamicLibraries
+chmod 0755 Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib
+chmod 0644 Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.plist
+ldid -S Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib
 chmod 0755 DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm
 chmod 0644 DEBIAN/control
 

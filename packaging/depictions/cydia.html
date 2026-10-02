@@ -20,7 +20,7 @@
   <ul>
     <li>iOS 12 or newer.</li>
     <li>Rootful package uses <code>iphoneos-arm</code>. Rootless package uses <code>iphoneos-arm64</code>.</li>
-    <li>Rootless beta 3-1 selects legacy UART or Apple ConvergedIPC/Skywalk from live hardware properties.</li>
+    <li>The rootless package selects legacy UART or Apple ConvergedIPC/Skywalk from live hardware properties.</li>
     <li>Requires Personal Hotspot support through an active SIM or carrier provisioning.</li>
   </ul>
 
@@ -28,7 +28,7 @@
   <p>
     Showcase takes over classic Bluetooth while active and restores Apple's
     <code>bluetoothd</code> when stopped. Diagnostics and packet dumps are off
-    by default. Enable them from the info button only when collecting a report.
+    by default. Enable them in Settings, under Troubleshooting, only when collecting a report.
   </p>
   <p>
     Beta 3 prepares the Apple authentication certificate before Personal
@@ -37,10 +37,24 @@
   </p>
   <p>
     Tap with three fingers during CarPlay to pause input and reveal the stop
-    and info controls. Tap with three fingers again to resume input.
+    and settings controls. Tap with three fingers again to resume input.
   </p>
 
   <h2>Changelog</h2>
+  <h3>1.0 beta 3-2</h3>
+  <ul>
+    <li>Starts Personal Hotspot by itself when you tap Start CarPlay. No trip to Settings.</li>
+    <li>On older devices, runs the CarPlay hotspot on 5 GHz instead of crowded 2.4 GHz, with automatic fallback.</li>
+    <li>Leaves other Wi-Fi networks during CarPlay so the radio stays on the hotspot.</li>
+    <li>Fixes Bluetooth using about a full CPU core after a session on rootful devices.</li>
+    <li>Adds a Settings screen behind the gear button with Cars, Hotspot, Sound, Display, Troubleshooting, and About.</li>
+    <li>Sound plays from your iPhone by default again. Turn on Play Sound on This iPad in Settings to route CarPlay audio to the receiver.</li>
+    <li>Shows each connection step while your iPhone connects.</li>
+    <li>Sizes the screen stream's TCP window like Apple's receiver, so older Wi-Fi chips stop discarding video bursts.</li>
+    <li>Sends touch reports at voice priority on the hotspot link.</li>
+    <li>Adds Dock on the Right, Prefer Smooth Video, and Start CarPlay Automatically.</li>
+  </ul>
+
   <h3>1.0 beta 3-1</h3>
   <ul>
     <li>Adds Apple ConvergedIPC/Skywalk HCI and ACL support.</li>

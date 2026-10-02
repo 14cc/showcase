@@ -22,7 +22,31 @@
 #include <stdlib.h>
 #include <time.h>
 #include <dispatch/dispatch.h>
+#include <notify.h>
 #include "baa_broker.h"
+
+/* Connection progress for the Showcase setup screen. The app reads the
+ * accumulated bit set from the notify state, so a late registration still
+ * sees every milestone reached so far. */
+#define SHOWCASE_BT_PROGRESS_NOTIFICATION "com.rostane.showcase.bt-progress"
+#define BT_PROGRESS_CONNECTED   0x01ULL  /* RFCOMM channel to the iPhone   */
+#define BT_PROGRESS_AUTHORIZED  0x02ULL  /* iAP2 authentication succeeded  */
+#define BT_PROGRESS_IDENTIFIED  0x04ULL  /* iAP2 identification accepted   */
+#define BT_PROGRESS_WIFI_SENT   0x08ULL  /* hotspot details handed over    */
+
+static void bt_progress(uint64_t bits) {
+    static int token = -1;
+    static uint64_t state = 0;
+    if (token < 0 &&
+        notify_register_check(SHOWCASE_BT_PROGRESS_NOTIFICATION, &token) !=
+            NOTIFY_STATUS_OK) {
+        token = -1;
+        return;
+    }
+    state = bits ? (state | bits) : 0;
+    notify_set_state(token, state);
+    notify_post(SHOWCASE_BT_PROGRESS_NOTIFICATION);
+}
 
 /* ══════════════════════════════════════════════════
  *  Configuration — populated from argv at startup.
@@ -532,6 +556,7 @@ static int send_accessory_wifi_config(const char *phase) {
     send_control_msg(0x5703, pb.buf, pb.off);
     pb_free(&pb);
     wifi_config_sent = 1;
+    bt_progress(BT_PROGRESS_WIFI_SENT);
     wifi_config_send_count++;
     return 1;
 }
@@ -836,6 +861,7 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
     case 0xAA05:
         mfi_auth_succeeded = 1;
         printf("[CP] *** AUTH SUCCEEDED! ***\n");
+        bt_progress(BT_PROGRESS_AUTHORIZED);
         maybe_start_handoff_watchdog();
         break;
 
@@ -846,6 +872,7 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
         break;
     case 0x1D02:
         printf("[CP] *** IdentificationAccepted! ***\n");
+        bt_progress(BT_PROGRESS_IDENTIFIED);
         send_bt_component_info();
         printf("[CP] Waiting for auth / WiFi request...\n");
         break;
@@ -1333,6 +1360,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
             active_cid=R16(pkt,12);rfcomm_mtu=R16(pkt,14);
             iap2_detected=0;link_established=0;detect_count=0;reset_wireless_handoff_state();
             printf("[CP] RFCOMM OPEN cid=0x%04x mtu=%d\n",active_cid,rfcomm_mtu);
+            bt_progress(BT_PROGRESS_CONNECTED);
             usleep(100000);
             send_detect();
             signal(SIGALRM,alarm_handler);
@@ -1355,6 +1383,7 @@ int main(int argc, char *argv[]) {
     unlink(BT_DOWN_PATH);
     unlink(BT_ID_PATH);
     signal(SIGUSR1, bluetooth_handoff_signal_handler);
+    bt_progress(0);
     parse_args(argc, argv);
     @autoreleasepool {
         printf("[CP] Showcase / carplay_bt\n");

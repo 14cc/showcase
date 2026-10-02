@@ -102,6 +102,9 @@ int showcase_service_log_printf(const char *format, ...) {
 #define STATUS_PAIR_SETUP_COMPLETE  0x02
 #define STATUS_PAIR_VERIFY_COMPLETE 0x03
 #define STATUS_STREAM_SETUP         0x04
+#define STATUS_PAIR_SETUP_STARTED   0x05   /* first pairing with this iPhone */
+#define STATUS_AUTH_COMPLETE        0x06   /* accessory certificate accepted */
+#define STATUS_SESSION_SETUP        0x07   /* control session negotiated     */
 static void app_send_status(uint8_t code);
 
 #define MSG_AUDIO_CONFIG 0x08
@@ -129,8 +132,15 @@ static char g_raop_name[64]     = DEVICE_ID_RAW "@" "RoadLink";
 static uint16_t g_display_width = 800;
 static uint16_t g_display_height = 480;
 static uint16_t g_display_fps = 60;
-static int g_screen_receive_buffer = 512 * 1024;
+static int g_screen_receive_buffer = 176 * 1024;
 static bool g_baa_broker_mode = false;
+/* false: leave CarPlay audio on the sender (its speaker or its own car
+ * Bluetooth), which is the Showcase default. true: claim MainAudio and play
+ * the negotiated buffered/low-latency streams on this receiver. */
+static bool g_receiver_audio = false;
+/* Places CarPlay's dock on the right edge, for right-hand-drive cars and for
+ * displays mounted to the driver's right. */
+static bool g_right_hand_drive = false;
 
 static void parse_args(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
@@ -155,8 +165,12 @@ static void parse_args(int argc, char *argv[]) {
                 g_display_fps = (uint16_t)value;
         } else if (!strcmp(argv[i], "--screen-rcvbuf") && i + 1 < argc) {
             long value = strtol(argv[++i], NULL, 10);
-            if (value >= 128 * 1024 && value <= 4 * 1024 * 1024)
+            if (value >= 64 * 1024 && value <= 4 * 1024 * 1024)
                 g_screen_receive_buffer = (int)value;
+        } else if (!strcmp(argv[i], "--right-hand-drive")) {
+            g_right_hand_drive = true;
+        } else if (!strcmp(argv[i], "--audio") && i + 1 < argc) {
+            g_receiver_audio = strcmp(argv[++i], "receiver") == 0;
         } else if (!strcmp(argv[i], "--baa-broker")) {
             g_baa_broker_mode = true;
         }
@@ -905,14 +919,19 @@ static void handle_info(int sock, const HTTPReq *r) {
         info[@"hardwareRevision"] = @"1.0";
         info[@"OSInfo"] = @"iPadOS 12.5.8";
         info[@"nightMode"] = @NO;
-        info[@"rightHandDrive"] = @NO;
+        info[@"rightHandDrive"] = @(g_right_hand_drive);
         info[@"extendedFeatures"] = @[@"vocoderInfo"];
         /*
          * Apple's receiver advertises this dictionary when buffered main
          * audio is enabled. The dictionary is intentionally empty: the
-         * presence of the key is the capability signal.
+         * presence of the key is the capability signal. Sender-audio mode
+         * omits it so the sender has no buffered media route to this device.
          */
-        info[@"mainBufferedInfo"] = @{};
+        if (g_receiver_audio)
+            info[@"mainBufferedInfo"] = @{};
+        printf("[AUDIO] output route: %s\n",
+               g_receiver_audio ? "receiver (MainAudio advertised)"
+                                : "sender (MainAudio left on the iPhone)");
         /*
          * ElectronicTollCollection is an installed-capability declaration,
          * not a generic inactive vehicle state. Advertising it with
@@ -996,6 +1015,12 @@ static void handle_info(int sock, const HTTPReq *r) {
          * UserInitiated priority (500), but MainAudio at NiceToHave priority
          * (100). Advertising MainAudio at 500 prevents the sender's ordinary
          * temporary controller/accessory transition that precedes type 100.
+         *
+         * Sender-audio mode restores the beta 2 advertisement exactly:
+         * MainAudio at UserInitiated priority (500) with the legacy format
+         * rows below. The sender never issued an audio SETUP for that
+         * description, so music, prompts, and calls stayed on the iPhone and
+         * its own Bluetooth route.
          */
         info[@"modes"] = @{
             @"resources": @[
@@ -1007,7 +1032,7 @@ static void handle_info(int sock, const HTTPReq *r) {
                 },
                 @{  @"resourceID": @(2),       /* MainAudio */
                     @"transferType": @(1),      /* Take */
-                    @"transferPriority": @(100), /* NiceToHave */
+                    @"transferPriority": @(g_receiver_audio ? 100 : 500),
                     @"takeConstraint": @(100),
                     @"borrowConstraint": @(100)
                 }
@@ -1047,6 +1072,27 @@ static void handle_info(int sock, const HTTPReq *r) {
         const uint64_t opusAll = opus16 | opus24 | opus48;
         const uint64_t aacLC44 = 0x00400000ULL;
         const uint64_t aacLC48 = 0x00800000ULL;
+        if (!g_receiver_audio) {
+            /* Beta 2 rows, kept byte-for-byte as the sender-audio contract. */
+            info[@"audioFormats"] = @[
+                @{
+                    @"type": @(100),
+                    @"audioInputFormats": @(0x01000000),
+                    @"audioOutputFormats": @(0x01000000)
+                },
+                @{
+                    @"type": @(96),
+                    @"audioInputFormats": @(0x04000000),
+                    @"audioOutputFormats": @(0x04000000)
+                }
+            ];
+            info[@"audioLatencies"] = @[
+                @{
+                    @"type": @(100), @"audioType": @"default",
+                    @"inputLatencyMicros": @0, @"outputLatencyMicros": @0
+                }
+            ];
+        } else {
         info[@"audioFormats"] = @[
             @{
                 @"audioType": @"default",
@@ -1118,6 +1164,7 @@ static void handle_info(int sock, const HTTPReq *r) {
                 @"outputLatencyMicros": @0
             }
         ];
+        }
 
         info[@"initialVolume"] = @(-20.0);
 
@@ -1226,6 +1273,8 @@ static void handle_pair_setup(int sock, const HTTPReq *r) {
                      NULL, NULL, 0, r->cseq);
         return;
     }
+
+    app_send_status(STATUS_PAIR_SETUP_STARTED);
 
     /* Handle the pair-setup request through our SRP state machine */
     size_t resp_len = 0;
@@ -1634,6 +1683,7 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
 
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream", resp, respLen, r->cseq);
+        app_send_status(STATUS_AUTH_COMPLETE);
 
         free(resp);
         free(opackBlob);
@@ -1821,6 +1871,52 @@ static void set_screen_socket_qos(int fd, const char *stage) {
                serviceError ? strerror(serviceError) : "none",
                trafficError ? strerror(trafficError) : "none");
     }
+}
+
+/*
+ * The event channel carries HID touch reports from this receiver to the
+ * sender. On the hotspot link they share the receiver's transmit queue with
+ * the screen stream's acknowledgements. Voice class lets a few dozen bytes of
+ * touch data bypass that queue; its WMM access category is not aggregated, so
+ * a report is not held while the radio builds a larger frame.
+ */
+#ifndef NET_SERVICE_TYPE_VO
+#define NET_SERVICE_TYPE_VO 4
+#endif
+#ifndef SO_TC_VO
+#define SO_TC_VO 800
+#endif
+
+static void set_event_socket_qos(int fd) {
+    if (fd < 0) return;
+    int serviceType = NET_SERVICE_TYPE_VO;
+    int serviceResult = setsockopt(fd, SOL_SOCKET, SO_NET_SERVICE_TYPE,
+                                   &serviceType, sizeof(serviceType));
+    int trafficClass = SO_TC_VO;
+    int trafficResult = setsockopt(fd, SOL_SOCKET, SO_TRAFFIC_CLASS,
+                                   &trafficClass, sizeof(trafficClass));
+    int diffServ = 0xC0; /* CS6 / WMM voice. */
+    int tosResult = -1;
+    struct sockaddr_storage local;
+    socklen_t localLength = sizeof(local);
+    memset(&local, 0, sizeof(local));
+    if (getsockname(fd, (struct sockaddr *)&local, &localLength) == 0) {
+        if (local.ss_family == AF_INET) {
+            tosResult = setsockopt(fd, IPPROTO_IP, IP_TOS,
+                                   &diffServ, sizeof(diffServ));
+        } else if (local.ss_family == AF_INET6) {
+            tosResult = setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS,
+                                   &diffServ, sizeof(diffServ));
+            const struct sockaddr_in6 *local6 =
+                (const struct sockaddr_in6 *)&local;
+            if (IN6_IS_ADDR_V4MAPPED(&local6->sin6_addr))
+                setsockopt(fd, IPPROTO_IP, IP_TOS, &diffServ, sizeof(diffServ));
+        }
+    }
+    printf("[EVENT] QoS voice: service=%s traffic=%s tos=%s\n",
+           serviceResult == 0 ? "OK" : "FAIL",
+           trafficResult == 0 ? "OK" : "FAIL",
+           tosResult == 0 ? "OK" : "FAIL");
 }
 
 static int bind_udp_port_ipv4(uint16_t *outPort) {
@@ -2427,6 +2523,7 @@ static void event_thread_func(void *ctx) {
         int yes = 1;
         setsockopt(client, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
         setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        set_event_socket_qos(client);
 
         /* Read loop — decrypt ChaCha20-Poly1305 framed messages */
         uint8_t buf[16384];
@@ -3796,6 +3893,14 @@ static void *screen_thread_func(void *arg) {
                requestedRcvBuf, rcvBuf);
     }
 
+    /*
+     * Leave Darwin's stretch ACKs alone. On HSIC Wi-Fi the chip shares one
+     * USB-class bus between transmit and receive; forcing an ACK every other
+     * segment raised the iPad4,2's transmit/receive frame ratio from 0.34 to
+     * 0.74 and its discarded-frame rate from 5% to 28%. Across three
+     * recorded sessions, windows with transmit below half the receive rate
+     * discarded 1-2% of frames and windows above it about 20%.
+     */
     printf("[SCREEN] Key valid=%d, connID=%llu\n", g_screen_key_valid, g_screen_conn_id);
     fflush(stdout);
 
@@ -4328,7 +4433,8 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
              * unknown sender features.
              */
             NSArray *requestedFeatures = reqDict[@"features"];
-            if ([requestedFeatures isKindOfClass:[NSArray class]] &&
+            if (g_receiver_audio &&
+                [requestedFeatures isKindOfClass:[NSArray class]] &&
                 [requestedFeatures containsObject:@"mainBuffered"]) {
                 respDict[@"enabledFeatures"] = @[@"mainBuffered"];
                 printf("[AUDIO] enabled session feature: mainBuffered\n");
@@ -4341,6 +4447,7 @@ static void handle_rtsp_setup(int sock, const HTTPReq *r) {
 
             printf("[AP] SETUP response: timingPort=%u eventPort=%u keepAlivePort=%u (dual-stack when available)\n",
                    g_timing_port, g_event_port, g_keepalive_port);
+            app_send_status(STATUS_SESSION_SETUP);
 
         } else {
             /* ── Phase 2: Stream setup ── */
