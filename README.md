@@ -8,19 +8,18 @@ This repository contains the Showcase source. Install the packaged tweak from th
 https://aminerostane.com/repo
 ```
 
-- Routes navigation, call, radio, and media audio through the receiver.
-- Fits CarPlay to the receiver's native aspect ratio without model presets.
-- Improves frame pacing, transport-stall recovery, and touch response.
-- Restores paired sessions after reconnects and app lifecycle changes.
-- Adds a named Showcase vehicle app and removes the stray ETC indicator.
-- Bundles CarPlay cryptography and removes the OpenSSL package dependency.
-- Reports unsupported Bluetooth hardware instead of stalling during setup.
-- Adds Apple ConvergedIPC/Skywalk HCI and ACL support while retaining the legacy UART backend.
-- Keeps the display cutout away from CarPlay controls on modern iPhones.
+Beta 4
+
+- Starts Personal Hotspot by itself, and asks you to turn it on in Settings when iOS refuses.
+- Lets you pick where sound plays by tapping the receiver or the CarPlay sender on the Sound page.
+- Shortens the connection steps and drops the small explanation text.
+- Returns to CarPlay when you tap anywhere on the dimmed controls screen.
+- Removes the 5 GHz hotspot option. The hotspot uses the band iOS chooses.
+- Reads every version string from the `VERSION` file.
 
 Showcase turns an older jailbroken Apple device into a software wireless CarPlay receiver. The iPhone pairs through Settings, joins the receiver's hotspot, sends the encrypted CarPlay video stream, and receives touch input from the receiver.
 
-Showcase beta 3 ships in rootful and rootless package layouts. Both use iOS 12 as the deployment minimum.
+Showcase ships in rootful and rootless package layouts. Both use iOS 12 as the deployment minimum.
 
 ## Install
 
@@ -40,8 +39,8 @@ https://aminerostane.com/articles/showcase
 
 | Item | Requirement |
 | --- | --- |
-| Receiver | Cellular iPhone or iPad with Personal Hotspot |
-| Tested rootful receiver | iPad Air 1 cellular, A1475, iPad4,2, iOS 12.5.8, checkra1n |
+| Receiver | Jailbroken iPhone or iPad with Personal Hotspot |
+| Tested rootful receiver | iPad Air 1, A1475, iPad4,2, iOS 12.5.8, checkra1n |
 | Tested rootless receiver | iPhone 7, iPhone9,3, iOS 15.8.4, Dopamine rootless |
 | Runtime packages | Rootful uses `uikittools`; rootless uses `uikittools` and `ldid` |
 
@@ -63,7 +62,7 @@ The package bundles `BTdaemon`, `libBTstack.dylib`, and the BTstack launch daemo
 - Stream telemetry for arrival rate, bitrate, frame gaps, presentation delay, and UI enqueue time.
 - Receiver audio for navigation, calls, radio, Apple Music, and third-party media apps.
 - A named vehicle app with the Showcase icon and a clean CarPlay sidebar.
-- Three-finger pause controls that dim the video and block CarPlay input while open.
+- Three-finger controls that dim the video and block CarPlay input until you tap to return.
 - Persistent controller pairing, CarPlay screen-resource handoff, and fresh-keyframe recovery after backgrounding.
 - A Bluetooth compatibility report when BTstack cannot control the receiver hardware.
 

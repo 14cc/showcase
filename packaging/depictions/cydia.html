@@ -14,14 +14,14 @@
 </head>
 <body>
   <h1>Showcase</h1>
-  <p>Turn a jailbroken cellular iPhone or iPad into a wireless CarPlay receiver.</p>
+  <p>Turn a jailbroken iPhone or iPad into a wireless CarPlay receiver.</p>
 
   <h2>Compatibility</h2>
   <ul>
     <li>iOS 12 or newer.</li>
     <li>Rootful package uses <code>iphoneos-arm</code>. Rootless package uses <code>iphoneos-arm64</code>.</li>
     <li>The rootless package selects legacy UART or Apple ConvergedIPC/Skywalk from live hardware properties.</li>
-    <li>Requires Personal Hotspot support through an active SIM or carrier provisioning.</li>
+    <li>Requires Personal Hotspot.</li>
   </ul>
 
   <h2>Notes</h2>
@@ -31,16 +31,25 @@
     by default. Enable them in Settings, under Troubleshooting, only when collecting a report.
   </p>
   <p>
-    Beta 3 prepares the Apple authentication certificate before Personal
+    Showcase prepares the Apple authentication certificate before Personal
     Hotspot starts. Open Showcase while the receiver still has internet
     access and wait for the Start button.
   </p>
   <p>
-    Tap with three fingers during CarPlay to pause input and reveal the stop
-    and settings controls. Tap with three fingers again to resume input.
+    Tap with three fingers during CarPlay to reveal the stop and settings
+    controls. Tap anywhere to return to CarPlay.
   </p>
 
   <h2>Changelog</h2>
+  <h3>1.0 Beta 4</h3>
+  <ul>
+    <li>Starts Personal Hotspot by itself. If iOS refuses, Showcase asks you to turn it on in Settings.</li>
+    <li>Removes the 5 GHz hotspot option. The hotspot uses the band iOS chooses.</li>
+    <li>Choose where sound plays by tapping this device or the CarPlay sender on the Sound page.</li>
+    <li>Cleaner screens with shorter connection steps and no small text.</li>
+    <li>Tap anywhere on the dimmed screen to return to CarPlay.</li>
+  </ul>
+
   <h3>1.0 beta 3-2</h3>
   <ul>
     <li>Starts Personal Hotspot by itself when you tap Start CarPlay. No trip to Settings.</li>

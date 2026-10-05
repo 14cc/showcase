@@ -24,6 +24,9 @@ SRC="$DIR/source"
 ICON="$DIR/icon/generated"
 SDK_REMOTE="/tmp/iPhoneOS10.3.sdk"
 BTSTACK_DYLIB="$DIR/packaging/payload/usr/lib/libBTstack.dylib"
+. "$DIR/packaging/scripts/version.sh"
+STAGED="$(mktemp -d)"
+fill_version "$SRC/Info.plist" > "$STAGED/Info.plist"
 
 ssh_cmd() { sshpass -p "$IPAD_PASS" ssh $SSHOPTS -p "$IPAD_PORT" "$IPAD_USER@$IPAD_HOST" "$@"; }
 scp_cmd() { sshpass -p "$IPAD_PASS" scp $SSHOPTS -P "$IPAD_PORT" "$@"; }
@@ -77,7 +80,7 @@ scp_cmd "$SRC/Showcase.m" \
         "$SRC/carplay_pair.c" \
         "$SRC/carplay_pair.h" \
         "$SRC/baa_broker.h" \
-        "$SRC/Info.plist" \
+        "$STAGED/Info.plist" \
         "$SRC/ent_app.xml" \
         "$SRC/ent_bt.xml" \
         "$SRC/ent_svc.xml" \
@@ -105,7 +108,7 @@ echo "[2/7] Compiling Showcase"
 # the SDK's .tbd stubs as 'out of sync' for libSystem (memset/strcmp etc).
 # Symbols resolve at runtime via dyld through libSystem.B.dylib (linked via Foundation).
 ssh_cmd "clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot $SDK_REMOTE \
-    -o /tmp/Showcase /tmp/Showcase.m \
+    -DAPP_VERSION='\"$DISPLAY_VERSION\"' -o /tmp/Showcase /tmp/Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup 2>&1" || { echo "FAIL"; exit 1; }

@@ -64,10 +64,7 @@ extern char **environ;
 #define AUTO_START_KEY          @"startCarPlayOnLaunch"
 #define DEDICATED_RADIO_KEY     @"leaveOtherWiFiDuringCarPlay"
 #define HELD_WIFI_NETWORK_KEY   @"heldWiFiNetworkSSID"
-#define FIVE_GHZ_HOTSPOT_KEY    @"useFiveGHzHotspot"
 #define HOTSPOT_OWNED_KEY       @"hotspotStartedByShowcase"
-#define SHOWCASE_RADIO_NOTIFICATION "com.rostane.showcase.softap-5ghz"
-#define SHOWCASE_RADIO_STATUS   "/tmp/showcase_radio_status"
 #define MIS_STATE_OFF           1022
 #define MIS_STATE_ON            1023
 #define SHOWCASE_BT_PROGRESS_NOTIFICATION "com.rostane.showcase.bt-progress"
@@ -116,7 +113,10 @@ static void ip_log_open(void) {
  * ═══════════════════════════════════════════════════════════════ */
 
 #define APP_NAME          "Showcase"
-#define APP_VERSION       "1.0 beta 3-2"
+/* Release builds pass APP_VERSION from the VERSION file. */
+#ifndef APP_VERSION
+#define APP_VERSION       "development"
+#endif
 #define APP_AUTHOR        "Amine Rostane"
 #define SOCK_PATH         "/tmp/ipadplay.sock"   /* IPC socket — kept for compat with carplay_services */
 #define BLUETOOTHD_PLIST  "/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
@@ -246,6 +246,61 @@ static const char *launchctl_path(void) {
  * 57% and 50%. Loading an already loaded job is harmless.
  */
 static int run_blocking(const char *path, char *const argv[]);
+#define BT_GUARD_DIR "/var/root/Library/ShowcaseBluetooth"
+#define BT_GUARD_PLIST BT_GUARD_DIR "/recovery.plist"
+#define BT_GUARD_READY BT_GUARD_DIR "/ready"
+
+static void stop_bluetooth_guard(void) {
+    const char *ctl = launchctl_path();
+    if (!ctl) return;
+    char *args[] = { (char *)"launchctl", (char *)"unload",
+                     (char *)BT_GUARD_PLIST, NULL };
+    run_blocking(ctl, args);
+    unlink(BT_GUARD_READY);
+}
+
+/* launchd owns this shell, so an app crash/force-quit cannot kill recovery.
+ * Arm it before removing Apple's services; disarm only after returning them.
+ * All shell inputs are positional arguments, never interpolated commands. */
+static BOOL start_bluetooth_guard(void) {
+    const char *ctl = launchctl_path();
+    if (!ctl) return NO;
+    mkdir(BT_GUARD_DIR, 0700);
+    struct stat st;
+    if (lstat(BT_GUARD_DIR, &st) || !S_ISDIR(st.st_mode) ||
+        st.st_uid != 0 || (st.st_mode & 077) != 0) return NO;
+    stop_bluetooth_guard();
+    NSString *script =
+        @"echo ready > \"$6\"; "
+         "while kill -0 \"$1\" 2>/dev/null; do sleep 1; done; "
+         "\"$7\" -TERM CarDisplaySim 2>/dev/null; "
+         "\"$2\" unload \"$3\"; "
+         "rm -f \"$8\"; "
+         "\"$2\" load \"$4\"; \"$2\" load \"$5\"; "
+         "rm -f \"$6\"";
+    NSDictionary *job = @{
+        @"Label": @"com.reng.showcase.bluetooth-recovery",
+        @"ProgramArguments": @[@JB_PATH("/bin/sh"), @"-c", script,
+            @"showcase-bluetooth-recovery", [NSString stringWithFormat:@"%d", getpid()],
+            @(ctl), @BTSTACK_PLIST, @BLUETOOL_PLIST, @BLUETOOTHD_PLIST,
+            @BT_GUARD_READY, @JB_PATH("/usr/bin/killall"), @BTSTACK_SOCKET],
+        @"RunAtLoad": @YES,
+        @"EnvironmentVariables": @{@"PATH": @JB_PATH("/usr/bin") ":" JB_PATH("/bin") ":/usr/bin:/bin"},
+        @"StandardOutPath": @LOG_DIR "/bluetooth-recovery.log",
+        @"StandardErrorPath": @LOG_DIR "/bluetooth-recovery.log"
+    };
+    if (![job writeToFile:@BT_GUARD_PLIST atomically:YES]) return NO;
+    char *args[] = { (char *)"launchctl", (char *)"load",
+                     (char *)BT_GUARD_PLIST, NULL };
+    if (run_blocking(ctl, args) != 0) return NO;
+    for (int i = 0; i < 50; i++) {
+        if (access(BT_GUARD_READY, F_OK) == 0) return YES;
+        usleep(100000);
+    }
+    ip_log("[BT] recovery guard did not start; keeping system Bluetooth loaded");
+    return NO;
+}
+
 static void restore_system_bluetooth(const char *reason) {
     const char *launchctl = launchctl_path();
     if (!launchctl) return;
@@ -255,8 +310,9 @@ static void restore_system_bluetooth(const char *reason) {
                                (char *)BLUETOOTHD_PLIST, NULL };
     int toolRc = run_blocking(launchctl, loadBlueTool);
     int daemonRc = run_blocking(launchctl, loadBluetoothd);
-    ip_log("[BT] system Bluetooth restored (%s): BlueTool=%d bluetoothd=%d",
+    ip_log("[BT] system Bluetooth load requested (%s): BlueTool=%d bluetoothd=%d",
            reason, toolRc, daemonRc);
+    stop_bluetooth_guard();
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1031,17 +1087,11 @@ static void showcase_release_other_wifi(const char *reason) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
- * Personal Hotspot control and 5 GHz channel selection
+ * Personal Hotspot control
  *
  * Showcase starts the hotspot itself instead of sending the user to Settings:
  * Mobile Internet Sharing state ON plus wifid's discovery flag is what the
- * Personal Hotspot screen does when it is open.
- *
- * On HSIC-era receivers the package's ShowcaseRadio library, loaded into
- * wifid, swaps the hotspot's 2.4 GHz channel candidates for 5 GHz ones while
- * Showcase asks for it. wifid only consults that list when it starts the
- * hotspot, so a hotspot that is already running is restarted. Measured on an
- * iPad4,2: the hotspot came up on channel 36, 802.11a/n.
+ * Personal Hotspot screen does when it is open. The band is iOS's choice.
  * ═══════════════════════════════════════════════════════════════ */
 
 static id showcase_mis_manager(void) {
@@ -1090,35 +1140,6 @@ static void showcase_set_wifi_power(BOOL on) {
         showcase_mobilewifi_symbol("WiFiManagerClientSetPower");
     void *manager = showcase_wifi_manager();
     if (setPower && manager) setPower(manager, on ? 1 : 0);
-}
-
-static void showcase_request_radio_band(BOOL fiveGHz) {
-    int token = 0;
-    if (notify_register_check(SHOWCASE_RADIO_NOTIFICATION, &token) !=
-        NOTIFY_STATUS_OK) return;
-    notify_set_state(token, fiveGHz ? 1 : 0);
-    notify_post(SHOWCASE_RADIO_NOTIFICATION);
-    notify_cancel(token);
-}
-
-/* The library reports "<wifid pid> <state>". A stale file from an earlier
- * wifid instance does not count. */
-static NSString *showcase_radio_status(void) {
-    NSString *text = [NSString stringWithContentsOfFile:@SHOWCASE_RADIO_STATUS
-                                               encoding:NSUTF8StringEncoding
-                                                  error:NULL];
-    NSArray<NSString *> *parts = [[text stringByTrimmingCharactersInSet:
-        [NSCharacterSet whitespaceAndNewlineCharacterSet]]
-        componentsSeparatedByString:@" "];
-    if (parts.count < 2) return nil;
-    pid_t pid = (pid_t)parts[0].intValue;
-    if (pid <= 0 || kill(pid, 0) != 0) return nil;
-    struct kinfo_proc info;
-    size_t length = sizeof(info);
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
-    if (sysctl(mib, 4, &info, &length, NULL, 0) != 0 || length == 0 ||
-        strcmp(info.kp_proc.p_comm, "wifid") != 0) return nil;
-    return parts[1];
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2727,8 +2748,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, strong) UIView   *setupOverlay;
 @property (nonatomic, strong) UILabel  *titleLabel;
 @property (nonatomic, strong) UILabel  *headlineLabel;
-@property (nonatomic, strong) UILabel  *subtitleLabel;
-@property (nonatomic, strong) UILabel  *carHintLabel;       /* "Appears on your iPhone as Miata" */
 @property (nonatomic, strong) UIButton *primaryButton;     /* Start CarPlay / Open Settings */
 @property (nonatomic, strong) UIButton *secondaryButton;   /* Cancel */
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
@@ -2742,7 +2761,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
 /* Hotspot automation */
 @property (nonatomic, assign) BOOL hotspotManual;          /* fell back to Settings */
-@property (nonatomic, assign) BOOL hotspotFiveGHz;         /* 5 GHz requested this attempt */
 @property (nonatomic, assign) NSInteger hotspotAttempt;
 @property (nonatomic, strong) NSTimer *hotspotWatchdog;
 @property (nonatomic, strong) NSTimer *discoveryTimer;
@@ -2751,7 +2769,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, strong) UIButton *closeButton;       /* top-right, only ACTIVE */
 @property (nonatomic, strong) UIButton *settingsButton;    /* top-left, revealed with close during Active */
 @property (nonatomic, strong) ControlsOverlayView *controlsOverlay;
-@property (nonatomic, strong) UILabel *controlsHintLabel;
 
 /* Three-finger tap is reserved for Showcase chrome and leaves pinch to CarPlay. */
 @property (nonatomic, strong) UITapGestureRecognizer *controlsGesture;
@@ -2845,12 +2862,12 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.tcpdumpPid = 0;
     self.tcpdumpMissingPromptShown = NO;
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
-        DEDICATED_RADIO_KEY: @YES,
-        FIVE_GHZ_HOTSPOT_KEY: @YES
+        DEDICATED_RADIO_KEY: @YES
     }];
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
     /* A session that ended without stopFlow may have left a network paused. */
     dispatch_async(self.bgQueue, ^{
+        stop_bluetooth_guard();
         showcase_release_other_wifi("launch recovery");
         /* A session that ended without stopFlow can leave BTstack holding the
          * controller and BlueTool unloaded. Release and hand it back. */
@@ -2862,7 +2879,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
             unlink(BTSTACK_SOCKET);
         }
         restore_system_bluetooth("launch recovery");
-        showcase_request_radio_band(NO);
     });
     self.cars = [[CarStore alloc] init];
 
@@ -3051,14 +3067,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.headlineLabel.minimumScaleFactor = 0.75;
     [self.setupOverlay addSubview:self.headlineLabel];
 
-    /* Subtitle */
-    self.subtitleLabel = [[UILabel alloc] init];
-    self.subtitleLabel.textAlignment = NSTextAlignmentCenter;
-    self.subtitleLabel.textColor = [UIColor colorWithWhite:1.0 alpha:0.55];
-    self.subtitleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
-    self.subtitleLabel.numberOfLines = 3;
-    [self.setupOverlay addSubview:self.subtitleLabel];
-
     /* Spinner, for the states that have no step list */
     self.spinner = [[UIActivityIndicatorView alloc]
         initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleWhiteLarge];
@@ -3088,16 +3096,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     [self.secondaryButton addTarget:self action:@selector(secondaryTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.setupOverlay addSubview:self.secondaryButton];
 
-    /* Quiet line under the button: how the iPhone will list this screen */
-    self.carHintLabel = [[UILabel alloc] init];
-    self.carHintLabel.textAlignment = NSTextAlignmentCenter;
-    self.carHintLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
-    self.carHintLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
-    self.carHintLabel.numberOfLines = 1;
-    self.carHintLabel.adjustsFontSizeToFitWidth = YES;
-    self.carHintLabel.minimumScaleFactor = 0.8;
-    [self.setupOverlay addSubview:self.carHintLabel];
-
     [self layoutSetupOverlay];
 }
 
@@ -3118,7 +3116,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
     self.titleLabel.font = [UIFont systemFontOfSize:(phone ? 44 : 64) weight:UIFontWeightUltraLight];
     self.headlineLabel.font = [UIFont systemFontOfSize:(phone ? 20 : 24) weight:UIFontWeightRegular];
-    self.subtitleLabel.font = [UIFont systemFontOfSize:(phone ? 14 : 16) weight:UIFontWeightRegular];
     self.primaryButton.titleLabel.font = [UIFont systemFontOfSize:(phone ? 16 : 18) weight:UIFontWeightSemibold];
     self.secondaryButton.titleLabel.font = [UIFont systemFontOfSize:(phone ? 14 : 15) weight:UIFontWeightRegular];
 
@@ -3132,11 +3129,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.stepsView.hidden = !connecting;
     self.stepsView.compact = shortScreen;
 
-    CGSize subtitleFit = [self.subtitleLabel sizeThatFits:CGSizeMake(colW, CGFLOAT_MAX)];
-    CGFloat subtitleH = self.subtitleLabel.text.length
-        ? MIN(ceil(subtitleFit.height), self.subtitleLabel.font.lineHeight * 3 + 2)
-        : 0;
-
     NSMutableArray<NSArray *> *items = [NSMutableArray array];
     void (^add)(UIView *, CGFloat, CGFloat, CGFloat) =
         ^(UIView *view, CGFloat width, CGFloat height, CGFloat gapAfter) {
@@ -3145,12 +3137,11 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         };
     add(self.titleLabel, W, phone ? 54 : 78, shortScreen ? 18 : (phone ? 26 : 48));
     add(self.spinner, 36, 36, 20);
-    add(self.headlineLabel, colW, phone ? 28 : 32, 8);
-    add(self.subtitleLabel, colW, subtitleH, connecting ? (shortScreen ? 18 : 28) : (phone ? 26 : 36));
+    add(self.headlineLabel, colW, phone ? 28 : 32,
+        connecting ? (shortScreen ? 18 : 28) : (phone ? 26 : 36));
     add(self.stepsView, colW, [self.stepsView preferredHeightForWidth:colW], shortScreen ? 14 : 28);
     add(self.primaryButton, btnW, btnH, phone ? 12 : 16);
     add(self.secondaryButton, btnW, phone ? 30 : 34, 10);
-    add(self.carHintLabel, colW, 18, 0);
 
     CGFloat total = 0;
     for (NSUInteger i = 0; i < items.count; i++) {
@@ -3183,16 +3174,9 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.controlsOverlay.hidden = YES;
     [content addSubview:self.controlsOverlay];
 
-    self.controlsHintLabel = [[UILabel alloc]
-        initWithFrame:CGRectMake(20, bs.height - 58, bs.width - 40, 30)];
-    self.controlsHintLabel.autoresizingMask =
-        UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleTopMargin;
-    self.controlsHintLabel.text = @"Three-finger tap to return to CarPlay";
-    self.controlsHintLabel.textAlignment = NSTextAlignmentCenter;
-    self.controlsHintLabel.textColor = [UIColor colorWithWhite:1 alpha:0.72];
-    self.controlsHintLabel.font =
-        [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    [self.controlsOverlay addSubview:self.controlsHintLabel];
+    /* Any tap on the dimmed screen returns to CarPlay. */
+    [self.controlsOverlay addGestureRecognizer:[[UITapGestureRecognizer alloc]
+        initWithTarget:self action:@selector(hideChrome)]];
 
     /* Close button, top right, only while CarPlay runs */
     self.closeButton = [UIButton buttonWithType:UIButtonTypeCustom];
@@ -3310,27 +3294,10 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
 - (void)updateConnectSteps {
     self.stepsView.pendingTitles = @[
-        @"Starting Bluetooth",
-        @"Starting CarPlay services",
-        @"Waiting for your iPhone",
-        @"Verifying Showcase with your iPhone",
-        @"Sharing hotspot details",
-        @"Waiting for iPhone to join Wi-Fi",
-        self.firstTimePairing ? @"Pairing for the first time" : @"Pairing securely",
-        @"Setting up CarPlay",
-        @"Starting video"
+        @"Bluetooth", @"CarPlay services", @"iPhone", @"Verification",
+        @"Hotspot details", @"Wi-Fi", @"Pairing", @"CarPlay", @"Video"
     ];
-    self.stepsView.doneTitles = @[
-        @"Bluetooth ready",
-        @"CarPlay services ready",
-        @"iPhone connected over Bluetooth",
-        @"Showcase verified",
-        @"Hotspot details shared",
-        @"iPhone joined Wi-Fi",
-        @"Paired securely",
-        @"CarPlay session ready",
-        @"Video started"
-    ];
+    self.stepsView.doneTitles = self.stepsView.pendingTitles;
     self.stepsView.completed = self.connectCompleted;
     [self.stepsView setNeedsLayout];
 }
@@ -3358,7 +3325,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.primaryButton.enabled = YES;
     self.primaryButton.alpha = 1.0;
     self.secondaryButton.hidden = YES;
-    self.carHintLabel.hidden = YES;
 
     Car *sel = self.cars.selected;
     NSString *carName = sel.name.length ? sel.name : @"your car";
@@ -3371,32 +3337,22 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
             if (!apReady) {
                 /* First run: Wi-Fi setup is the headline action. */
                 self.headlineLabel.text = @"Welcome";
-                self.subtitleLabel.text =
-                    @"Before connecting your iPhone, Showcase needs\nthe hotspot details of this device.";
                 [self.primaryButton setTitle:@"Set Up Wi-Fi" forState:UIControlStateNormal];
             } else {
                 if (self.baaLoading) {
-                    self.headlineLabel.text = @"Preparing secure authentication";
-                    self.subtitleLabel.text = @"Keep this device online for a moment.\nThis happens before Personal Hotspot starts.";
+                    self.headlineLabel.text = @"Preparing";
                     [self.primaryButton setTitle:@"Preparing…" forState:UIControlStateNormal];
                     self.primaryButton.enabled = NO;
                     self.primaryButton.alpha = 0.55;
                 } else if (!self.baaReady) {
-                    self.headlineLabel.text = @"Internet connection required";
-                    self.subtitleLabel.text = self.baaError.length
-                        ? @"Showcase could not prepare CarPlay authentication.\nConnect to the internet, then try again."
-                        : @"Showcase needs internet once before Personal Hotspot starts.";
+                    self.headlineLabel.text = @"Connect to the Internet";
                     [self.primaryButton setTitle:@"Try Again"
                                        forState:UIControlStateNormal];
                 } else {
                     self.headlineLabel.text = @"Wireless CarPlay";
-                    self.subtitleLabel.text = @"Connect your iPhone wirelessly\nto this device as a CarPlay screen.";
                     [self.primaryButton setTitle:@"Start CarPlay"
                                        forState:UIControlStateNormal];
                 }
-                self.carHintLabel.text = [NSString stringWithFormat:
-                    @"Appears on your iPhone as %@", carName];
-                self.carHintLabel.hidden = NO;
             }
             break;
         }
@@ -3404,14 +3360,10 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         case StateAwaitingAP:
             if (!self.hotspotManual) {
                 self.headlineLabel.text = @"Starting Personal Hotspot";
-                self.subtitleLabel.text = self.hotspotFiveGHz
-                    ? @"Using 5 GHz Wi-Fi for a steadier picture."
-                    : @"This takes a few seconds.";
                 self.spinner.hidden = NO;
                 [self.spinner startAnimating];
             } else {
-                self.headlineLabel.text = @"Turn on Personal Hotspot";
-                self.subtitleLabel.text = @"Settings › Personal Hotspot\nAllow Others to Join";
+                self.headlineLabel.text = @"Turn On Personal Hotspot";
                 [self.primaryButton setTitle:@"Open Settings" forState:UIControlStateNormal];
                 self.primaryButton.hidden = NO;
             }
@@ -3421,19 +3373,14 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
         case StatePreparingBT:
         case StatePreparingNet:
-            self.headlineLabel.text = @"Getting ready";
-            self.subtitleLabel.text = @"Showcase is preparing Bluetooth and Wi-Fi for CarPlay.";
+            self.headlineLabel.text = @"Getting Ready";
             [self updateConnectSteps];
             break;
 
         case StateAwaitingPhone:
             self.headlineLabel.text = self.connectCompleted >= ConnectStepPhoneBluetooth
-                ? @"Connecting to your iPhone"
-                : @"Connect from your iPhone";
-            self.subtitleLabel.text = self.connectCompleted >= ConnectStepPhoneBluetooth
-                ? @"Keep your iPhone nearby.\nThis usually takes a few seconds."
-                : [NSString stringWithFormat:
-                    @"On your iPhone, open Settings › General › CarPlay\nand choose %@.", carName];
+                ? @"Connecting"
+                : [NSString stringWithFormat:@"Choose %@ in CarPlay on your iPhone", carName];
             [self updateConnectSteps];
             [self.secondaryButton setTitle:@"Cancel" forState:UIControlStateNormal];
             self.secondaryButton.hidden = NO;
@@ -3455,7 +3402,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
         case StateStopping:
             self.headlineLabel.text = @"Stopping";
-            self.subtitleLabel.text = @"";
             self.spinner.hidden = NO; [self.spinner startAnimating];
             break;
     }
@@ -3635,6 +3581,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     if ([[NSUserDefaults standardUserDefaults] boolForKey:DEDICATED_RADIO_KEY]) {
         dispatch_async(self.bgQueue, ^{ showcase_hold_other_wifi(); });
     }
+    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:HOTSPOT_OWNED_KEY];
     self.hotspotManual = NO;
     self.hotspotAttempt = 0;
     [self.apPollTimer invalidate];
@@ -3645,14 +3592,13 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
 /* ─── Hotspot automation ───────────────────────────────────── */
 
-/* Attempt 0: 5 GHz when enabled. Attempt 1: the same after a Wi-Fi power
- * cycle, which clears a SoftAP interface wifid could not start. Attempt 2:
- * stock 2.4 GHz. After that the user turns the hotspot on in Settings. */
+/* Showcase turns on Personal Hotspot itself. Attempt 1 repeats after a
+ * Wi-Fi power cycle, which clears an access point wifid could not start.
+ * After that the user turns the hotspot on in Settings. */
 - (void)startHotspotAttempt {
     NSInteger attempt = self.hotspotAttempt;
-    BOOL wantFiveGHz = attempt < 2 &&
-        [[NSUserDefaults standardUserDefaults] boolForKey:FIVE_GHZ_HOTSPOT_KEY];
     dispatch_async(self.bgQueue, ^{
+        if (self.state != StateAwaitingAP) return;
         int state = showcase_hotspot_state();
         if (state < 0) {
             ip_log("[HOTSPOT] Mobile Internet Sharing unavailable; manual setup");
@@ -3664,27 +3610,24 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
             [[NSUserDefaults standardUserDefaults] setBool:(state != MIS_STATE_ON)
                                                     forKey:HOTSPOT_OWNED_KEY];
         }
-        if (state == MIS_STATE_ON) {
-            /* wifid picks the channel only when the hotspot starts. */
+        if (state == MIS_STATE_ON && !is_ap_up()) {
+            /* On but not advertising: start it fresh. */
             showcase_set_hotspot(NO);
-            for (int i = 0; i < 50 && is_ap_up(); i++) usleep(100000);
+            usleep(1000000);
         }
-        BOOL fiveGHz = wantFiveGHz && [self prepareRadioForFiveGHz];
-        showcase_request_radio_band(fiveGHz);
         if (attempt == 1) {
             showcase_set_wifi_power(NO);
             sleep(3);
             showcase_set_wifi_power(YES);
             sleep(6);
         }
+        if (self.state != StateAwaitingAP) return;
         showcase_set_hotspot(YES);
         usleep(800000);
         showcase_set_hotspot_discovery(YES);
-        ip_log("[HOTSPOT] attempt %ld: hotspot requested on %s",
-               (long)attempt, fiveGHz ? "5 GHz" : "2.4 GHz");
+        ip_log("[HOTSPOT] attempt %ld: hotspot requested", (long)attempt);
         dispatch_async(dispatch_get_main_queue(), ^{
             if (self.state != StateAwaitingAP) return;
-            self.hotspotFiveGHz = fiveGHz;
             [self renderState];
             [self.apPollTimer invalidate];
             self.apPollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
@@ -3698,39 +3641,13 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     });
 }
 
-/* Makes sure the running wifid has loaded ShowcaseRadio. A wifid started
- * before the package was installed is restarted once, with the hotspot off so
- * no orphaned hostapd survives. Runs on the background queue. */
-- (BOOL)prepareRadioForFiveGHz {
-    if (access(JB_PATH("/Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib"),
-               R_OK) != 0) {
-        ip_log("[HOTSPOT] ShowcaseRadio not installed; using 2.4 GHz");
-        return NO;
-    }
-    NSString *status = showcase_radio_status();
-    if (!status) {
-        const char *launchctl = launchctl_path();
-        if (!launchctl) return NO;
-        ip_log("[HOTSPOT] restarting wifid to load ShowcaseRadio");
-        char *kick[] = { (char *)"launchctl", (char *)"kickstart", (char *)"-k",
-                         (char *)"system/com.apple.wifid", NULL };
-        run_blocking(launchctl, kick);
-        for (int i = 0; i < 100 && !(status = showcase_radio_status()); i++)
-            usleep(100000);
-        signal_processes_named("hostapd", SIGKILL, 0);
-    }
-    ip_log("[HOTSPOT] ShowcaseRadio state=%s",
-           status ? status.UTF8String : "not loaded");
-    return status && ![status isEqualToString:@"unsupported"];
-}
-
 - (void)hotspotAttemptTimedOut {
     self.hotspotWatchdog = nil;
     if (self.state != StateAwaitingAP || self.hotspotManual) return;
     ip_log("[HOTSPOT] attempt %ld did not bring up %s", (long)self.hotspotAttempt,
            AP_INTERFACE);
     self.hotspotAttempt += 1;
-    if (self.hotspotAttempt <= 2) {
+    if (self.hotspotAttempt <= 1) {
         [self startHotspotAttempt];
     } else {
         [self fallBackToManualHotspot];
@@ -3740,7 +3657,6 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 - (void)fallBackToManualHotspot {
     if (self.state != StateAwaitingAP) return;
     self.hotspotManual = YES;
-    dispatch_async(self.bgQueue, ^{ showcase_request_radio_band(NO); });
     [self renderState];
     if (!self.apPollTimer) {
         self.apPollTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
@@ -3898,6 +3814,11 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         return;
     }
     ip_log("launchctl path: %s", launchctl);
+    if (!start_bluetooth_guard()) {
+        [self failBluetoothWithReason:@"Bluetooth crash recovery could not start."
+                             unsupported:NO];
+        return;
+    }
     char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
                            (char*)BLUETOOTHD_PLIST, NULL };
     int rc = run_blocking(launchctl, unloadArgv);
@@ -4162,9 +4083,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         } else {
             ip_log("WARNING: launchctl not found while restoring bluetoothd");
         }
-        showcase_request_radio_band(NO);
-        showcase_set_hotspot_discovery(NO);
         if ([[NSUserDefaults standardUserDefaults] boolForKey:HOTSPOT_OWNED_KEY]) {
+            showcase_set_hotspot_discovery(NO);
             showcase_set_hotspot(NO);
             [[NSUserDefaults standardUserDefaults] removeObjectForKey:HOTSPOT_OWNED_KEY];
             ip_log("[HOTSPOT] turned off the hotspot Showcase started");
@@ -4273,18 +4193,18 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     NSString *currentPass = self.cars.apPassword ?: @"";
 
     UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:@"Hotspot Credentials"
-                         message:[NSString stringWithFormat:@"Enter your %@'s name and the Personal Hotspot password.", showcase_device_noun()]
+        alertControllerWithTitle:@"Hotspot Details"
+                         message:nil
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = [NSString stringWithFormat:@"%@ name (Wi-Fi network)", showcase_device_noun()];
+        tf.placeholder = @"Name";
         tf.text = currentSSID;
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Hotspot password";
+        tf.placeholder = @"Password";
         tf.text = currentPass;
         tf.secureTextEntry = YES;
     }];
@@ -5431,10 +5351,12 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 }
 @end
 
-/* Two device outlines that show where CarPlay sound comes out. The active
- * device is bright and carries sound waves; the other one dims. */
+/* Where CarPlay sound comes out: this device on the left, the CarPlay
+ * sender on the right. The active one is bright and carries sound waves.
+ * Tapping a device selects it. */
 @interface SoundRouteView : UIView
 @property (nonatomic, assign) BOOL receiverActive;
+@property (nonatomic, copy) void (^selected)(BOOL receiver);
 - (void)setReceiverActive:(BOOL)active animated:(BOOL)animated;
 @end
 
@@ -5443,7 +5365,6 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 @property (nonatomic, strong) UIView *receiverGroup;
 @property (nonatomic, strong) UIView *senderWaves;
 @property (nonatomic, strong) UIView *receiverWaves;
-@property (nonatomic, strong) UILabel *caption;
 @end
 
 @implementation SoundRouteView
@@ -5479,22 +5400,28 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 }
 
 - (UIView *)groupWithOutline:(CGSize)size title:(NSString *)title
-                       waves:(UIView **)wavesOut {
-    UIView *group = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 120, 120)];
+                       waves:(UIView **)wavesOut action:(SEL)action {
+    UIView *group = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 140, 124)];
     UIView *outline = [self deviceOutlineWithSize:size];
-    outline.frame = CGRectMake((120 - size.width) / 2.0, 92 - size.height,
+    outline.frame = CGRectMake((140 - size.width) / 2.0, 92 - size.height,
                                size.width, size.height);
     [group addSubview:outline];
     UIView *waves = [self wavesView];
     waves.frame = CGRectMake(CGRectGetMaxX(outline.frame) + 6,
                              CGRectGetMidY(outline.frame) - 15, 26, 30);
     [group addSubview:waves];
-    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 98, 120, 20)];
+    UILabel *label = [[UILabel alloc] initWithFrame:CGRectMake(0, 100, 140, 22)];
     label.text = title;
     label.textAlignment = NSTextAlignmentCenter;
     label.textColor = [UIColor whiteColor];
-    label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    label.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    label.adjustsFontSizeToFitWidth = YES;
+    label.minimumScaleFactor = 0.8;
     [group addSubview:label];
+    [group addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:action]];
+    group.accessibilityLabel = title;
+    group.isAccessibilityElement = YES;
+    group.accessibilityTraits = UIAccessibilityTraitButton;
     *wavesOut = waves;
     return group;
 }
@@ -5503,37 +5430,32 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
     if ((self = [super initWithFrame:frame])) {
         BOOL pad = UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad;
         UIView *senderWaves = nil, *receiverWaves = nil;
-        self.senderGroup = [self groupWithOutline:CGSizeMake(34, 62)
-                                            title:@"Your iPhone"
-                                            waves:&senderWaves];
         self.receiverGroup = [self groupWithOutline:
             (pad ? CGSizeMake(68, 86) : CGSizeMake(34, 62))
             title:[NSString stringWithFormat:@"This %@", showcase_device_noun()]
-            waves:&receiverWaves];
+            waves:&receiverWaves action:@selector(receiverTapped)];
+        self.senderGroup = [self groupWithOutline:CGSizeMake(34, 62)
+                                            title:@"CarPlay sender"
+                                            waves:&senderWaves action:@selector(senderTapped)];
         self.senderWaves = senderWaves;
         self.receiverWaves = receiverWaves;
-        [self addSubview:self.senderGroup];
         [self addSubview:self.receiverGroup];
-
-        self.caption = [[UILabel alloc] init];
-        self.caption.textAlignment = NSTextAlignmentCenter;
-        self.caption.textColor = [UIColor whiteColor];
-        self.caption.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
-        [self addSubview:self.caption];
+        [self addSubview:self.senderGroup];
         [self applyState];
     }
     return self;
 }
 
+- (void)receiverTapped { if (self.selected && !self.receiverActive) self.selected(YES); }
+- (void)senderTapped { if (self.selected && self.receiverActive) self.selected(NO); }
+
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat W = self.bounds.size.width;
-    CGFloat spacing = MIN(70.0, W / 6.0);
-    CGFloat total = 120 * 2 + spacing;
-    CGFloat x = (W - total) / 2.0;
-    self.senderGroup.frame = CGRectMake(x, 0, 120, 120);
-    self.receiverGroup.frame = CGRectMake(x + 120 + spacing, 0, 120, 120);
-    self.caption.frame = CGRectMake(0, 132, W, 24);
+    CGFloat spacing = MIN(60.0, W / 8.0);
+    CGFloat x = (W - (140 * 2 + spacing)) / 2.0;
+    self.receiverGroup.frame = CGRectMake(x, 0, 140, 124);
+    self.senderGroup.frame = CGRectMake(x + 140 + spacing, 0, 140, 124);
 }
 
 - (void)applyState {
@@ -5542,9 +5464,8 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
     self.receiverGroup.alpha = r ? 1.0 : 0.3;
     self.senderWaves.hidden = r;
     self.receiverWaves.hidden = !r;
-    self.caption.text = r
-        ? [NSString stringWithFormat:@"Sound plays from this %@", showcase_device_noun()]
-        : @"Sound plays from your iPhone";
+    self.receiverGroup.accessibilityTraits = UIAccessibilityTraitButton | (r ? UIAccessibilityTraitSelected : 0);
+    self.senderGroup.accessibilityTraits = UIAccessibilityTraitButton | (r ? 0 : UIAccessibilityTraitSelected);
 }
 
 - (void)setReceiverActive:(BOOL)active animated:(BOOL)animated {
@@ -5583,15 +5504,6 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
     [self.container addSubview:l];
     self.y += h + gap;
     return l;
-}
-- (void)caption:(NSString *)text {
-    [self labelText:text font:[UIFont systemFontOfSize:13 weight:UIFontWeightRegular]
-              alpha:0.5 inset:16 gapAfter:8 color:nil];
-}
-- (UILabel *)footnote:(NSString *)text {
-    self.y -= 4;
-    return [self labelText:text font:[UIFont systemFontOfSize:13 weight:UIFontWeightRegular]
-                     alpha:0.45 inset:16 gapAfter:24 color:nil];
 }
 - (UILabel *)message:(NSString *)text color:(UIColor *)color {
     return [self labelText:text font:[UIFont systemFontOfSize:14 weight:UIFontWeightMedium]
@@ -6126,7 +6038,7 @@ static BOOL g_settings_hardware_loading = NO;
         [card addRow:[self navRow:@"Sound"
             value:receiverAudio
                 ? [NSString stringWithFormat:@"This %@", showcase_device_noun()]
-                : @"iPhone"
+                : @"CarPlay sender"
             width:w selected:[selected isEqualToString:@"sound"]
             action:^{ [weakSelf selectSection:@"sound"]; }] height:52];
         [card addRow:[self navRow:@"Display" value:@""
@@ -6152,15 +6064,12 @@ static BOOL g_settings_hardware_loading = NO;
                 }] height:52];
         }];
     }
-    [b gap:4];
-    [b footnote:@"During CarPlay, tap the screen with three fingers to show Settings and Stop."];
 }
 
 - (void)buildCars:(SettingsPageBuilder *)b {
     AppDelegate *app = self.appDelegate;
     CGFloat w = b.width;
     __weak SettingsViewController *weakSelf = self;
-    [b caption:@"Choose the car your iPhone connects to."];
     [b card:^(SettingsCard *card) {
         for (Car *car in app.cars.cars) {
             BOOL isSelected = car == app.cars.selected;
@@ -6194,10 +6103,6 @@ static BOOL g_settings_hardware_loading = NO;
             [weakSelf push:@"car"];
         }] height:52];
     }];
-    [b gap:4];
-    [b footnote:@"Your iPhone lists this screen under the chosen car's name in Settings › General › CarPlay."];
-    if (self.sessionRunning)
-        [b footnote:@"A different car takes effect the next time CarPlay starts."];
 }
 
 - (void)editCarTapped:(UIButton *)sender {
@@ -6210,16 +6115,14 @@ static BOOL g_settings_hardware_loading = NO;
     CGFloat w = b.width;
     __weak SettingsViewController *weakSelf = self;
     Car *car = self.editingCar;
-    [b caption:@"Name"];
     [b card:^(SettingsCard *card) {
-        self.carNameField = [self fieldRowInCard:card title:nil
-            text:self.draftCarName ?: car.name placeholder:@"Car name, for example Miata"
+        self.carNameField = [self fieldRowInCard:card title:@"Name"
+            text:self.draftCarName ?: car.name placeholder:@"Miata"
             secure:NO trailing:nil];
         self.carNameField.autocapitalizationType = UITextAutocapitalizationTypeWords;
         self.carNameField.returnKeyType = UIReturnKeyDone;
     }];
-    [b gap:4];
-    [b footnote:@"Your iPhone shows this name in Settings › General › CarPlay."];
+    [b gap:8];
     [self showPageMessage:b];
     [self placePill:[self pillButton:@"Save" action:@selector(saveCar) width:w] builder:b];
 
@@ -6288,10 +6191,6 @@ static BOOL g_settings_hardware_loading = NO;
 - (void)buildHotspot:(SettingsPageBuilder *)b {
     AppDelegate *app = self.appDelegate;
     CGFloat w = b.width;
-    NSString *noun = showcase_device_noun();
-    [b footnote:[NSString stringWithFormat:
-        @"Showcase gives these details to your iPhone so it can join this %@'s Personal Hotspot.", noun]];
-    [b caption:@"Personal Hotspot"];
     UIButton *show = [UIButton buttonWithType:UIButtonTypeSystem];
     show.frame = CGRectMake(0, 0, 52, 32);
     [show setTitle:self.passwordVisible ? @"Hide" : @"Show" forState:UIControlStateNormal];
@@ -6315,18 +6214,15 @@ static BOOL g_settings_hardware_loading = NO;
     [self showPageMessage:b];
     [self placePill:[self pillButton:@"Save" action:@selector(saveHotspot) width:w] builder:b];
 
-    [b caption:@"Changing the network name"];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self actionRow:@"Open Settings" color:nil width:w enabled:YES action:^{
+        [card addRow:[self actionRow:[NSString stringWithFormat:@"Rename This %@", showcase_device_noun()]
+            color:nil width:w enabled:YES action:^{
             NSURL *u = [NSURL URLWithString:@"App-Prefs:root=General&path=About"];
             UIApplication *a = [UIApplication sharedApplication];
             if (![a canOpenURL:u]) u = [NSURL URLWithString:@"prefs:root=General&path=About"];
             [a openURL:u options:@{} completionHandler:nil];
         }] height:52];
     }];
-    [b gap:4];
-    [b footnote:[NSString stringWithFormat:
-        @"The hotspot name is this %@'s name, set in Settings › General › About › Name. It needs at least 6 characters and can't contain iPad, iPhone, or iPod.", noun]];
 }
 
 - (void)togglePasswordVisible {
@@ -6353,32 +6249,27 @@ static BOOL g_settings_hardware_loading = NO;
     CGFloat w = b.width;
     __weak SettingsViewController *weakSelf = self;
     BOOL receiverAudio = [[NSUserDefaults standardUserDefaults] boolForKey:RECEIVER_AUDIO_KEY];
-    NSString *noun = showcase_device_noun();
+    void (^choose)(BOOL) = ^(BOOL on) {
+        [[NSUserDefaults standardUserDefaults] setBool:on forKey:RECEIVER_AUDIO_KEY];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        ip_log("settings: receiver audio %s", on ? "on" : "off");
+        [weakSelf.soundRoute setReceiverActive:on animated:YES];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [weakSelf render]; });
+    };
 
-    [b gap:12];
-    SoundRouteView *route = [[SoundRouteView alloc] initWithFrame:CGRectMake(0, 0, w, 160)];
+    [b gap:16];
+    SoundRouteView *route = [[SoundRouteView alloc] initWithFrame:CGRectMake(0, 0, w, 124)];
     [route setReceiverActive:receiverAudio animated:NO];
-    [b place:route height:160 gapAfter:24];
+    route.selected = choose;
+    [b place:route height:124 gapAfter:28];
     self.soundRoute = route;
 
     [b card:^(SettingsCard *card) {
-        UIView *row = [self switchRow:[NSString stringWithFormat:@"Play Sound on This %@", noun]
-            subtitle:nil on:receiverAudio width:w changed:^(BOOL on) {
-                [[NSUserDefaults standardUserDefaults] setBool:on forKey:RECEIVER_AUDIO_KEY];
-                [[NSUserDefaults standardUserDefaults] synchronize];
-                ip_log("settings: receiver audio %s", on ? "on" : "off");
-                [weakSelf.soundRoute setReceiverActive:on animated:YES];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{ [weakSelf render]; });
-            }];
+        UIView *row = [self switchRow:[NSString stringWithFormat:@"Play Sound on This %@", showcase_device_noun()]
+            subtitle:nil on:receiverAudio width:w changed:choose];
         [card addRow:row height:row.bounds.size.height];
     }];
-    [b gap:4];
-    [b footnote:receiverAudio
-        ? [NSString stringWithFormat:@"CarPlay sends music and navigation to this %@ over Wi-Fi. Use this when the %@'s speaker or its audio output feeds the car.", noun, noun]
-        : @"Music, navigation, and calls stay on your iPhone. If your iPhone is connected to the car's Bluetooth, sound plays through the car."];
-    if (self.sessionRunning)
-        [b footnote:@"This change applies the next time CarPlay starts."];
 }
 
 - (void)buildDisplay:(SettingsPageBuilder *)b {
@@ -6390,40 +6281,27 @@ static BOOL g_settings_hardware_loading = NO;
         ip_log("settings: %s=%d", key.UTF8String, on ? 1 : 0);
     };
     [b card:^(SettingsCard *card) {
-        UIView *dock = [self switchRow:@"Dock on the Right"
-            subtitle:@"Moves the CarPlay dock to the right edge of the screen, for right-hand-drive cars."
+        UIView *dock = [self switchRow:@"Dock on the Right" subtitle:nil
             on:[d boolForKey:RIGHT_HAND_DRIVE_KEY] width:w
             changed:^(BOOL on) { setter(RIGHT_HAND_DRIVE_KEY, on); }];
         [card addRow:dock height:dock.bounds.size.height];
-        UIView *smooth = [self switchRow:@"Prefer Smooth Video"
-            subtitle:@"Uses a lighter video stream so motion stays fluid on older devices and weak Wi-Fi. Text looks slightly softer."
+        UIView *smooth = [self switchRow:@"Prefer Smooth Video" subtitle:nil
             on:[d boolForKey:SMOOTH_VIDEO_KEY] width:w
             changed:^(BOOL on) { setter(SMOOTH_VIDEO_KEY, on); }];
         [card addRow:smooth height:smooth.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        UIView *band = [self switchRow:@"Use 5 GHz Hotspot"
-            subtitle:@"Runs the CarPlay hotspot on 5 GHz, away from crowded 2.4 GHz Wi-Fi and Bluetooth. Falls back to 2.4 GHz when this device can't."
-            on:[d boolForKey:FIVE_GHZ_HOTSPOT_KEY] width:w
-            changed:^(BOOL on) { setter(FIVE_GHZ_HOTSPOT_KEY, on); }];
-        [card addRow:band height:band.bounds.size.height];
-        UIView *radio = [self switchRow:@"Dedicate Wi-Fi to CarPlay"
-            subtitle:@"Leaves other Wi-Fi networks while CarPlay runs, so the radio stays on the hotspot. They rejoin when CarPlay stops."
+        UIView *radio = [self switchRow:@"Dedicate Wi-Fi to CarPlay" subtitle:nil
             on:[d boolForKey:DEDICATED_RADIO_KEY] width:w
             changed:^(BOOL on) { setter(DEDICATED_RADIO_KEY, on); }];
         [card addRow:radio height:radio.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        UIView *autoStart = [self switchRow:@"Start CarPlay Automatically"
-            subtitle:@"Starts CarPlay as soon as Showcase opens, so a screen mounted in the car needs no tap."
+        UIView *autoStart = [self switchRow:@"Start CarPlay Automatically" subtitle:nil
             on:[d boolForKey:AUTO_START_KEY] width:w
             changed:^(BOOL on) { setter(AUTO_START_KEY, on); }];
         [card addRow:autoStart height:autoStart.bounds.size.height];
     }];
-    if (self.sessionRunning) {
-        [b gap:4];
-        [b footnote:@"Changes apply the next time CarPlay starts."];
-    }
 }
 
 - (void)buildLogs:(SettingsPageBuilder *)b {
@@ -6436,8 +6314,7 @@ static BOOL g_settings_hardware_loading = NO;
     NSString *lastCapture = capturing ? nil : [app latestNetworkDumpPath];
 
     [b card:^(SettingsCard *card) {
-        UIView *row = [self switchRow:@"Detailed Logging"
-            subtitle:@"Records extra Bluetooth and network detail for bug reports."
+        UIView *row = [self switchRow:@"Detailed Logging" subtitle:nil
             on:logging width:w changed:^(BOOL on) {
                 [app applyDiagnosticsEnabled:on];
                 weakSelf.pageMessage = nil;
@@ -6445,19 +6322,13 @@ static BOOL g_settings_hardware_loading = NO;
             }];
         [card addRow:row height:row.bounds.size.height];
     }];
-    if (logging && self.sessionRunning) {
-        [b gap:4];
-        [b footnote:@"Helper logs fill in from the next time CarPlay starts."];
-    }
-
-    [b caption:@"Share"];
     [b card:^(SettingsCard *card) {
         [card addRow:[self actionRow:self.preparingLogs ? @"Preparing Logs…" : @"Send Logs"
             color:nil width:w enabled:!self.preparingLogs action:^{
                 [weakSelf sendLogs];
             }] height:52];
         if (!haveTcpdump) {
-            [card addRow:[self actionRow:@"Install tcpdump for Network Captures"
+            [card addRow:[self actionRow:@"Install tcpdump"
                 color:nil width:w enabled:YES action:^{
                     NSURL *u = [NSURL URLWithString:@"sileo://package/tcpdump"];
                     [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
@@ -6475,8 +6346,7 @@ static BOOL g_settings_hardware_loading = NO;
             [card addRow:[self actionRow:@"Start Network Capture"
                 color:nil width:w enabled:logging action:^{
                     [app startNetworkDumpCapture];
-                    [weakSelf setMessage:@"Capturing. Reproduce the problem, then come back here to stop and send the capture."
-                                   error:NO];
+                    [weakSelf setMessage:@"Capturing" error:NO];
                 }] height:52];
             if (lastCapture) {
                 [card addRow:[self actionRow:@"Send Last Network Capture"
@@ -6486,10 +6356,6 @@ static BOOL g_settings_hardware_loading = NO;
             }
         }
     }];
-    if (!logging && haveTcpdump && !capturing) {
-        [b gap:4];
-        [b footnote:@"Turn on Detailed Logging to record network captures. Leave captures off when judging performance."];
-    }
     [self showPageMessage:b];
 
     [b card:^(SettingsCard *card) {
@@ -6502,8 +6368,7 @@ static BOOL g_settings_hardware_loading = NO;
                 }
                 weakSelf.confirmingDestructive = NO;
                 [app clearLogsAndDumps];
-                [weakSelf setMessage:@"Logs, diagnostics archives, and captures were removed."
-                               error:NO];
+                [weakSelf setMessage:@"Cleared" error:NO];
             }] height:52];
     }];
 }
@@ -6519,8 +6384,7 @@ static BOOL g_settings_hardware_loading = NO;
         dispatch_async(dispatch_get_main_queue(), ^{
             weakSelf.preparingLogs = NO;
             if (!archive) {
-                [weakSelf setMessage:@"Showcase could not create the log archive. tar may be missing."
-                               error:YES];
+                [weakSelf setMessage:@"Could not create the log archive" error:YES];
                 return;
             }
             [weakSelf render];
@@ -6544,11 +6408,7 @@ static BOOL g_settings_hardware_loading = NO;
             : (profile.wlanAttachment == CarPlayWLANAttachmentPCIe ? @"PCIe" : @"Unknown");
         NSString *video = [NSString stringWithFormat:@"%u × %u at %u fps",
             profile.width, profile.height, profile.framesPerSecond];
-        NSString *radio = showcase_radio_status();
-        NSString *band = !radio ? @"Not loaded"
-            : ([radio isEqualToString:@"unsupported"] ? @"Not supported" : @"Supported");
-        NSDictionary *info = @{ @"bluetooth": bluetooth, @"wifi": wifi,
-                                @"video": video, @"band": band };
+        NSDictionary *info = @{ @"bluetooth": bluetooth, @"wifi": wifi, @"video": video };
         dispatch_async(dispatch_get_main_queue(), ^{
             g_settings_hardware_info = info;
             g_settings_hardware_loading = NO;
@@ -6567,7 +6427,7 @@ static BOOL g_settings_hardware_loading = NO;
     mark.font = [UIFont systemFontOfSize:44 weight:UIFontWeightUltraLight];
     [b place:mark height:54 gapAfter:2];
     UILabel *by = [[UILabel alloc] init];
-    by.text = [NSString stringWithFormat:@"Version %s, by %s", APP_VERSION, APP_AUTHOR];
+    by.text = [NSString stringWithFormat:@"by %s\u2003\u2003%s", APP_AUTHOR, APP_VERSION];
     by.textAlignment = NSTextAlignmentCenter;
     by.textColor = [UIColor colorWithWhite:1 alpha:0.5];
     by.font = [UIFont systemFontOfSize:14];
@@ -6581,18 +6441,14 @@ static BOOL g_settings_hardware_loading = NO;
 #else
     NSString *package = @"Rootful";
 #endif
-    [b caption:@"This device"];
     [b card:^(SettingsCard *card) {
         [card addRow:[self valueRow:@"Model" value:hardware_machine_identifier() width:w] height:48];
         [card addRow:[self valueRow:@"iOS" value:[UIDevice currentDevice].systemVersion width:w] height:48];
         [card addRow:[self valueRow:@"Package" value:package width:w] height:48];
         [card addRow:[self valueRow:@"Bluetooth" value:hw[@"bluetooth"] ?: checking width:w] height:48];
         [card addRow:[self valueRow:@"Wi-Fi Bus" value:hw[@"wifi"] ?: checking width:w] height:48];
-        [card addRow:[self valueRow:@"5 GHz Hotspot" value:hw[@"band"] ?: checking width:w] height:48];
         [card addRow:[self valueRow:@"CarPlay Video" value:hw[@"video"] ?: checking width:w] height:48];
     }];
-    [b gap:4];
-    [b footnote:@"Include these details when you report a problem."];
 }
 
 /* ─── keyboard ─── */
@@ -6645,14 +6501,9 @@ static BOOL g_settings_hardware_loading = NO;
 /* ═══════════════════════════════════════════════════════════════
  * WifiSetupViewController — sleek two-step setup modal
  *
- * Step 1: Rename your iPad. Body explains why, shows a tappable
- *         example name that copies to the clipboard, plus a button
- *         that deep-links to Settings › General › About.
- *
- * Step 2: Enter hotspot details. Tap opens a focused alert prompt.
- *
- * Layout: single centered column, plenty of breathing room. Designed
- * to feel like a focused Apple onboarding screen.
+ * Step 1: rename the device (the hotspot carries its name), with a name
+ *         to copy and a link to Settings › General › About.
+ * Step 2: enter the hotspot details.
  * ═══════════════════════════════════════════════════════════════ */
 
 @interface WifiSetupViewController ()
@@ -6731,104 +6582,34 @@ static BOOL g_settings_hardware_loading = NO;
         root = scroll;
     }
 
-    /* ── Header ── */
-    UILabel *eyebrow = [[UILabel alloc] init];
-    eyebrow.text = @"Showcase";
-    eyebrow.textAlignment = NSTextAlignmentCenter;
-    eyebrow.textColor = [UIColor colorWithWhite:1 alpha:0.35];
-    eyebrow.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
-    eyebrow.frame = CGRectMake(0, phone ? 20 : 56, W, 16);
-    eyebrow.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    /* letterspacing simulated via attributed string */
-    eyebrow.attributedText = [[NSAttributedString alloc]
-        initWithString:@"Showcase"
-            attributes:@{ NSKernAttributeName: @(0.4),
-                          NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.35],
-                          NSFontAttributeName: [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold] }];
-    [root addSubview:eyebrow];
-
     UILabel *title = [[UILabel alloc] init];
     title.text = @"Wi-Fi Setup";
     title.textAlignment = NSTextAlignmentCenter;
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont systemFontOfSize:(phone ? 34 : 44) weight:UIFontWeightUltraLight];
-    title.frame = CGRectMake(0, phone ? 40 : 80, W, phone ? 44 : 56);
+    title.frame = CGRectMake(0, phone ? 28 : 72, W, phone ? 44 : 56);
     title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
     [root addSubview:title];
 
-    /* ── Single centered column ── */
     CGFloat colW = phone ? MIN(560, W - 56) : MIN(620, W - 120);
     CGFloat colX = (W - colW) / 2.0;
-    CGFloat y = phone ? 100 : 168;
+    CGFloat y = phone ? 104 : 168;
 
-    /* ─────── STEP 1 ─────── */
-    [root addSubview:[self stepEyebrowAt:CGRectMake(colX, y, colW, 18) text:@"Step 1"]];
-    y += 22;
-
-    UILabel *step1H = [self headlineLabel:[NSString stringWithFormat:@"Rename your %@", showcase_device_noun()]
-                                     rect:CGRectMake(colX, y, colW, 30)];
-    [root addSubview:step1H];
-    y += 38;
-
-    NSString *step1Body = [NSString stringWithFormat:@"iOS uses your %@'s name as the Personal Hotspot network. CarPlay needs this name to be at least 6 characters and to not contain words like iPad, iPhone, or iPod. You can change it in the Settings app, under General › About › Name.", showcase_device_noun()];
-    CGFloat body1H = [self heightForText:step1Body width:colW
-                                    font:[UIFont systemFontOfSize:15 weight:UIFontWeightRegular]];
-    UILabel *body1 = [self bodyLabel:step1Body
-                                rect:CGRectMake(colX, y, colW, body1H)];
-    [root addSubview:body1];
-    y += body1H + 22;
-
-    /* Tappable example name pill */
-    UILabel *exampleEyebrow = [[UILabel alloc] init];
-    exampleEyebrow.attributedText = [[NSAttributedString alloc]
-        initWithString:@"Suggested name"
-            attributes:@{ NSKernAttributeName: @(0.2),
-                          NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.4],
-                          NSFontAttributeName: [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold] }];
-    exampleEyebrow.frame = CGRectMake(colX, y, colW, 18);
-    [root addSubview:exampleEyebrow];
-    y += 20;
-
-    UIView *pill = [self buildCopyPillWithText:@"Carplay-Receiver"
-                                          rect:CGRectMake(colX, y, colW, 56)];
-    [root addSubview:pill];
+    /* Step 1: the hotspot is named after the device. */
+    [root addSubview:[self headlineLabel:[NSString stringWithFormat:@"1.  Rename This %@", showcase_device_noun()]
+                                    rect:CGRectMake(colX, y, colW, 30)]];
+    y += 46;
+    [root addSubview:[self buildCopyPillWithText:@"Carplay-Receiver" rect:CGRectMake(colX, y, colW, 56)]];
     y += 72;
+    [root addSubview:[self primaryButton:@"Open Settings" rect:CGRectMake(colX, y, colW, 50)
+                                  action:@selector(openSettingsTapped)]];
+    y += 82;
 
-    /* Open Settings button */
-    UIButton *openBtn = [self primaryButton:@"Open Settings"
-                                        rect:CGRectMake(colX, y, colW, 50)
-                                      action:@selector(openSettingsTapped)];
-    [root addSubview:openBtn];
-    y += 70;
-
-    /* Divider */
-    UIView *div = [[UIView alloc] init];
-    div.frame = CGRectMake(colX, y, colW, 1);
-    div.backgroundColor = [UIColor colorWithWhite:1 alpha:0.10];
-    [root addSubview:div];
-    y += 32;
-
-    /* ─────── STEP 2 ─────── */
-    [root addSubview:[self stepEyebrowAt:CGRectMake(colX, y, colW, 18) text:@"Step 2"]];
-    y += 22;
-
-    UILabel *step2H = [self headlineLabel:@"Set your credentials"
-                                     rect:CGRectMake(colX, y, colW, 30)];
-    [root addSubview:step2H];
-    y += 38;
-
-    NSString *step2Body = [NSString stringWithFormat:@"After renaming your %@ and turning on Personal Hotspot, enter the hotspot name and password here. Showcase saves them and reuses them for every car.", showcase_device_noun()];
-    CGFloat body2H = [self heightForText:step2Body width:colW
-                                    font:[UIFont systemFontOfSize:15 weight:UIFontWeightRegular]];
-    UILabel *body2 = [self bodyLabel:step2Body
-                                rect:CGRectMake(colX, y, colW, body2H)];
-    [root addSubview:body2];
-    y += body2H + 22;
-
-    UIButton *credsBtn = [self primaryButton:@"Set Credentials"
-                                        rect:CGRectMake(colX, y, colW, 50)
-                                      action:@selector(credsTapped)];
-    [root addSubview:credsBtn];
+    /* Step 2 */
+    [root addSubview:[self headlineLabel:@"2.  Enter Hotspot Details" rect:CGRectMake(colX, y, colW, 30)]];
+    y += 46;
+    [root addSubview:[self primaryButton:@"Enter Details" rect:CGRectMake(colX, y, colW, 50)
+                                  action:@selector(credsTapped)]];
 
     if (scroll) {
         scroll.contentSize = CGSizeMake(W, y + 74);
@@ -6837,40 +6618,12 @@ static BOOL g_settings_hardware_loading = NO;
 
 /* ─── helpers ─── */
 
-- (UILabel *)stepEyebrowAt:(CGRect)rect text:(NSString *)text {
-    UILabel *l = [[UILabel alloc] initWithFrame:rect];
-    l.attributedText = [[NSAttributedString alloc]
-        initWithString:text
-            attributes:@{ NSKernAttributeName: @(0.2),
-                          NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.5],
-                          NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold] }];
-    return l;
-}
-
 - (UILabel *)headlineLabel:(NSString *)text rect:(CGRect)rect {
     UILabel *l = [[UILabel alloc] initWithFrame:rect];
     l.text = text;
     l.textColor = [UIColor whiteColor];
     l.font = [UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];
     return l;
-}
-
-- (UILabel *)bodyLabel:(NSString *)text rect:(CGRect)rect {
-    UILabel *l = [[UILabel alloc] initWithFrame:rect];
-    l.text = text;
-    l.textColor = [UIColor colorWithWhite:1 alpha:0.65];
-    l.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
-    l.numberOfLines = 0;
-    return l;
-}
-
-- (CGFloat)heightForText:(NSString *)text width:(CGFloat)width font:(UIFont *)font {
-    CGSize bound = CGSizeMake(width, CGFLOAT_MAX);
-    CGRect r = [text boundingRectWithSize:bound
-                                  options:NSStringDrawingUsesLineFragmentOrigin
-                               attributes:@{NSFontAttributeName: font}
-                                  context:nil];
-    return ceilf(r.size.height);
 }
 
 - (UIButton *)primaryButton:(NSString *)title rect:(CGRect)rect action:(SEL)sel {
@@ -6903,9 +6656,9 @@ static BOOL g_settings_hardware_loading = NO;
     [container addSubview:txt];
 
     UILabel *hint = [[UILabel alloc] init];
-    hint.text = @"Tap to copy";
-    hint.textColor = [UIColor colorWithWhite:1 alpha:0.45];
-    hint.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
+    hint.text = @"Copy";
+    hint.textColor = [UIColor whiteColor];
+    hint.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     hint.textAlignment = NSTextAlignmentRight;
     hint.frame = CGRectMake(rect.size.width - 110, 0, 90, rect.size.height);
     [container addSubview:hint];
@@ -6921,8 +6674,7 @@ static BOOL g_settings_hardware_loading = NO;
 
 - (void)copyExampleTapped:(UITapGestureRecognizer *)gr {
     [UIPasteboard generalPasteboard].string = @"Carplay-Receiver";
-    self.pillHintLabel.text = @"Copied ✓";
-    self.pillHintLabel.textColor = [UIColor whiteColor];
+    self.pillHintLabel.text = @"Copied";
     UIView *pill = self.pillView;
     [UIView animateWithDuration:0.12 animations:^{
         pill.transform = CGAffineTransformMakeScale(1.02, 1.02);
@@ -6934,9 +6686,8 @@ static BOOL g_settings_hardware_loading = NO;
     }];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if ([self.pillHintLabel.text isEqualToString:@"Copied ✓"]) {
-            self.pillHintLabel.text = @"Tap to copy";
-            self.pillHintLabel.textColor = [UIColor colorWithWhite:1 alpha:0.45];
+        if ([self.pillHintLabel.text isEqualToString:@"Copied"]) {
+            self.pillHintLabel.text = @"Copy";
             [UIView animateWithDuration:0.25 animations:^{
                 pill.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
             }];

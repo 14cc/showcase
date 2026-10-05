@@ -5407,12 +5407,14 @@ static int try_connect(const char *host, uint16_t port, uint32_t ifIndex,
         if (verbose)
             printf("[CTRL] getaddrinfo(%s:%s) failed: %s\n",
                    clean, portStr, gai_strerror(gai));
+        if (gai != EAI_SYSTEM) errno = EHOSTUNREACH;
         return -1;
     }
 
+    int lastError = EHOSTUNREACH;
     for (const struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s < 0) continue;
+        if (s < 0) { lastError = errno; continue; }
 
         char addrStr[NI_MAXHOST], portS[NI_MAXSERV];
         getnameinfo(ai->ai_addr, ai->ai_addrlen,
@@ -5435,15 +5437,17 @@ static int try_connect(const char *host, uint16_t port, uint32_t ifIndex,
             if (sel > 0) {
                 int serr = 0;
                 socklen_t slen = sizeof(serr);
-                getsockopt(s, SOL_SOCKET, SO_ERROR, &serr, &slen);
+                if (getsockopt(s, SOL_SOCKET, SO_ERROR, &serr, &slen) < 0)
+                    serr = errno;
                 if (serr == 0) ret = 0;
                 else { errno = serr; ret = -1; }
             } else {
-                errno = ETIMEDOUT;
+                if (sel == 0) errno = ETIMEDOUT;
                 ret = -1;
             }
         }
 
+        int connectError = ret < 0 ? errno : 0;
         /* Restore blocking mode */
         fcntl(s, F_SETFL, flags);
 
@@ -5453,10 +5457,12 @@ static int try_connect(const char *host, uint16_t port, uint32_t ifIndex,
             return s;
         }
         if (verbose)
-            printf("[CTRL] Failed: %s\n", strerror(errno));
+            printf("[CTRL] Failed: %s\n", strerror(connectError));
+        lastError = connectError;
         close(s);
     }
     freeaddrinfo(res);
+    errno = lastError; /* cleanup must not hide refusal of a stale port */
     return -1;
 }
 
@@ -5639,21 +5645,26 @@ static void ctrl_connect_thread(void *ctx) {
     while (1) {
         ResolveResult rr = { .resolved = false };
         if (!resolve_ctrl_port(&rr)) {
-            sleep(5); waitSecs += 5;
+            sleep(1); waitSecs += 1;
             if (waitSecs % 30 == 0)
                 printf("[CTRL] Still waiting for iPhone... (%ds)\n", waitSecs);
             continue;
         }
 
-        /* Silent probe — 3s timeout, no log spam */
-        int sock = try_connect(rr.host, rr.port, g_ctrlIfIndex, false, 3);
+        /* Ports change between sessions. Re-resolve promptly so a cached
+         * endpoint cannot stall the new Bluetooth-to-Wi-Fi handoff. */
+        int sock = try_connect(rr.host, rr.port, g_ctrlIfIndex, false, 1);
         if (sock >= 0) {
             /* Connected on first probe! */
             ctrl_send_connect(sock, rr.host);
             return;
         }
 
-        if (errno == ECONNREFUSED) {
+        int connectError = errno;
+        printf("[CTRL] Probe %s:%u failed: %s\n", rr.host,
+               (unsigned)rr.port, strerror(connectError));
+        fflush(stdout);
+        if (connectError == ECONNREFUSED) {
             /* iPhone IS on the network (TCP RST = host reachable).
              * This port is stale — move to Phase 2 with re-resolve. */
             printf("[CTRL] iPhone is online! (port %u stale, re-resolving)\n",
@@ -5662,7 +5673,7 @@ static void ctrl_connect_thread(void *ctx) {
         }
 
         /* EHOSTDOWN / ETIMEDOUT / EHOSTUNREACH — not on network yet */
-        sleep(8); waitSecs += 8;
+        sleep(1); waitSecs += 1;
         if (waitSecs % 30 == 0 && waitSecs > 0) {
             printf("[CTRL] Still waiting for iPhone... (%ds)\n", waitSecs);
             fflush(stdout);

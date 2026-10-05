@@ -1,13 +1,13 @@
 # Requirements
 
-End users who install the `.deb` need a compatible jailbroken cellular iPhone or iPad, Personal Hotspot, and the runtime packages declared by APT. They do not need a compiler, SDK, headers, signing tools, or OpenSSL.
+End users who install the `.deb` need a compatible jailbroken iPhone or iPad with Personal Hotspot and the runtime packages declared by APT. They do not need a compiler, SDK, headers, signing tools, or OpenSSL.
 
 ## Runtime
 
 | Item | Requirement |
 | --- | --- |
-| Device | Cellular iPhone or iPad with Personal Hotspot |
-| Tested rootful device | iPad Air 1 cellular, iPad4,2, iOS 12.5.8 |
+| Device | Jailbroken iPhone or iPad with Personal Hotspot |
+| Tested rootful device | iPad Air 1, iPad4,2, iOS 12.5.8 |
 | Tested rootless device | iPhone 7, iPhone9,3, iOS 15.8.4 |
 | Jailbreak | Rootful or rootless, iOS 12 or newer |
 | Package manager | Sileo, Cydia, Zebra, or APT-compatible frontend |

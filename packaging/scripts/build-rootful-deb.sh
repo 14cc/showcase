@@ -34,6 +34,8 @@ SCP_OPTS=(
   -P "$IPAD_PORT"
 )
 
+. "$ROOT/scripts/version.sh"
+
 field() {
   awk -F': ' -v key="$1" '$1 == key { print $2; exit }' "$CONTROL"
 }
@@ -46,7 +48,7 @@ need_file() {
 }
 
 PKG="$(field Package)"
-VER="$(field Version)"
+VER="$PACKAGE_VERSION"
 ARCH="$(field Architecture)"
 DEB_NAME="${PKG}_${VER}_${ARCH}.deb"
 
@@ -63,8 +65,6 @@ need_file "$REPO_ROOT/source/carplay_services.m"
 need_file "$REPO_ROOT/source/carplay_pair.c"
 need_file "$REPO_ROOT/source/carplay_pair.h"
 need_file "$REPO_ROOT/source/baa_broker.h"
-need_file "$REPO_ROOT/source/ShowcaseRadio.c"
-need_file "$REPO_ROOT/source/ShowcaseRadio.plist"
 need_file "$REPO_ROOT/source/vendor/monocypher/monocypher.c"
 need_file "$REPO_ROOT/source/vendor/monocypher/monocypher-ed25519.c"
 need_file "$REPO_ROOT/source/vendor/libtommath/tommath.c"
@@ -94,7 +94,6 @@ cp "$REPO_ROOT/source/Showcase.m" \
    "$REPO_ROOT/source/carplay_pair.c" \
    "$REPO_ROOT/source/carplay_pair.h" \
    "$REPO_ROOT/source/baa_broker.h" \
-   "$REPO_ROOT/source/ShowcaseRadio.c" \
    "$REPO_ROOT/source/Info.plist" \
    "$REPO_ROOT/source/ent_app.xml" \
    "$REPO_ROOT/source/ent_bt.xml" \
@@ -117,7 +116,7 @@ cd '$REMOTE_BASE'
 tar -xf crypto-vendor.tar
 
 clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
-    -o Showcase Showcase.m \
+    -DAPP_VERSION='\"$DISPLAY_VERSION\"' -o Showcase Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
@@ -135,31 +134,21 @@ clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
     vendor/libtommath/tommath.c \
     -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
-
-clang -dynamiclib -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
-    -o ShowcaseRadio.dylib ShowcaseRadio.c \
-    -Wl,-undefined,dynamic_lookup
 "
 
 cp -R "$PAYLOAD"/. "$WORK/rootfs"/
-mkdir -p "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries"
-sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
-  "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/ShowcaseRadio.dylib" \
-  "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib"
-cp "$REPO_ROOT/source/ShowcaseRadio.plist" \
-   "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.plist"
 for bin in Showcase carplay_bt carplay_services; do
   sshpass -p "$IPAD_PASS" scp "${SCP_OPTS[@]}" \
     "$IPAD_USER@$IPAD_HOST:$REMOTE_BASE/$bin" \
     "$WORK/rootfs/Applications/Showcase.app/$bin"
 done
-cp "$REPO_ROOT/source/Info.plist" "$WORK/rootfs/Applications/Showcase.app/Info.plist"
+fill_version "$REPO_ROOT/source/Info.plist" > "$WORK/rootfs/Applications/Showcase.app/Info.plist"
 cp "$REPO_ROOT/icon/generated/Icon-OEM-104.png" \
    "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-104.png"
 cp "$REPO_ROOT/icon/generated/Icon-OEM-120.png" \
    "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-120.png"
 
-cp "$ROOT/control/control" "$WORK/rootfs/DEBIAN/control"
+fill_version "$CONTROL" > "$WORK/rootfs/DEBIAN/control"
 cp "$ROOT/control/postinst" "$WORK/rootfs/DEBIAN/postinst"
 cp "$ROOT/control/prerm" "$WORK/rootfs/DEBIAN/prerm"
 cp "$ROOT/control/postrm" "$WORK/rootfs/DEBIAN/postrm"
@@ -195,10 +184,6 @@ chmod 0644 Applications/Showcase.app/Info.plist Applications/Showcase.app/Icon*.
 chmod 4755 Applications/Showcase.app/Showcase Applications/Showcase.app/carplay_bt Applications/Showcase.app/carplay_services
 chmod 0755 usr/bin/BTdaemon usr/lib/libBTstack.dylib
 chmod 0644 Library/LaunchDaemons/ch.ringwald.BTstack.plist
-chmod 0755 Library/MobileSubstrate Library/MobileSubstrate/DynamicLibraries
-chmod 0755 Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib
-chmod 0644 Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.plist
-ldid -S Library/MobileSubstrate/DynamicLibraries/ShowcaseRadio.dylib
 chmod 0755 DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm
 chmod 0644 DEBIAN/control
 

@@ -13,7 +13,7 @@
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Turn a jailbroken cellular iPhone or iPad into a wireless CarPlay receiver. Showcase receives CarPlay video and audio, then sends touch input to the connected iPhone."
+          "markdown": "Turn a jailbroken iPhone or iPad into a wireless CarPlay receiver. Showcase receives CarPlay video and audio, then sends touch input to the connected iPhone."
         },
         {
           "class": "DepictionTableTextView",
@@ -41,7 +41,7 @@
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Cellular iPhone or iPad with Personal Hotspot available."
+          "markdown": "An iPhone or iPad with Personal Hotspot."
         },
         {
           "class": "DepictionMarkdownView",
@@ -61,15 +61,15 @@
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Diagnostics and packet dumps are off by default. Enable them from the info button only when collecting a report."
+          "markdown": "Diagnostics and packet dumps are off by default. Enable them in Settings, under Troubleshooting, only when collecting a report."
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Open Showcase while the receiver still has internet access. Beta 3 prepares BAA authentication before Personal Hotspot starts."
+          "markdown": "Open Showcase while the receiver still has internet access. Showcase prepares BAA authentication before Personal Hotspot starts."
         },
         {
           "class": "DepictionMarkdownView",
-          "markdown": "Tap with three fingers during CarPlay to pause input and reveal the stop and settings controls. Tap again with three fingers to resume."
+          "markdown": "Tap with three fingers during CarPlay to reveal the stop and settings controls. Tap anywhere to return to CarPlay."
         }
       ]
     },
@@ -77,6 +77,30 @@
       "class": "DepictionStackView",
       "tabname": "Changelog",
       "views": [
+        {
+          "class": "DepictionHeaderView",
+          "title": "1.0 Beta 4"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Starts Personal Hotspot by itself. If iOS refuses, Showcase asks you to turn it on in Settings."
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Removes the 5 GHz hotspot option. The hotspot uses the band iOS chooses."
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Choose where sound plays by tapping this device or the CarPlay sender on the Sound page."
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Cleaner screens with shorter connection steps and no small text."
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "Tap anywhere on the dimmed screen to return to CarPlay."
+        },
         {
           "class": "DepictionHeaderView",
           "title": "1.0 beta 3-2"
