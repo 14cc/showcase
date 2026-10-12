@@ -488,6 +488,23 @@ static void baa_broker_handle_client(int client) {
     free(response);
 }
 
+/* The key lives behind a token daemon connection that iOS drops when it sits
+ * idle, after which signing fails. Signing every 30 s keeps it open; a broker
+ * that can no longer sign exits so Showcase starts a fresh one. */
+static bool baa_broker_key_usable(void) {
+    static const uint8_t probe[] = "Showcase BAA keepalive";
+    CFErrorRef error = NULL;
+    CFDataRef signature = SecKeyCreateSignature(
+        g_baa_broker_key, kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
+        (__bridge CFDataRef)[NSData dataWithBytes:probe length:sizeof(probe) - 1], &error);
+    if (signature) CFRelease(signature);
+    if (error) {
+        NSLog(@"[BAA] Broker keepalive failed: %@", error);
+        CFRelease(error);
+    }
+    return signature != NULL;
+}
+
 static int run_baa_broker(void) {
     if (!issue_baa_for_broker()) return 1;
 
@@ -509,6 +526,19 @@ static int run_baa_broker(void) {
     printf("[BAA] Broker ready on %s\n", BAA_BROKER_PATH);
 
     while (1) {
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(server, &ready);
+        struct timeval wait = { .tv_sec = 30, .tv_usec = 0 };
+        int count = select(server + 1, &ready, NULL, NULL, &wait);
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0) break;
+        if (count == 0) {
+            bool usable;
+            @autoreleasepool { usable = baa_broker_key_usable(); }
+            if (!usable) break;
+            continue;
+        }
         int client = accept(server, NULL, NULL);
         if (client < 0) {
             if (errno == EINTR) continue;
@@ -521,6 +551,7 @@ static int run_baa_broker(void) {
     }
     close(server);
     unlink(BAA_BROKER_PATH);
+    printf("[BAA] Broker exiting\n");
     return 0;
 }
 
@@ -4971,6 +5002,7 @@ static void handle_rtsp_generic(int sock, const HTTPReq *r) {
 
 static NSDictionary *g_modes_state = nil;
 
+
 static void handle_command_dictionary(NSDictionary *command) {
     NSString *type = command[@"type"];
     if (![type isKindOfClass:[NSString class]]) return;
@@ -5187,9 +5219,14 @@ static void handle_client(int c) {
     struct timeval tv = { .tv_sec = 600, .tv_usec = 0 };
     setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    /* TCP keepalive */
-    int yes = 1;
+    /* TCP keepalive. An iPhone that leaves Wi-Fi never closes the
+     * connection, so probe after 10 s of silence and give up after 3 misses.
+     * The iPhone posts /feedback every 2 s while a session runs. */
+    int yes = 1, idle = 10, interval = 3, count = 3;
     setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    setsockopt(c, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    setsockopt(c, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(c, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
 
     while (1) {
         /* ── Encrypted mode: read framed ChaCha20-Poly1305 messages ── */
@@ -5326,6 +5363,14 @@ static void handle_client(int c) {
     }
     close(c);
     printf("[AP] Connection closed\n");
+    /* A session uses one encrypted control connection. Once it ends, by
+     * TEARDOWN, the iPhone closing it, or the iPhone leaving Wi-Fi, exit so
+     * Showcase stops the session the same way the Stop button does. */
+    if (g_enc.active) {
+        printf("[AP] CarPlay session ended; exiting\n");
+        fflush(stdout);
+        exit(0);
+    }
 }
 
 static bool start_airplay_server(uint16_t port) {

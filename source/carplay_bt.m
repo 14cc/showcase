@@ -19,6 +19,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <stdlib.h>
 #include <time.h>
 #include <dispatch/dispatch.h>
@@ -127,6 +128,11 @@ extern const void *hci_accept_connection_request;
 extern const void *hci_disconnect;
 extern const void *hci_io_capability_request_reply, *hci_user_confirmation_request_reply;
 extern const void *rfcomm_register_service, *rfcomm_accept_connection;
+extern const void *rfcomm_create_channel, *sdp_client_query_rfcomm_services;
+extern void run_loop_set_timer(void *timer, uint32_t milliseconds);
+extern void run_loop_set_timer_handler(void *timer, void (*handler)(void *timer));
+extern void run_loop_add_timer(void *timer);
+extern int  run_loop_remove_timer(void *timer);
 extern const void *sdp_register_service_record;
 extern const void *hci_read_bd_addr;
 
@@ -151,6 +157,24 @@ static uint8_t *baa_leaf_der = NULL, *baa_inter_der = NULL;
 static int baa_leaf_len = 0, baa_inter_len = 0, baa_ready = 0;
 
 static uint8_t iap2_detect[] = { 0xFF, 0x55, 0x02, 0x00, 0xEE, 0x10 };
+
+/* ── Reconnect ──
+ * A car pages the phone it knows and opens the phone's iAP2 channel itself;
+ * the phone does not reconnect on its own. The last iPhone that passed
+ * authentication is remembered and paged until it connects. */
+#define LAST_IPHONE_PATH "/var/mobile/Library/Showcase/last-iphone"
+#define PAGE_RETRY_MS 10000
+static uint8_t page_addr[6];            /* display order */
+static int page_known = 0, page_busy = 0, page_channel = 0, timer_armed = 0;
+static uint8_t peer_addr[6];            /* peer of the open channel, display order */
+static int have_peer = 0;
+static uint64_t page_timer[16];         /* opaque timer_source_t, zeroed */
+/* Service search pattern: the iPhone's iAP2 UUID 00000000-DECA-FADE-DECA-DEAFDECACAFE */
+static uint8_t iap2_device_pattern[] = {
+    0x35, 0x11, 0x1C, 0x00, 0x00, 0x00, 0x00, 0xDE, 0xCA, 0xFA, 0xDE,
+    0xDE, 0xCA, 0xDE, 0xAF, 0xDE, 0xCA, 0xCA, 0xFE };
+static void load_last_iphone(void);
+static void schedule_page(uint32_t milliseconds);
 
 /* ── State tracking ── */
 static int wifi_config_sent = 0;
@@ -387,6 +411,8 @@ static void perform_bt_setup(void) {
     bt_send_cmd(&sdp_register_service_record,did_sdp_rec);
     bt_send_cmd(&btstack_set_discoverable,1);
     printf("[CP] READY — identity: RoadLink / RL-100 / RoadLink Labs\n");
+    load_last_iphone();
+    schedule_page(1000);
     int ready_fd = open(BT_READY_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (ready_fd >= 0) {
         dprintf(ready_fd, "ready\n");
@@ -408,6 +434,58 @@ static uint8_t ck(uint8_t *d, int l) {
 static void print_hci_addr(const char *prefix, const uint8_t *raw) {
     printf("%s%02X:%02X:%02X:%02X:%02X:%02X",
            prefix, raw[5], raw[4], raw[3], raw[2], raw[1], raw[0]);
+}
+
+static void load_last_iphone(void) {
+    char text[32] = {0};
+    FILE *file = fopen(LAST_IPHONE_PATH, "r");
+    if (!file) return;
+    unsigned b[6];
+    if (fgets(text, sizeof(text), file) &&
+        sscanf(text, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6) {
+        for (int i = 0; i < 6; i++) page_addr[i] = (uint8_t)b[i];
+        page_known = 1;
+        printf("[PAGE] last iPhone %02X:%02X:%02X:%02X:%02X:%02X\n",
+               page_addr[0], page_addr[1], page_addr[2], page_addr[3], page_addr[4], page_addr[5]);
+    }
+    fclose(file);
+}
+
+static void save_last_iphone(void) {
+    if (!have_peer) return;
+    memcpy(page_addr, peer_addr, 6);
+    page_known = 1;
+    mkdir("/var/mobile/Library/Showcase", 0755);
+    FILE *file = fopen(LAST_IPHONE_PATH ".tmp", "w");
+    if (!file) return;
+    fprintf(file, "%02X:%02X:%02X:%02X:%02X:%02X\n",
+            peer_addr[0], peer_addr[1], peer_addr[2], peer_addr[3], peer_addr[4], peer_addr[5]);
+    fclose(file);
+    rename(LAST_IPHONE_PATH ".tmp", LAST_IPHONE_PATH);
+}
+
+static void page_iphone(void);
+
+static void page_timer_fired(void *timer) {
+    timer_armed = 0;
+    page_iphone();
+}
+
+static void schedule_page(uint32_t milliseconds) {
+    if (!page_known || bluetooth_handoff_requested) return;
+    if (timer_armed) run_loop_remove_timer(page_timer);
+    run_loop_set_timer_handler(page_timer, page_timer_fired);
+    run_loop_set_timer(page_timer, milliseconds);
+    run_loop_add_timer(page_timer);
+    timer_armed = 1;
+}
+
+static void page_iphone(void) {
+    if (!page_known || active_cid || page_busy || bluetooth_handoff_requested) return;
+    page_busy = 1;
+    page_channel = 0;
+    printf("[PAGE] looking for the iPhone's iAP2 service\n");
+    bt_send_cmd(&sdp_client_query_rfcomm_services, page_addr, iap2_device_pattern);
 }
 
 static void rfcomm_send_chunked(uint8_t *data, int len) {
@@ -861,6 +939,7 @@ static void handle_ctrl_msg(uint16_t msg_id, uint8_t *params, int plen) {
     case 0xAA05:
         mfi_auth_succeeded = 1;
         printf("[CP] *** AUTH SUCCEEDED! ***\n");
+        save_last_iphone();
         bt_progress(BT_PROGRESS_AUTHORIZED);
         maybe_start_handoff_watchdog();
         break;
@@ -1296,6 +1375,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         printf("[CP] Disconnected handle=0x%04X reason=0x%02X\n",
                sz > 4 ? R16(pkt,3) : 0, sz > 5 ? pkt[5] : 0xff);
         active_cid=0;iap2_detected=0;link_established=0;reset_wireless_handoff_state();
+        schedule_page(PAGE_RETRY_MS);
         break;
     case 0x06:
         printf("[CP] Auth complete status=0x%02X handle=0x%04X\n",
@@ -1349,6 +1429,23 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
             printf(" status=0x%02X\n", pkt[2]);
         }
         break;
+    case 0x92:  /* SDP RFCOMM service found */
+        if (page_busy && sz >= 3 && pkt[2]) {
+            page_channel = pkt[2];
+            printf("[PAGE] iPhone iAP2 on RFCOMM channel %d\n", page_channel);
+        }
+        break;
+    case 0x91:  /* SDP query complete */
+        if (!page_busy) break;
+        if (page_channel && !active_cid) {
+            printf("[PAGE] opening iAP2 to the iPhone\n");
+            bt_send_cmd(&rfcomm_create_channel, page_addr, page_channel);
+        } else {
+            page_busy = 0;
+            printf("[PAGE] iPhone not reachable (status=0x%02X); retrying\n", sz >= 3 ? pkt[2] : 0xff);
+            schedule_page(PAGE_RETRY_MS);
+        }
+        break;
     case 0x82:{
         uint16_t c=R16(pkt,9);
         bt_send_cmd(&rfcomm_accept_connection,c);
@@ -1356,7 +1453,14 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
         break;
     }
     case 0x80:
+        page_busy = 0;
+        if(pkt[2]!=0){
+            printf("[PAGE] iAP2 channel failed status=0x%02X; retrying\n", pkt[2]);
+            schedule_page(PAGE_RETRY_MS);
+        }
         if(pkt[2]==0){
+            for(int i=0;i<6;i++) peer_addr[i]=pkt[8-i];
+            have_peer=1;
             active_cid=R16(pkt,12);rfcomm_mtu=R16(pkt,14);
             iap2_detected=0;link_established=0;detect_count=0;reset_wireless_handoff_state();
             printf("[CP] RFCOMM OPEN cid=0x%04x mtu=%d\n",active_cid,rfcomm_mtu);
@@ -1370,6 +1474,7 @@ static void handler(uint8_t type, uint16_t ch, uint8_t *pkt, uint16_t sz) {
     case 0x81:
         printf("[CP] RFCOMM CLOSED\n");
         alarm(0);active_cid=0;iap2_detected=0;link_established=0;reset_wireless_handoff_state();
+        schedule_page(PAGE_RETRY_MS);
         break;
     }
 }

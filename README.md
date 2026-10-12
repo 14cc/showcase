@@ -8,6 +8,16 @@ This repository contains the Showcase source. Install the packaged tweak from th
 https://aminerostane.com/repo
 ```
 
+Beta 4-2
+
+- Reconnects to your iPhone by itself, like a car. Open Showcase and CarPlay comes back without touching the iPhone.
+- Starts CarPlay when you open Showcase. You can turn this off in Settings.
+- Stops cleanly and waits for your iPhone when it leaves or turns off Wi-Fi.
+- Rootless: keeps the Bluetooth pairing after a reboot.
+- Relaunching no longer asks for internet, Try Again works, and Showcase retries when the network comes back.
+- Opens without the long black screen.
+- Warns when the hotspot name doesn't match the device name.
+
 Beta 4
 
 - Starts Personal Hotspot by itself, and asks you to turn it on in Settings when iOS refuses.

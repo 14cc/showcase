@@ -17,5 +17,4 @@ Description: Wireless CarPlay receiver for rootless jailbreaks.
  receiver. This package uses the rootless layout under /var/jb and supports
  iOS 12 or newer.
  .
- Beta 4 brings cleaner screens, a tappable sound picker and automatic
- Personal Hotspot.
+ Beta 4-2 reconnects to your iPhone by itself, like a car head unit.

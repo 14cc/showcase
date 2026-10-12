@@ -2773,6 +2773,9 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 /* Three-finger tap is reserved for Showcase chrome and leaves pinch to CarPlay. */
 @property (nonatomic, strong) UITapGestureRecognizer *controlsGesture;
 @property (nonatomic, assign) BOOL chromeVisible;
+/* The iPhone ended a running session; start again and wait for it, as a car
+ * head unit does. The Stop button never sets this. */
+@property (nonatomic, assign) BOOL restartAfterStop;
 
 /* Lifecycle */
 @property (nonatomic, assign) UIBackgroundTaskIdentifier bgTask;
@@ -2861,8 +2864,10 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.bgTask = UIBackgroundTaskInvalid;
     self.tcpdumpPid = 0;
     self.tcpdumpMissingPromptShown = NO;
+    /* Opening Showcase is turning the car on: start and page the iPhone. */
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
-        DEDICATED_RADIO_KEY: @YES
+        DEDICATED_RADIO_KEY: @YES,
+        AUTO_START_KEY: @YES
     }];
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
     /* A session that ended without stopFlow may have left a network paused. */
@@ -2916,16 +2921,90 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 #ifdef SHOWCASE_UI_PREVIEW
     [self schedulePreviewFromFile];
 #endif
-    if (![self startBAABroker]) {
-        self.baaError = @"The local authentication broker could not start.";
-        ip_log("BAA broker failed to start");
-    } else {
-        [self preheatBAA];
-    }
+    [self startBAA];
+    /* The first preheat fails when the iPad is offline at launch, for example
+     * before it rejoins Wi-Fi. Retry when the network changes. */
+    int networkToken = 0;
+    notify_register_dispatch("com.apple.system.config.network_change", &networkToken,
+                             dispatch_get_main_queue(), ^(int token) { [self networkChanged]; });
     return YES;
 }
 
+- (void)networkChanged {
+    static CFAbsoluteTime lastRetry = 0;
+    if (self.state != StateIdle || self.baaReady || self.baaLoading || !self.baaError ||
+        CFAbsoluteTimeGetCurrent() - lastRetry < 5) return;
+    lastRetry = CFAbsoluteTimeGetCurrent();
+    ip_log("network changed; retrying CarPlay authentication");
+    [self startBAA];
+}
+
+/* Reaping stale helpers sleeps, so the broker starts off the main thread and
+ * the first frame draws at once. Try Again comes here too when the broker
+ * exited after a failed preheat. */
+- (void)startBAA {
+    if (self.baaLoading) return;
+    self.baaLoading = YES;
+    self.baaError = nil;
+    [self renderState];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        BOOL started = [self startBAABroker];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            self.baaLoading = NO;
+            if (started) {
+                [self preheatBAA];
+                return;
+            }
+            self.baaError = @"The local authentication broker could not start.";
+            ip_log("BAA broker failed to start");
+            [self renderState];
+        });
+    });
+}
+
+/* A broker from an earlier launch still holds a certificate, so a relaunch
+ * after iOS ends Showcase in the background needs no internet. It is reused
+ * for 12 hours, well inside the certificate's validity. */
+#ifndef LOCAL_PEERPID
+#define LOCAL_PEERPID 0x002
+#endif
+#define BAA_BROKER_REUSE_SECONDS (12 * 3600)
+
+static pid_t reusable_baa_broker(void) {
+    int fd = baa_broker_connect();
+    if (fd < 0) return 0;
+    pid_t pid = 0;
+    socklen_t length = sizeof(pid);
+    if (getsockopt(fd, 0 /* SOL_LOCAL */, LOCAL_PEERPID, &pid, &length) != 0) pid = 0;
+    close(fd);
+    if (pid <= 0) return 0;
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0 || size == 0 ||
+        time(NULL) - info.kp_proc.p_starttime.tv_sec > BAA_BROKER_REUSE_SECONDS) return 0;
+    uint8_t *leaf = NULL, *intermediate = NULL;
+    int leafLength = 0, intermediateLength = 0;
+    int rc = baa_broker_get_certs(&leaf, &leafLength, &intermediate, &intermediateLength);
+    free(leaf);
+    free(intermediate);
+    /* A broker that still holds its certificate may have lost its key. */
+    static const uint8_t probe[] = "Showcase BAA reuse";
+    uint8_t *signature = NULL;
+    int signatureLength = 0;
+    if (rc == 0) rc = baa_broker_sign(probe, (uint32_t)(sizeof(probe) - 1), &signature, &signatureLength);
+    free(signature);
+    return rc == 0 && signatureLength > 0 ? pid : 0;
+}
+
 - (BOOL)startBAABroker {
+    pid_t existing = reusable_baa_broker();
+    if (existing > 0) {
+        reap_stale_helpers(existing);
+        self.baaBrokerPid = existing;
+        ip_log("BAA broker pid=%d from an earlier launch reused", existing);
+        return YES;
+    }
     reap_stale_helpers(0);
     NSString *helper = [[[NSBundle mainBundle] bundlePath]
         stringByAppendingPathComponent:@SVC_HELPER_NAME];
@@ -2978,6 +3057,9 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
                    leafLength, intermediateLength, signatureLength);
         } else {
             ip_log("BAA preheat helper failed rc=%d", rc);
+            /* The next attempt starts a fresh broker. */
+            kill_pid(self.baaBrokerPid);
+            self.baaBrokerPid = 0;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -3029,9 +3111,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     [self endAWDLSuppression];
     showcase_release_other_wifi("app terminating");
     [self stopNetworkDumpCaptureWithReason:@"app terminating"];
-    kill_pid(self.baaBrokerPid);
-    self.baaBrokerPid = 0;
-    unlink(BAA_BROKER_PATH);
+    /* The BAA broker stays up so the next launch can reuse its certificate. */
 }
 
 - (void)endBackgroundTask {
@@ -3466,6 +3546,11 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         [self hideChrome];
         return;
     }
+    [self showChrome];
+}
+
+- (void)showChrome {
+    if (self.state != StateActive || self.chromeVisible) return;
     self.chromeVisible = YES;
     self.controlsOverlay.alpha = 0;
     self.controlsOverlay.hidden = NO;
@@ -3547,7 +3632,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 /* "Start CarPlay automatically" runs once per launch, as soon as the
  * authentication certificate is ready, so a car-mounted screen needs no tap. */
 - (void)startAutomaticallyIfRequested {
-    if (self.autoStartConsumed) return;
+    /* Authentication may come later, after a retry; wait for it. */
+    if (self.autoStartConsumed || !self.baaReady) return;
     self.autoStartConsumed = YES;
     if (![[NSUserDefaults standardUserDefaults] boolForKey:AUTO_START_KEY]) return;
     if (self.state != StateIdle || !self.baaReady || ![self.cars apReady] ||
@@ -3566,7 +3652,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     if (![self.cars apReady]) { [self showWifiSetup]; return; }
     if (self.cars.cars.count == 0) return;
     if (!self.baaReady) {
-        [self preheatBAA];
+        if (self.baaBrokerPid > 0 && pid_alive(self.baaBrokerPid)) [self preheatBAA];
+        else [self startBAA];
         return;
     }
     [self startFlow];
@@ -3576,6 +3663,10 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     ip_log("startFlow: car='%s' ssid='%s'",
            [self.cars.selected.name UTF8String],
            [self.cars.apSSID UTF8String]);
+    NSString *deviceName = hotspot_name();
+    if (deviceName && ![deviceName isEqualToString:self.cars.apSSID])
+        ip_log("[HOTSPOT] WARNING: hotspot is named '%s' but Showcase sends '%s'",
+               deviceName.UTF8String, self.cars.apSSID.UTF8String);
     self.bluetoothHandedOff = NO;
     [self resetConnectProgress];
     if ([[NSUserDefaults standardUserDefaults] boolForKey:DEDICATED_RADIO_KEY]) {
@@ -4051,6 +4142,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 }
 
 - (void)stopFlow {
+    BOOL restart = self.restartAfterStop;
+    self.restartAfterStop = NO;
     [self endAWDLSuppression];
     [self stopNetworkDumpCaptureWithReason:@"user cancelled / stopping flow"];
     [self endBackgroundTask];
@@ -4099,6 +4192,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         [self transitionTo:StateIdle];
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentPendingBluetoothCompatibilityError];
+            if (restart && self.state == StateIdle && self.baaReady &&
+                !self.vc.presentedViewController) [self startFlow];
         });
     });
 }
@@ -4186,10 +4281,28 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     [self.vc presentViewController:vc animated:YES completion:nil];
 }
 
+/* iOS names Personal Hotspot after the device. The iPhone is told to join the
+ * name entered here, so a different name leaves it unable to connect. */
+static NSString *hotspot_name(void) {
+    void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    CFTypeRef (*copy)(CFStringRef) = gestalt ? dlsym(gestalt, "MGCopyAnswer") : NULL;
+    CFTypeRef value = copy ? copy(CFSTR("UserAssignedDeviceName")) : NULL;
+    NSString *name = value && CFGetTypeID(value) == CFStringGetTypeID() ?
+        [(__bridge NSString *)value copy] : nil;
+    if (value) CFRelease(value);
+    return name.length ? name : nil;
+}
+
+- (void)saveSSID:(NSString *)ssid password:(NSString *)pass host:(UIViewController *)host {
+    [self.cars setAPSSID:ssid password:pass];
+    [host dismissViewControllerAnimated:YES completion:^{ [self renderState]; }];
+}
+
 /* Called by WifiSetupViewController when the user taps "Set credentials".
  * This is a focused alert prompt for SSID + password. */
 - (void)promptForCredentialsFromController:(UIViewController *)host {
-    NSString *currentSSID = self.cars.apSSID ?: @"";
+    NSString *deviceName = hotspot_name();
+    NSString *currentSSID = self.cars.apSSID.length ? self.cars.apSSID : (deviceName ?: @"");
     NSString *currentPass = self.cars.apPassword ?: @"";
 
     UIAlertController *ac = [UIAlertController
@@ -4231,10 +4344,27 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
                 [weakHost presentViewController:e animated:YES completion:nil];
                 return;
             }
-            [self.cars setAPSSID:ssid password:pass];
-            [weakHost dismissViewControllerAnimated:YES completion:^{
-                [self renderState];
-            }];
+            if (deviceName && ![ssid isEqualToString:deviceName]) {
+                UIAlertController *m = [UIAlertController
+                    alertControllerWithTitle:@"Different Name"
+                                     message:[NSString stringWithFormat:
+                        @"This iPad's hotspot is called \u201c%@\u201d. Your iPhone joins the name you enter here, so it has to match. To use \u201c%@\u201d, rename the iPad in Settings > General > About > Name.",
+                        deviceName, ssid]
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [m addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Use \u201c%@\u201d", deviceName]
+                    style:UIAlertActionStyleDefault handler:^(UIAlertAction *_b) {
+                        if (validateSSID(deviceName)) {
+                            [self promptForCredentialsFromController:weakHost];
+                            return;
+                        }
+                        [self saveSSID:deviceName password:pass host:weakHost];
+                    }]];
+                [m addAction:[UIAlertAction actionWithTitle:@"Keep" style:UIAlertActionStyleCancel
+                    handler:^(UIAlertAction *_b) { [self saveSSID:ssid password:pass host:weakHost]; }]];
+                [weakHost presentViewController:m animated:YES completion:nil];
+                return;
+            }
+            [self saveSSID:ssid password:pass host:weakHost];
         }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
         style:UIAlertActionStyleCancel handler:nil]];
@@ -4765,8 +4895,18 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self endAWDLSuppression];
         });
-        if (self.state == StateActive || self.state == StateAwaitingPhone) {
-            [self stopFlow]; break;
+        /* CarPlay services exits when the iPhone ends the session or leaves
+         * Wi-Fi, and when it fails while connecting. */
+        if (self.state != StateIdle && self.state != StateStopping) {
+            BOOL wasActive = self.state == StateActive;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (wasActive) {
+                    ip_log("[SESSION] iPhone ended the session; waiting for it again");
+                    self.restartAfterStop = YES;
+                }
+                [self stopFlow];
+            });
+            break;
         }
     }
 }
@@ -6242,6 +6382,13 @@ static BOOL g_settings_hardware_loading = NO;
     if (error) { [self setMessage:error error:YES]; return; }
     [app.cars setAPSSID:ssid password:pass];
     [app renderState];
+    NSString *deviceName = hotspot_name();
+    if (deviceName && ![deviceName isEqualToString:ssid]) {
+        [self setMessage:[NSString stringWithFormat:
+            @"Saved, but this iPad's hotspot is called \u201c%@\u201d. Your iPhone can't join until the names match.",
+            deviceName] error:YES];
+        return;
+    }
     [self setMessage:@"Saved." error:NO];
 }
 

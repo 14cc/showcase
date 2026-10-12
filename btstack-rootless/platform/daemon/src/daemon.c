@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <strings.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 #include "Winsock2.h"
@@ -251,6 +252,7 @@ static char string_buffer[1000];
 static int loggingEnabled;
 
 static const char * btstack_server_storage_path;
+#define SHOWCASE_DIR "/var/mobile/Library/Showcase"
 
 // TLV
 static int                   tlv_setup_done;
@@ -1524,7 +1526,18 @@ static void daemon_packet_handler(void * connection, uint8_t packet_type, uint16
                     // setup TLV using local address as part of the name
                     gap_local_bd_addr(addr);
                     log_info("BTstack up and running at %s",  bd_addr_to_str(addr));
+                    // link keys live outside /tmp, which iOS empties at boot; a
+                    // database left in /tmp by an older build moves over once
                     snprintf(string_buffer, sizeof(string_buffer), "%s/btstack_%s.tlv", btstack_server_storage_path, bd_addr_to_str_dashed(addr));
+                    {
+                        char keys_path[sizeof(string_buffer)];
+                        mkdir(SHOWCASE_DIR, 0755);
+                        mkdir(SHOWCASE_DIR "/bluetooth", 0700);
+                        snprintf(keys_path, sizeof(keys_path), SHOWCASE_DIR "/bluetooth/btstack_%s.tlv", bd_addr_to_str_dashed(addr));
+                        if (access(keys_path, F_OK) != 0) rename(string_buffer, keys_path);
+                        strcpy(string_buffer, keys_path);
+                    }
+                    log_info("open link key db %s", string_buffer);
                     tlv_impl = btstack_tlv_posix_init_instance(&tlv_context, string_buffer);
                     btstack_tlv_set_instance(tlv_impl, &tlv_context);
 
