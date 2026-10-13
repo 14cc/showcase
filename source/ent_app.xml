@@ -19,5 +19,12 @@
     <!-- Start and stop Personal Hotspot for the CarPlay session -->
     <key>com.apple.MobileInternetSharing.allow</key>
     <true/>
+    <!-- Read the device name, which is the hotspot's name (iOS 16+) -->
+    <key>com.apple.developer.device-information.user-assigned-device-name</key>
+    <true/>
+    <key>com.apple.private.MobileGestalt.AllowedProtectedKeys</key>
+    <array>
+        <string>UserAssignedDeviceName</string>
+    </array>
 </dict>
 </plist>

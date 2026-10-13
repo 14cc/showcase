@@ -4283,14 +4283,20 @@ static pid_t reusable_baa_broker(void) {
 
 /* iOS names Personal Hotspot after the device. The iPhone is told to join the
  * name entered here, so a different name leaves it unable to connect. */
-static NSString *hotspot_name(void) {
+static NSString *gestalt_string(CFStringRef key) {
     void *gestalt = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
     CFTypeRef (*copy)(CFStringRef) = gestalt ? dlsym(gestalt, "MGCopyAnswer") : NULL;
-    CFTypeRef value = copy ? copy(CFSTR("UserAssignedDeviceName")) : NULL;
-    NSString *name = value && CFGetTypeID(value) == CFStringGetTypeID() ?
+    CFTypeRef value = copy ? copy(key) : NULL;
+    NSString *string = value && CFGetTypeID(value) == CFStringGetTypeID() ?
         [(__bridge NSString *)value copy] : nil;
     if (value) CFRelease(value);
-    return name.length ? name : nil;
+    return string.length ? string : nil;
+}
+
+/* Without access, iOS 16 and later answer with the model ("iPad"). */
+static NSString *hotspot_name(void) {
+    NSString *name = gestalt_string(CFSTR("UserAssignedDeviceName"));
+    return [name isEqualToString:gestalt_string(CFSTR("DeviceName"))] ? nil : name;
 }
 
 - (void)saveSSID:(NSString *)ssid password:(NSString *)pass host:(UIViewController *)host {

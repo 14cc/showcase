@@ -8,6 +8,10 @@ This repository contains the Showcase source. Install the packaged tweak from th
 https://aminerostane.com/repo
 ```
 
+Beta 4-3
+
+- Fixes the false hotspot name warning on iOS 16 and newer.
+
 Beta 4-2
 
 - Reconnects to your iPhone by itself, like a car. Open Showcase and CarPlay comes back without touching the iPhone.
