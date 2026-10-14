@@ -905,11 +905,8 @@ static CarPlayDisplayProfile preferred_carplay_display_profile(BOOL preferSmooth
     if (wlanAttachment == CarPlayWLANAttachmentHSIC)
         framesPerSecond = MIN(framesPerSecond, 30);
 
-    /* Size the stream from runtime hardware capability, never jailbreak
-     * layout. One-gigabyte devices share memory bandwidth between UIKit,
-     * VideoToolbox, the CarPlay service, and the hotspot; a 960x720-class
-     * budget limits the shared memory and wireless working set.
-     * Two-gigabyte devices and above retain a 720p-class floor. */
+    /* Keep the proven low-bandwidth budgets for smooth mode. Normal mode
+     * spends more pixels on text and map detail at 30 fps, capped at 1080p. */
     uint64_t pixelBudget = 960ULL * 720ULL;
     if (memory >= 1536ULL * 1024ULL * 1024ULL)
         pixelBudget = 1280ULL * 720ULL;
@@ -920,13 +917,15 @@ static CarPlayDisplayProfile preferred_carplay_display_profile(BOOL preferSmooth
     uint64_t nativePixels = (uint64_t)nativeLong * (uint64_t)nativeShort;
     if (nativePixels > 0 && pixelBudget > nativePixels)
         pixelBudget = nativePixels;
-    /* The user's "Prefer smooth video" choice trades sharpness for a lighter
-     * stream: about half the pixels and at most 30 frames per second, which
-     * roughly halves the bytes each frame puts on the hotspot link. */
     if (preferSmooth) {
         pixelBudget = MAX(640ULL * 384ULL, (pixelBudget * 9ULL) / 16ULL);
-        framesPerSecond = MIN(framesPerSecond, 30);
+    } else {
+        pixelBudget = MIN((pixelBudget * 16ULL) / 9ULL,
+                          1920ULL * 1080ULL);
     }
+    framesPerSecond = MIN(framesPerSecond, 30);
+    if (nativePixels > 0 && pixelBudget > nativePixels)
+        pixelBudget = nativePixels;
 
     /* Search codec-friendly 16-pixel dimensions. The score rewards using
      * the available decode budget but penalizes aspect error heavily, so the

@@ -82,6 +82,22 @@ The package bundles `BTdaemon`, `libBTstack.dylib`, and the BTstack launch daemo
 
 Showcase embeds Monocypher and LibTomMath for CarPlay cryptography. Users no longer need an OpenSSL package or repository.
 
+## Video quality
+
+With **Prefer Smooth Video** off (the default), Showcase requests a sharper
+30 fps stream, within the receiver's aspect ratio, native dimensions and a
+1080p pixel budget. For a 2048 × 1536 iPad with 1 GB of RAM, the requested
+stream is 1280 × 960 instead of 960 × 720 (78% more pixels).
+This is still below Retina resolution; the iPhone controls H.264 compression.
+
+Enable **Prefer Smooth Video** if the larger stream causes stalls on your
+receiver or hotspot. This retains the previous lower-resolution profile.
+Reconnect CarPlay after changing the setting. The selected resolution and
+cadence appear on the About page and in the `display profile` log entry.
+The sharper profile was tested on an iPad Air (iPad4,1), iOS 12.5.7,
+with a user-reported improvement in sharpness and satisfactory 30 fps playback.
+Other receivers and wireless conditions still need on-device validation.
+
 ## Source Layout
 
 ```text
