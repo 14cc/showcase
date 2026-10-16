@@ -8,6 +8,13 @@ This repository contains the Showcase source. Install the packaged tweak from th
 https://aminerostane.com/repo
 ```
 
+Beta 5
+
+- Adds a resolution picker and a 30 or 60 fps choice in Settings > Display. The resolutions follow your screen's shape, like on a Mac.
+- Adds Prioritize Quality and Prioritize Performance. Quality streams the largest resolution at 60 fps; Performance is the old Prefer Smooth Video.
+- Speaks French, Spanish, Simplified Chinese and Japanese. Showcase follows your device's language, and Settings > Language lets you pick another.
+- Ships a separate Showcase for Taurine package for Taurine on iOS 14.
+
 Beta 4-3
 
 - Fixes the false hotspot name warning on iOS 16 and newer.
@@ -44,6 +51,8 @@ https://aminerostane.com/repo
 ```
 
 Then install `Showcase`.
+
+On Taurine (iOS 14), install `Showcase for Taurine` instead. It starts Bluetooth in the order Taurine needs, waits longer for the controller and adds BTQuiet, which slows Bluetooth clients' reconnects while Showcase owns the controller. It replaces the regular package.
 
 Install guide and protocol write-up
 
@@ -82,21 +91,24 @@ The package bundles `BTdaemon`, `libBTstack.dylib`, and the BTstack launch daemo
 
 Showcase embeds Monocypher and LibTomMath for CarPlay cryptography. Users no longer need an OpenSSL package or repository.
 
-## Video quality
+## Video Quality
 
-With **Prefer Smooth Video** off (the default), Showcase requests a sharper
-30 fps stream, within the receiver's aspect ratio, native dimensions and a
-1080p pixel budget. For a 2048 × 1536 iPad with 1 GB of RAM, the requested
-stream is 1280 × 960 instead of 960 × 720 (78% more pixels).
-This is still below Retina resolution; the iPhone controls H.264 compression.
+Settings > Display sets the CarPlay stream. Reconnect CarPlay after a change.
 
-Enable **Prefer Smooth Video** if the larger stream causes stalls on your
-receiver or hotspot. This retains the previous lower-resolution profile.
-Reconnect CarPlay after changing the setting. The selected resolution and
-cadence appear on the About page and in the `display profile` log entry.
-The sharper profile was tested on an iPad Air (iPad4,1), iOS 12.5.7,
-with a user-reported improvement in sharpness and satisfactory 30 fps playback.
-Other receivers and wireless conditions still need on-device validation.
+- **Resolution** lists sizes that match the screen's aspect ratio, like the scaled resolutions macOS offers, up to 1920 pixels wide and 1080p worth of pixels. **Default** is sized from the receiver's memory and processor count.
+- **Frame Rate** is 30 or 60 fps. The default is 60, or 30 on receivers with HSIC Wi-Fi such as the iPad Air, which drop large bursts. About > Wi-Fi Bus shows yours.
+- **Prioritize Quality** uses the largest listed resolution at 60 fps.
+- **Prioritize Performance** uses about half the default's pixels at 30 fps, which roughly halves what each frame puts on the hotspot. It replaces Prefer Smooth Video and keeps that setting.
+
+Either priority grays out Resolution and Frame Rate; only one can be on. The About page and the `display profile` log line show what Showcase requested. The iPhone still decides the H.264 bitrate.
+
+The sharper stream started with [@edouaz](https://github.com/edouaz) in [#26](https://github.com/amineross/showcase/pull/26), tested on an iPad Air (iPad4,1) on iOS 12.5.7. `tests/test_display_profile.py` compiles the production selector and checks every mode across 576 receiver profiles.
+
+## Languages
+
+Showcase speaks English, French, Spanish, Simplified Chinese and Japanese. It follows the device's preferred languages; Settings > Language picks another one. iOS places and features use Apple's own names in each language.
+
+Translations live in `tools/localization/translations.py`. After changing a string or a translation, run `tools/localization/generate.py` to rewrite `source/Localizations/*.lproj`, then `tests/test_localization.py`.
 
 ## Source Layout
 
@@ -104,7 +116,12 @@ Other receivers and wireless conditions still need on-device validation.
 source/       app, Bluetooth helper, AirPlay helper, pairing code
 btstack-rootless/
               patched BTstack v1.1 iOS daemon source used by the rootless package
+source/Localizations/
+              generated translations
 packaging/    Debian control files, depictions, package scripts
+tweak/        BTQuiet, shipped only in the Taurine package
+tools/localization/
+              translation table and generator
 icon/         app icons
 ```
 
@@ -134,8 +151,11 @@ cd packaging
 ./scripts/fetch-installed-app.sh
 ./scripts/build-rootful-deb.sh
 ./scripts/build-rootless-deb.sh
+./scripts/build-taurine-deb.sh
 ./scripts/generate-apt-repo.py repo
 ```
+
+`build-taurine-deb.sh` builds `com.rostane.showcase-taurine` on the rootful device: Showcase compiled with `SHOWCASE_TAURINE`, the BTdaemon from `btstack-rootless/` and BTQuiet. It depends on iOS 14 and conflicts with the regular package, so other jailbreaks never get it. `VARIANT=taurine ./build_and_install.sh` installs the same app for testing.
 
 The `.deb` files land in `packaging/build/`. The APT repository lands in `packaging/repo/`.
 

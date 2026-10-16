@@ -17,4 +17,5 @@ Description: Wireless CarPlay receiver for rootless jailbreaks.
  receiver. This package uses the rootless layout under /var/jb and supports
  iOS 12 or newer.
  .
- Beta 4-3 fixes the false hotspot name warning on iOS 16 and newer.
+ Beta 5 adds a resolution and frame rate picker, Prioritize Quality and
+ Performance, and French, Spanish, Chinese and Japanese.

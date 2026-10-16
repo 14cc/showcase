@@ -16,3 +16,5 @@ evidence-*/
 
 source/*.o
 source/*.dSYM/
+
+build/

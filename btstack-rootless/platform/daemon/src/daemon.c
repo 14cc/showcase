@@ -2012,6 +2012,8 @@ static void btstack_server_configure_stack(void){
 }
 
 int btstack_server_run(int tcp_flag){
+    // launchd sends stdout to a file; keep the log readable after a kill.
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     if (tcp_flag){
         printf("BTstack Server started on port %u\n", BTSTACK_PORT);

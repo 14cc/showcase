@@ -49,6 +49,75 @@
 extern char **environ;
 
 /* ═══════════════════════════════════════════════════════════════
+ * Languages
+ *
+ * English strings are the keys; <language>.lproj/Localizable.strings in the
+ * app bundle holds the others. Showcase follows the device's preferred
+ * languages unless one is chosen in Settings. The app runs as root, whose
+ * preferences do not carry the user's languages, so mobile's are read.
+ * ═══════════════════════════════════════════════════════════════ */
+
+#define LANGUAGE_KEY @"appLanguage"
+#define MOBILE_GLOBAL_PREFERENCES @"/var/mobile/Library/Preferences/.GlobalPreferences.plist"
+
+static NSArray<NSString *> *showcase_languages(void) {
+    return @[@"en", @"fr", @"es", @"zh-Hans", @"ja"];
+}
+
+/* The language's own name, as iOS lists it. */
+static NSString *showcase_language_name(NSString *language) {
+    NSDictionary *names = @{@"en": @"English", @"fr": @"Français", @"es": @"Español",
+                            @"zh-Hans": @"简体中文", @"ja": @"日本語"};
+    return names[language] ?: language;
+}
+
+static NSString *showcase_device_language(void) {
+    NSArray *preferred = [NSDictionary dictionaryWithContentsOfFile:MOBILE_GLOBAL_PREFERENCES][@"AppleLanguages"];
+    if (![preferred isKindOfClass:[NSArray class]] || !preferred.count) preferred = [NSLocale preferredLanguages];
+    for (NSString *tag in preferred) {
+        if (![tag isKindOfClass:[NSString class]]) continue;
+        NSString *lower = tag.lowercaseString;
+        if ([lower hasPrefix:@"zh"]) return @"zh-Hans";
+        for (NSString *language in showcase_languages())
+            if ([lower isEqualToString:language] || [lower hasPrefix:[language stringByAppendingString:@"-"]])
+                return language;
+    }
+    return @"en";
+}
+
+static NSBundle *g_language_bundle;
+static BOOL g_language_loaded;
+
+/* The chosen language, or nil to follow the device. */
+static NSString *showcase_chosen_language(void) {
+    NSString *chosen = [[NSUserDefaults standardUserDefaults] stringForKey:LANGUAGE_KEY];
+    return [showcase_languages() containsObject:chosen] ? chosen : nil;
+}
+
+static NSString *showcase_language(void) {
+    return showcase_chosen_language() ?: showcase_device_language();
+}
+
+static void showcase_set_language(NSString *language) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (language) [d setObject:language forKey:LANGUAGE_KEY];
+    else [d removeObjectForKey:LANGUAGE_KEY];
+    [d synchronize];
+    g_language_loaded = NO;
+}
+
+static NSString *L(NSString *english) {
+    if (!g_language_loaded) {
+        NSString *language = showcase_language();
+        NSString *path = [language isEqualToString:@"en"] ? nil
+            : [[NSBundle mainBundle] pathForResource:language ofType:@"lproj"];
+        g_language_bundle = path ? [NSBundle bundleWithPath:path] : nil;
+        g_language_loaded = YES;
+    }
+    return g_language_bundle ? [g_language_bundle localizedStringForKey:english value:english table:nil] : english;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * Application logger
  * ═══════════════════════════════════════════════════════════════ */
 
@@ -61,6 +130,10 @@ extern char **environ;
 #define RECEIVER_AUDIO_KEY      @"receiverAudioEnabled"
 #define RIGHT_HAND_DRIVE_KEY    @"rightHandDriveDock"
 #define SMOOTH_VIDEO_KEY        @"preferSmoothVideo"
+#define QUALITY_VIDEO_KEY       @"prioritizeVideoQuality"
+#define VIDEO_WIDTH_KEY         @"videoWidth"
+#define VIDEO_HEIGHT_KEY        @"videoHeight"
+#define VIDEO_FPS_KEY           @"videoFramesPerSecond"
 #define AUTO_START_KEY          @"startCarPlayOnLaunch"
 #define DEDICATED_RADIO_KEY     @"leaveOtherWiFiDuringCarPlay"
 #define HELD_WIFI_NETWORK_KEY   @"heldWiFiNetworkSSID"
@@ -249,6 +322,17 @@ static int run_blocking(const char *path, char *const argv[]);
 #define BT_GUARD_DIR "/var/root/Library/ShowcaseBluetooth"
 #define BT_GUARD_PLIST BT_GUARD_DIR "/recovery.plist"
 #define BT_GUARD_READY BT_GUARD_DIR "/ready"
+/* Exists while BTstack owns the controller; the Taurine package's BTQuiet
+ * throttles Bluetooth clients' reconnects only then. /tmp is emptied at boot. */
+#define BT_OWNED_FLAG "/tmp/showcase_bt_owned"
+#ifdef SHOWCASE_TAURINE
+/* Controller init takes about thirty seconds on an A10 iPad on iOS 14. */
+#define BT_READY_SECONDS 45
+#define BT_RETRY_READY_SECONDS 45
+#else
+#define BT_READY_SECONDS 12
+#define BT_RETRY_READY_SECONDS 20
+#endif
 
 static void stop_bluetooth_guard(void) {
     const char *ctl = launchctl_path();
@@ -277,13 +361,15 @@ static BOOL start_bluetooth_guard(void) {
          "\"$2\" unload \"$3\"; "
          "rm -f \"$8\"; "
          "\"$2\" load \"$4\"; \"$2\" load \"$5\"; "
+         "rm -f \"$9\"; "
          "rm -f \"$6\"";
     NSDictionary *job = @{
         @"Label": @"com.reng.showcase.bluetooth-recovery",
         @"ProgramArguments": @[@JB_PATH("/bin/sh"), @"-c", script,
             @"showcase-bluetooth-recovery", [NSString stringWithFormat:@"%d", getpid()],
             @(ctl), @BTSTACK_PLIST, @BLUETOOL_PLIST, @BLUETOOTHD_PLIST,
-            @BT_GUARD_READY, @JB_PATH("/usr/bin/killall"), @BTSTACK_SOCKET],
+            @BT_GUARD_READY, @JB_PATH("/usr/bin/killall"), @BTSTACK_SOCKET,
+            @BT_OWNED_FLAG],
         @"RunAtLoad": @YES,
         @"EnvironmentVariables": @{@"PATH": @JB_PATH("/usr/bin") ":" JB_PATH("/bin") ":/usr/bin:/bin"},
         @"StandardOutPath": @LOG_DIR "/bluetooth-recovery.log",
@@ -310,6 +396,7 @@ static void restore_system_bluetooth(const char *reason) {
                                (char *)BLUETOOTHD_PLIST, NULL };
     int toolRc = run_blocking(launchctl, loadBlueTool);
     int daemonRc = run_blocking(launchctl, loadBluetoothd);
+    unlink(BT_OWNED_FLAG);
     ip_log("[BT] system Bluetooth load requested (%s): BlueTool=%d bluetoothd=%d",
            reason, toolRc, daemonRc);
     stop_bluetooth_guard();
@@ -885,86 +972,211 @@ static CarPlayWLANAttachment wlan_attachment_class(void) {
     }
 }
 
-static CarPlayDisplayProfile preferred_carplay_display_profile(BOOL preferSmooth) {
-    UIScreen *screen = [UIScreen mainScreen];
-    CGSize nativeSize = [screen respondsToSelector:@selector(nativeBounds)]
-        ? screen.nativeBounds.size
-        : CGSizeMake(screen.bounds.size.width * screen.scale,
-                     screen.bounds.size.height * screen.scale);
-    double nativeLong = MAX(nativeSize.width, nativeSize.height);
-    double nativeShort = MIN(nativeSize.width, nativeSize.height);
-    double aspect = nativeShort > 0 ? nativeLong / nativeShort : (5.0 / 3.0);
+/* BEGIN display selector: plain C, compiled by tests/test_display_profile.py */
+#define CARPLAY_MAX_WIDTH 1920
+#define CARPLAY_MAX_PIXELS (1920ULL * 1080ULL)
+#define CARPLAY_MAX_OPTIONS 8
 
-    NSProcessInfo *process = [NSProcessInfo processInfo];
-    uint64_t memory = process.physicalMemory;
-    NSUInteger processors = process.activeProcessorCount;
-    NSInteger screenFPS = [screen respondsToSelector:
-        @selector(maximumFramesPerSecond)] ? screen.maximumFramesPerSecond : 60;
-    uint16_t framesPerSecond = (uint16_t)MAX(30, MIN(screenFPS, 60));
-    CarPlayWLANAttachment wlanAttachment = wlan_attachment_class();
-    if (wlanAttachment == CarPlayWLANAttachmentHSIC)
-        framesPerSecond = MIN(framesPerSecond, 30);
+typedef struct { uint16_t width, height; } CarPlayVideoSize;
 
-    /* Keep the proven low-bandwidth budgets for smooth mode. Normal mode
-     * spends more pixels on text and map detail at 30 fps, capped at 1080p. */
+typedef enum {
+    CarPlayVideoCustom = 0,
+    CarPlayVideoQuality,
+    CarPlayVideoPerformance,
+} CarPlayVideoPriority;
+
+/* The stream is sized from the receiver's screen and capability, never from
+ * jailbreak layout. One-gigabyte devices share memory bandwidth between
+ * UIKit, VideoToolbox, the CarPlay service and the hotspot, so they default
+ * to a 960x720-class stream; two gigabytes and above to 720p-class. */
+static uint64_t carplay_default_budget(double nativeLong, double nativeShort,
+                                       uint64_t memory, unsigned processors) {
     uint64_t pixelBudget = 960ULL * 720ULL;
     if (memory >= 1536ULL * 1024ULL * 1024ULL)
         pixelBudget = 1280ULL * 720ULL;
     if (memory >= 3ULL * 1024ULL * 1024ULL * 1024ULL && processors >= 4)
         pixelBudget = 1600ULL * 900ULL;
     if (memory >= 4ULL * 1024ULL * 1024ULL * 1024ULL && processors >= 6)
-        pixelBudget = 1920ULL * 1080ULL;
+        pixelBudget = CARPLAY_MAX_PIXELS;
     uint64_t nativePixels = (uint64_t)nativeLong * (uint64_t)nativeShort;
     if (nativePixels > 0 && pixelBudget > nativePixels)
         pixelBudget = nativePixels;
-    if (preferSmooth) {
-        pixelBudget = MAX(640ULL * 384ULL, (pixelBudget * 9ULL) / 16ULL);
-    } else {
-        pixelBudget = MIN((pixelBudget * 16ULL) / 9ULL,
-                          1920ULL * 1080ULL);
-    }
-    framesPerSecond = MIN(framesPerSecond, 30);
-    if (nativePixels > 0 && pixelBudget > nativePixels)
-        pixelBudget = nativePixels;
+    return pixelBudget;
+}
 
-    /* Search codec-friendly 16-pixel dimensions. The score rewards using
-     * the available decode budget but penalizes aspect error heavily, so the
-     * selected stream fills the physical display without stretching. */
-    uint16_t bestWidth = 800;
-    uint16_t bestHeight = 480;
+/* Codec-friendly 16-pixel dimensions. The score rewards using the budget but
+ * penalizes aspect error heavily, so the stream fills the screen unstretched. */
+static CarPlayVideoSize carplay_fit(double nativeLong, double nativeShort, uint64_t pixelBudget) {
+    double aspect = nativeShort > 0 ? nativeLong / nativeShort : (5.0 / 3.0);
+    CarPlayVideoSize best = {800, 480};
     double bestScore = -DBL_MAX;
-    uint16_t maxWidth = (uint16_t)(floor(MIN(nativeLong, 1920.0) / 16.0) * 16.0);
-    for (uint16_t candidateWidth = 640;
-         candidateWidth <= maxWidth;
-         candidateWidth = (uint16_t)(candidateWidth + 16)) {
-        uint16_t candidateHeight = (uint16_t)(
-            floor(((candidateWidth / aspect) / 16.0) + 0.5) * 16.0);
-        if (candidateHeight < 360 || candidateHeight > nativeShort) continue;
-        uint64_t pixels = (uint64_t)candidateWidth * candidateHeight;
+    uint16_t maxWidth = (uint16_t)(floor(MIN(nativeLong, (double)CARPLAY_MAX_WIDTH) / 16.0) * 16.0);
+    for (uint16_t width = 640; width <= maxWidth; width = (uint16_t)(width + 16)) {
+        uint16_t height = (uint16_t)(floor(((width / aspect) / 16.0) + 0.5) * 16.0);
+        if (height < 360 || height > nativeShort) continue;
+        uint64_t pixels = (uint64_t)width * height;
         if (pixels > pixelBudget) continue;
-        double candidateAspect =
-            (double)candidateWidth / (double)candidateHeight;
-        double aspectError = fabs(candidateAspect - aspect) / aspect;
-        double budgetUse = pixelBudget > 0
-            ? (double)pixels / (double)pixelBudget : 0;
-        double score = budgetUse - (aspectError * 10.0);
+        double aspectError = fabs((double)width / height - aspect) / aspect;
+        double score = (pixelBudget ? (double)pixels / (double)pixelBudget : 0) - aspectError * 10.0;
         if (score > bestScore) {
             bestScore = score;
-            bestWidth = candidateWidth;
-            bestHeight = candidateHeight;
+            best.width = width;
+            best.height = height;
         }
     }
+    return best;
+}
 
+/* The resolutions offered in Settings, largest first, like the scaled
+ * resolutions macOS lists for a display. Each step has about half to
+ * two-thirds of the previous one's pixels and takes the size closest to the
+ * screen's aspect ratio there (within 1%). The default is always listed, and
+ * a size within a fifth of its pixels is left out. Returns how many. */
+static unsigned carplay_resolution_options(double nativeLong, double nativeShort, CarPlayVideoSize fallback,
+                                           CarPlayVideoSize out[CARPLAY_MAX_OPTIONS]) {
+    double aspect = nativeShort > 0 ? nativeLong / nativeShort : (5.0 / 3.0);
+    uint16_t maxWidth = (uint16_t)(floor(MIN(nativeLong, (double)CARPLAY_MAX_WIDTH) / 16.0) * 16.0);
+    CarPlayVideoSize candidates[128];
+    double errors[128];
+    unsigned found = 0;
+    for (uint16_t width = maxWidth; width >= 640 && found < 128; width = (uint16_t)(width - 16)) {
+        uint16_t height = (uint16_t)(floor(((width / aspect) / 16.0) + 0.5) * 16.0);
+        double error = fabs((double)width / height - aspect) / aspect;
+        if (height < 360 || height > nativeShort || (uint64_t)width * height > CARPLAY_MAX_PIXELS || error > 0.01)
+            continue;
+        candidates[found].width = width;
+        candidates[found].height = height;
+        errors[found++] = error;
+    }
+    uint64_t fallbackPixels = (uint64_t)fallback.width * fallback.height;
+    unsigned count = 0;
+    uint64_t ceiling = found ? (uint64_t)candidates[0].width * candidates[0].height : 0;
+    uint64_t floor_ = ceiling * 8 / 10;
+    while (count < CARPLAY_MAX_OPTIONS - 1) {
+        int best = -1;
+        for (unsigned i = 0; i < found; i++) {
+            uint64_t pixels = (uint64_t)candidates[i].width * candidates[i].height;
+            if (pixels > ceiling || pixels <= floor_) continue;
+            if (best < 0 || errors[i] < errors[best] - 1e-9) best = (int)i;
+        }
+        if (best < 0) break;
+        uint64_t pixels = (uint64_t)candidates[best].width * candidates[best].height;
+        if (pixels * 5 >= fallbackPixels * 6 || pixels * 5 <= fallbackPixels * 4)
+            out[count++] = candidates[best];
+        ceiling = pixels * 2 / 3;
+        floor_ = pixels / 2;
+    }
+    unsigned at = 0;
+    while (at < count && (uint64_t)out[at].width * out[at].height > fallbackPixels) at++;
+    for (unsigned i = count; i > at; i--) out[i] = out[i - 1];
+    out[at] = fallback;
+    return count + 1;
+}
+
+/* Default: the hardware budget at the screen's rate. Quality: the largest
+ * offered size at up to 60 fps. Performance: about half the default's pixels
+ * at 30 fps, which roughly halves the bytes each frame puts on the hotspot
+ * link. Custom: the chosen size and rate when they are still offered. */
+static CarPlayVideoSize carplay_select_video(double nativeLong, double nativeShort, uint64_t memory,
+                                             unsigned processors, uint16_t defaultFPS, uint16_t screenFPS,
+                                             CarPlayVideoPriority priority, CarPlayVideoSize chosen,
+                                             uint16_t chosenFPS, uint16_t *fps, uint64_t *budget) {
+    uint64_t pixelBudget = carplay_default_budget(nativeLong, nativeShort, memory, processors);
+    CarPlayVideoSize fallback = carplay_fit(nativeLong, nativeShort, pixelBudget);
+    CarPlayVideoSize options[CARPLAY_MAX_OPTIONS];
+    unsigned count = carplay_resolution_options(nativeLong, nativeShort, fallback, options);
+    CarPlayVideoSize size = fallback;
+    *fps = defaultFPS;
+    if (priority == CarPlayVideoQuality) {
+        size = options[0];
+        *fps = (uint16_t)MAX(30, MIN(screenFPS, 60));
+        pixelBudget = (uint64_t)size.width * size.height;
+    } else if (priority == CarPlayVideoPerformance) {
+        pixelBudget = MAX(640ULL * 384ULL, (pixelBudget * 9ULL) / 16ULL);
+        size = carplay_fit(nativeLong, nativeShort, pixelBudget);
+        *fps = MIN(defaultFPS, 30);
+    } else {
+        for (unsigned i = 0; i < count; i++)
+            if (options[i].width == chosen.width && options[i].height == chosen.height) {
+                size = chosen;
+                pixelBudget = (uint64_t)size.width * size.height;
+            }
+        if (chosenFPS == 30 || (chosenFPS == 60 && screenFPS >= 60)) *fps = chosenFPS;
+    }
+    *budget = pixelBudget;
+    return size;
+}
+/* END display selector */
+
+/* The receiver's screen and capability. The Wi-Fi bus probe runs ioreg, so
+ * the answer is kept for the life of the app. */
+typedef struct {
+    double nativeLong, nativeShort;
+    uint64_t memory;
+    unsigned processors;
+    uint16_t screenFPS, defaultFPS;
+    CarPlayWLANAttachment wlanAttachment;
+} CarPlayDisplayHardware;
+
+static CarPlayDisplayHardware carplay_display_hardware(void) {
+    static CarPlayDisplayHardware hardware;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        UIScreen *screen = [UIScreen mainScreen];
+        CGSize nativeSize = [screen respondsToSelector:@selector(nativeBounds)]
+            ? screen.nativeBounds.size
+            : CGSizeMake(screen.bounds.size.width * screen.scale,
+                         screen.bounds.size.height * screen.scale);
+        hardware.nativeLong = MAX(nativeSize.width, nativeSize.height);
+        hardware.nativeShort = MIN(nativeSize.width, nativeSize.height);
+        NSProcessInfo *process = [NSProcessInfo processInfo];
+        hardware.memory = process.physicalMemory;
+        hardware.processors = (unsigned)process.activeProcessorCount;
+        NSInteger screenFPS = [screen respondsToSelector:@selector(maximumFramesPerSecond)]
+            ? screen.maximumFramesPerSecond : 60;
+        hardware.screenFPS = (uint16_t)MAX(30, MIN(screenFPS, 60));
+        hardware.wlanAttachment = wlan_attachment_class();
+        /* HSIC-attached Wi-Fi drops bursts; 30 fps halves them. */
+        hardware.defaultFPS = hardware.wlanAttachment == CarPlayWLANAttachmentHSIC
+            ? 30 : hardware.screenFPS;
+    });
+    return hardware;
+}
+
+static CarPlayVideoPriority carplay_video_priority(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if ([d boolForKey:QUALITY_VIDEO_KEY]) return CarPlayVideoQuality;
+    if ([d boolForKey:SMOOTH_VIDEO_KEY]) return CarPlayVideoPerformance;
+    return CarPlayVideoCustom;
+}
+
+static unsigned carplay_offered_resolutions(CarPlayVideoSize out[CARPLAY_MAX_OPTIONS], CarPlayVideoSize *fallback) {
+    CarPlayDisplayHardware h = carplay_display_hardware();
+    *fallback = carplay_fit(h.nativeLong, h.nativeShort,
+        carplay_default_budget(h.nativeLong, h.nativeShort, h.memory, h.processors));
+    return carplay_resolution_options(h.nativeLong, h.nativeShort, *fallback, out);
+}
+
+static CarPlayDisplayProfile preferred_carplay_display_profile(void) {
+    CarPlayDisplayHardware h = carplay_display_hardware();
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    CarPlayVideoSize chosen = {
+        (uint16_t)[d integerForKey:VIDEO_WIDTH_KEY], (uint16_t)[d integerForKey:VIDEO_HEIGHT_KEY]};
+    uint16_t fps = 0;
+    uint64_t budget = 0;
+    CarPlayVideoSize size = carplay_select_video(h.nativeLong, h.nativeShort, h.memory, h.processors,
+        h.defaultFPS, h.screenFPS, carplay_video_priority(), chosen,
+        (uint16_t)[d integerForKey:VIDEO_FPS_KEY], &fps, &budget);
     CarPlayDisplayProfile profile = {
-        .width = bestWidth,
-        .height = bestHeight,
-        .nativeLong = (uint16_t)nativeLong,
-        .nativeShort = (uint16_t)nativeShort,
-        .pixelBudget = pixelBudget,
-        .physicalMemory = memory,
-        .activeProcessors = processors,
-        .framesPerSecond = framesPerSecond,
-        .wlanAttachment = wlanAttachment,
+        .width = size.width,
+        .height = size.height,
+        .nativeLong = (uint16_t)h.nativeLong,
+        .nativeShort = (uint16_t)h.nativeShort,
+        .pixelBudget = budget,
+        .physicalMemory = h.memory,
+        .activeProcessors = h.processors,
+        .framesPerSecond = fps,
+        .wlanAttachment = h.wlanAttachment,
     };
     return profile;
 }
@@ -1563,6 +1775,32 @@ static void signal_processes_named(const char *name, int sig, pid_t preservedPid
     free(procs);
 }
 
+#ifdef SHOWCASE_TAURINE
+static BOOL process_named_running(const char *name) {
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t len = 0;
+    if (sysctl(mib, 4, NULL, &len, NULL, 0) != 0 || len == 0) return NO;
+    struct kinfo_proc *procs = malloc(len);
+    if (!procs) return NO;
+    BOOL found = NO;
+    if (sysctl(mib, 4, procs, &len, NULL, 0) == 0) {
+        int count = (int)(len / sizeof(struct kinfo_proc));
+        for (int i = 0; i < count && !found; i++)
+            found = procs[i].kp_proc.p_pid > 0 && !strcmp(procs[i].kp_proc.p_comm, name);
+    }
+    free(procs);
+    return found;
+}
+#endif
+
+#if !defined(SHOWCASE_TAURINE) && !defined(SHOWCASE_ROOTLESS)
+/* Taurine marks its install at the root and keeps jailbreakd in /taurine. */
+static BOOL showcase_on_taurine(void) {
+    return [[NSProcessInfo processInfo] operatingSystemVersion].majorVersion == 14 &&
+        (access("/.installed_taurine", F_OK) == 0 || access("/taurine", F_OK) == 0);
+}
+#endif
+
 static void reap_stale_helpers(pid_t preservedPid) {
     const char *names[] = {
         "carplay_services",
@@ -1627,16 +1865,16 @@ static void reap_stale_helpers(pid_t preservedPid) {
  * Returns nil if valid, otherwise human-readable error message.
  * ────────────────────────────────────────────────────────────── */
 static NSString *validateSSID(NSString *ssid) {
-    if (ssid.length == 0) return @"Wi-Fi network is required.";
+    if (ssid.length == 0) return L(@"Wi-Fi network is required.");
     if (ssid.length < 6) {
-        return @"Wi-Fi name must be at least 6 characters. iOS rejects shorter names for CarPlay.";
+        return L(@"Wi-Fi name must be at least 6 characters. iOS rejects shorter names for CarPlay.");
     }
     NSString *lower = [ssid lowercaseString];
     NSArray *forbidden = @[@"ipad", @"iphone", @"ipod"];
     for (NSString *bad in forbidden) {
         if ([lower rangeOfString:bad].location != NSNotFound) {
             return [NSString stringWithFormat:
-                @"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name.",
+                L(@"Wi-Fi name cannot contain \"%@\". Rename this %@ in Settings › General › About › Name."),
                 bad, UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad ? @"iPad" : @"iPhone"];
         }
     }
@@ -2338,7 +2576,7 @@ static OSStatus carplay_aac_input_callback(
     self.diagnosticCopyButton.backgroundColor = [UIColor whiteColor];
     [self.diagnosticCopyButton setTitleColor:[UIColor blackColor]
                                     forState:UIControlStateNormal];
-    [self.diagnosticCopyButton setTitle:@"Copy Diagnostic"
+    [self.diagnosticCopyButton setTitle:L(@"Copy Diagnostic")
                                forState:UIControlStateNormal];
     self.diagnosticCopyButton.titleLabel.font =
         [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
@@ -2351,7 +2589,7 @@ static OSStatus carplay_aac_input_callback(
     self.closeButton.backgroundColor = [UIColor colorWithWhite:1 alpha:0.13];
     [self.closeButton setTitleColor:[UIColor whiteColor]
                            forState:UIControlStateNormal];
-    [self.closeButton setTitle:@"Close" forState:UIControlStateNormal];
+    [self.closeButton setTitle:L(@"Close") forState:UIControlStateNormal];
     self.closeButton.titleLabel.font =
         [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
     self.closeButton.layer.cornerRadius = 9;
@@ -2393,7 +2631,7 @@ static OSStatus carplay_aac_input_callback(
 
 - (void)copyDiagnostic {
     [UIPasteboard generalPasteboard].string = self.diagnostic ?: @"";
-    [self.diagnosticCopyButton setTitle:@"Copied"
+    [self.diagnosticCopyButton setTitle:L(@"Copied")
                                forState:UIControlStateNormal];
 }
 
@@ -2869,6 +3107,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         AUTO_START_KEY: @YES
     }];
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
+    /* Settings reads the display hardware; probe the Wi-Fi bus off the main thread now. */
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ carplay_display_hardware(); });
     /* A session that ended without stopFlow may have left a network paused. */
     dispatch_async(self.bgQueue, ^{
         stop_bluetooth_guard();
@@ -3280,7 +3520,7 @@ static pid_t reusable_baa_broker(void) {
     self.settingsButton.tintColor = [UIColor whiteColor];
     [self.settingsButton setImage:showcase_gear_image(22) forState:UIControlStateNormal];
     self.settingsButton.adjustsImageWhenHighlighted = YES;
-    self.settingsButton.accessibilityLabel = @"Settings";
+    self.settingsButton.accessibilityLabel = L(@"Settings");
     [self.settingsButton addTarget:self action:@selector(settingsTapped) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:self.settingsButton];
 
@@ -3373,8 +3613,8 @@ static pid_t reusable_baa_broker(void) {
 
 - (void)updateConnectSteps {
     self.stepsView.pendingTitles = @[
-        @"Bluetooth", @"CarPlay services", @"iPhone", @"Verification",
-        @"Hotspot details", @"Wi-Fi", @"Pairing", @"CarPlay", @"Video"
+        @"Bluetooth", L(@"CarPlay services"), @"iPhone", L(@"Verification"),
+        L(@"Hotspot details"), @"Wi-Fi", L(@"Pairing"), @"CarPlay", L(@"Video")
     ];
     self.stepsView.doneTitles = self.stepsView.pendingTitles;
     self.stepsView.completed = self.connectCompleted;
@@ -3406,7 +3646,7 @@ static pid_t reusable_baa_broker(void) {
     self.secondaryButton.hidden = YES;
 
     Car *sel = self.cars.selected;
-    NSString *carName = sel.name.length ? sel.name : @"your car";
+    NSString *carName = sel.name.length ? sel.name : L(@"your car");
 
     switch (self.state) {
         case StateIdle: {
@@ -3415,21 +3655,21 @@ static pid_t reusable_baa_broker(void) {
 
             if (!apReady) {
                 /* First run: Wi-Fi setup is the headline action. */
-                self.headlineLabel.text = @"Welcome";
-                [self.primaryButton setTitle:@"Set Up Wi-Fi" forState:UIControlStateNormal];
+                self.headlineLabel.text = L(@"Welcome");
+                [self.primaryButton setTitle:L(@"Set Up Wi-Fi") forState:UIControlStateNormal];
             } else {
                 if (self.baaLoading) {
-                    self.headlineLabel.text = @"Preparing";
-                    [self.primaryButton setTitle:@"Preparing…" forState:UIControlStateNormal];
+                    self.headlineLabel.text = L(@"Preparing");
+                    [self.primaryButton setTitle:L(@"Preparing…") forState:UIControlStateNormal];
                     self.primaryButton.enabled = NO;
                     self.primaryButton.alpha = 0.55;
                 } else if (!self.baaReady) {
-                    self.headlineLabel.text = @"Connect to the Internet";
-                    [self.primaryButton setTitle:@"Try Again"
+                    self.headlineLabel.text = L(@"Connect to the Internet");
+                    [self.primaryButton setTitle:L(@"Try Again")
                                        forState:UIControlStateNormal];
                 } else {
-                    self.headlineLabel.text = @"Wireless CarPlay";
-                    [self.primaryButton setTitle:@"Start CarPlay"
+                    self.headlineLabel.text = L(@"Wireless CarPlay");
+                    [self.primaryButton setTitle:L(@"Start CarPlay")
                                        forState:UIControlStateNormal];
                 }
             }
@@ -3438,30 +3678,30 @@ static pid_t reusable_baa_broker(void) {
 
         case StateAwaitingAP:
             if (!self.hotspotManual) {
-                self.headlineLabel.text = @"Starting Personal Hotspot";
+                self.headlineLabel.text = L(@"Starting Personal Hotspot");
                 self.spinner.hidden = NO;
                 [self.spinner startAnimating];
             } else {
-                self.headlineLabel.text = @"Turn On Personal Hotspot";
-                [self.primaryButton setTitle:@"Open Settings" forState:UIControlStateNormal];
+                self.headlineLabel.text = L(@"Turn On Personal Hotspot");
+                [self.primaryButton setTitle:L(@"Open Settings") forState:UIControlStateNormal];
                 self.primaryButton.hidden = NO;
             }
-            [self.secondaryButton setTitle:@"Cancel" forState:UIControlStateNormal];
+            [self.secondaryButton setTitle:L(@"Cancel") forState:UIControlStateNormal];
             self.secondaryButton.hidden = NO;
             break;
 
         case StatePreparingBT:
         case StatePreparingNet:
-            self.headlineLabel.text = @"Getting Ready";
+            self.headlineLabel.text = L(@"Getting Ready");
             [self updateConnectSteps];
             break;
 
         case StateAwaitingPhone:
             self.headlineLabel.text = self.connectCompleted >= ConnectStepPhoneBluetooth
-                ? @"Connecting"
-                : [NSString stringWithFormat:@"Choose %@ in CarPlay on your iPhone", carName];
+                ? L(@"Connecting")
+                : [NSString stringWithFormat:L(@"Choose %@ in CarPlay on your iPhone"), carName];
             [self updateConnectSteps];
-            [self.secondaryButton setTitle:@"Cancel" forState:UIControlStateNormal];
+            [self.secondaryButton setTitle:L(@"Cancel") forState:UIControlStateNormal];
             self.secondaryButton.hidden = NO;
             break;
 
@@ -3480,7 +3720,7 @@ static pid_t reusable_baa_broker(void) {
             break;
 
         case StateStopping:
-            self.headlineLabel.text = @"Stopping";
+            self.headlineLabel.text = L(@"Stopping");
             self.spinner.hidden = NO; [self.spinner startAnimating];
             break;
     }
@@ -3896,7 +4136,6 @@ static pid_t reusable_baa_broker(void) {
 
     reap_stale_helpers(self.baaBrokerPid);
 
-    /* 1. Unload bluetoothd */
     const char *launchctl = launchctl_path();
     if (!launchctl) {
         [self failBluetoothWithReason:@"launchctl was not found."
@@ -3909,6 +4148,20 @@ static pid_t reusable_baa_broker(void) {
                              unsupported:NO];
         return;
     }
+#ifdef SHOWCASE_TAURINE
+    /* 1. Start the bundled BTstack daemon while launchd still spawns jobs.
+     * On iOS 14 (Taurine) unloading bluetoothd leaves the unload "in
+     * progress" while mediaserverd and others retry the vanished Bluetooth
+     * services; launchd then stops spawning anything, so an on-demand
+     * BTdaemon would hang in xpcproxy and never answer. The daemon only
+     * touches the UART when a client powers it on. */
+    if (![self startBTstackDaemon:launchctl]) return;
+
+    /* 2. Release the UART: bluetoothd holds it (EBUSY) even with Bluetooth
+     * off, and BlueTool owns it on iOS 14 and newer. */
+    [self stopSystemBluetooth:launchctl];
+#else
+    /* 1. Unload bluetoothd */
     char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
                            (char*)BLUETOOTHD_PLIST, NULL };
     int rc = run_blocking(launchctl, unloadArgv);
@@ -3943,6 +4196,7 @@ static pid_t reusable_baa_broker(void) {
         return;
     }
     self.btdaemonPid = 0;
+#endif
 
     /* 3. Spawn carplay_bt with car name + global AP creds */
     char nameBuf[64], ssidBuf[128], passBuf[128];
@@ -3970,7 +4224,7 @@ static pid_t reusable_baa_broker(void) {
                              unsupported:YES];
         return;
     }
-    if (!wait_for_bt_ready_or_exit(self.carplayBtPid, 12)) {
+    if (!wait_for_bt_ready_or_exit(self.carplayBtPid, BT_READY_SECONDS)) {
         /* On some rootless boots BlueTool releases the controller after its
          * launchd job has already exited. BTstack then accepts a client and
          * its power command, but emits no HCI events. A complete daemon/client
@@ -3980,6 +4234,25 @@ static pid_t reusable_baa_broker(void) {
         self.bluetoothRetryAttempted = YES;
         kill_pid(self.carplayBtPid);
         self.carplayBtPid = 0;
+#ifdef SHOWCASE_TAURINE
+        /* Bring Apple's Bluetooth back first so launchd can spawn the
+         * daemon again. */
+        char *loadBlueToolArgv[] = { (char*)"launchctl", (char*)"load",
+                                     (char*)BLUETOOL_PLIST, NULL };
+        char *loadArgv[] = { (char*)"launchctl", (char*)"load",
+                             (char*)BLUETOOTHD_PLIST, NULL };
+        run_blocking(launchctl, loadBlueToolArgv);
+        run_blocking(launchctl, loadArgv);
+        unlink(BT_OWNED_FLAG);
+        sleep(2);
+        if ([self startBTstackDaemon:launchctl]) {
+            [self stopSystemBluetooth:launchctl];
+            unlink(BT_READY_PATH);
+            self.carplayBtPid =
+                spawn_daemon([btPath UTF8String], btArgv,
+                             LOG_DIR "/carplay_bt-retry.log");
+        }
+#else
         run_blocking(launchctl, unloadBTstackArgv);
         unlink(BTSTACK_SOCKET);
         sleep(2);
@@ -3991,8 +4264,9 @@ static pid_t reusable_baa_broker(void) {
                 spawn_daemon([btPath UTF8String], btArgv,
                              LOG_DIR "/carplay_bt-retry.log");
         }
+#endif
         if (self.carplayBtPid <= 0 ||
-            !wait_for_bt_ready_or_exit(self.carplayBtPid, 20)) {
+            !wait_for_bt_ready_or_exit(self.carplayBtPid, BT_RETRY_READY_SECONDS)) {
             [self failBluetoothWithReason:
                 @"Bluetooth takeover failed after one clean retry; no HCI "
                  "controller-ready event was received."
@@ -4005,6 +4279,61 @@ static pid_t reusable_baa_broker(void) {
     [self bgPrepareNet];
 }
 
+#ifdef SHOWCASE_TAURINE
+- (BOOL)startBTstackDaemon:(const char *)launchctl {
+    char *unloadBTstackArgv[] = { (char*)"launchctl", (char*)"unload",
+                                  (char*)BTSTACK_PLIST, NULL };
+    char *loadBTstackArgv[] = { (char*)"launchctl", (char*)"load",
+                                (char*)BTSTACK_PLIST, NULL };
+    char *startBTstackArgv[] = { (char*)"launchctl", (char*)"start",
+                                 (char*)"ch.ringwald.BTstack", NULL };
+    run_blocking(launchctl, unloadBTstackArgv);
+    signal_processes_named("BTdaemon", SIGKILL, 0);
+    unlink(BTSTACK_SOCKET);
+    if (run_blocking(launchctl, loadBTstackArgv) != 0) {
+        [self failBluetoothWithReason:
+            @"The BTstack launch daemon failed to load."
+                             unsupported:NO];
+        return NO;
+    }
+    if (!wait_for_path(BTSTACK_SOCKET, 8, "BTstack socket")) {
+        [self failBluetoothWithReason:
+            @"The BTstack daemon did not create its control socket."
+                             unsupported:NO];
+        return NO;
+    }
+    run_blocking(launchctl, startBTstackArgv);
+    for (int i = 0; i < 50 && !process_named_running("BTdaemon"); i++)
+        usleep(100000);
+    if (!process_named_running("BTdaemon")) {
+        [self failBluetoothWithReason:
+            @"The BTstack daemon did not start."
+                             unsupported:NO];
+        return NO;
+    }
+    ip_log("[BT] BTdaemon running before system Bluetooth stops");
+    self.btdaemonPid = 0;
+    return YES;
+}
+
+- (void)stopSystemBluetooth:(const char *)launchctl {
+    int flag = open(BT_OWNED_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (flag >= 0) close(flag);
+    char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
+                           (char*)BLUETOOTHD_PLIST, NULL };
+    int rc = run_blocking(launchctl, unloadArgv);
+    if (rc != 0) ip_log("  WARNING: launchctl unload returned %d", rc);
+    char *unloadBlueToolArgv[] = { (char*)"launchctl", (char*)"unload",
+                                   (char*)BLUETOOL_PLIST, NULL };
+    rc = run_blocking(launchctl, unloadBlueToolArgv);
+    if (rc != 0) ip_log("  WARNING: BlueTool unload returned %d", rc);
+    /* An unload can stay in progress; make sure the UART is free. */
+    signal_processes_named("bluetoothd", SIGKILL, 0);
+    signal_processes_named("BlueTool", SIGKILL, 0);
+    sleep(2);
+}
+#endif
+
 - (void)bgPrepareNet {
     NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
     NSString *svcPath = [bundlePath stringByAppendingPathComponent:@SVC_HELPER_NAME];
@@ -4015,14 +4344,13 @@ static pid_t reusable_baa_broker(void) {
 
     char nameBuf[64];
     char widthBuf[16], heightBuf[16], fpsBuf[16], receiveBufferBuf[16];
-    BOOL preferSmooth = [[NSUserDefaults standardUserDefaults]
-        boolForKey:SMOOTH_VIDEO_KEY];
+    CarPlayVideoPriority priority = carplay_video_priority();
     BOOL receiverAudio = [[NSUserDefaults standardUserDefaults]
         boolForKey:RECEIVER_AUDIO_KEY];
     BOOL rightHandDrive = [[NSUserDefaults standardUserDefaults]
         boolForKey:RIGHT_HAND_DRIVE_KEY];
     CarPlayDisplayProfile display =
-        preferred_carplay_display_profile(preferSmooth);
+        preferred_carplay_display_profile();
     uint16_t displayWidth = display.width;
     uint16_t displayHeight = display.height;
     /*
@@ -4056,14 +4384,16 @@ static pid_t reusable_baa_broker(void) {
              screenReceiveBuffer);
     ip_log("display profile: native=%ux%u memory=%lluMB cores=%lu "
            "budget=%llu pixels selected=%ux%u@%u wlan=%s rcvbuf=%d "
-           "smooth=%d audio=%s dock=%s policy=hardware-only layout=ignored",
+           "priority=%s audio=%s dock=%s",
            display.nativeLong, display.nativeShort,
            (unsigned long long)(display.physicalMemory / (1024ULL * 1024ULL)),
            (unsigned long)display.activeProcessors,
            (unsigned long long)display.pixelBudget,
            displayWidth, displayHeight, display.framesPerSecond,
            carplay_wlan_attachment_name(display.wlanAttachment),
-           screenReceiveBuffer, preferSmooth ? 1 : 0,
+           screenReceiveBuffer,
+           priority == CarPlayVideoQuality ? "quality"
+               : (priority == CarPlayVideoPerformance ? "performance" : "custom"),
            receiverAudio ? "receiver" : "sender",
            rightHandDrive ? "right" : "left");
     char *svcArgv[] = {
@@ -4209,14 +4539,23 @@ static pid_t reusable_baa_broker(void) {
            [report UTF8String]);
 
     self.pendingBluetoothErrorTitle = unsupported
-        ? @"Bluetooth Hardware Not Supported"
-        : @"Bluetooth Setup Failed";
+        ? L(@"Bluetooth Hardware Not Supported")
+        : L(@"Bluetooth Setup Failed");
     self.pendingBluetoothErrorExplanation = unsupported
-        ? @"Showcase could not take over this device's Bluetooth controller. "
+        ? L(@"Showcase could not take over this device's Bluetooth controller. "
           "Tell the developer or community that this model is not yet supported "
-          "and include the diagnostic below."
-        : @"Showcase's Bluetooth components are incomplete or could not start. "
-          "Copy the diagnostic below before reinstalling or reporting the problem.";
+          "and include the diagnostic below.")
+        : L(@"Showcase's Bluetooth components are incomplete or could not start. "
+          "Copy the diagnostic below before reinstalling or reporting the problem.");
+#if !defined(SHOWCASE_TAURINE) && !defined(SHOWCASE_ROOTLESS)
+    /* Taurine on iOS 14 needs its own package's Bluetooth takeover. */
+    if (showcase_on_taurine()) {
+        self.pendingBluetoothErrorTitle = L(@"Install Showcase for Taurine");
+        self.pendingBluetoothErrorExplanation =
+            L(@"This device runs Taurine, which needs a different Bluetooth setup. "
+             "Install Showcase for Taurine from the same repository; it replaces this package.");
+    }
+#endif
     self.pendingBluetoothDiagnostic = report;
     [self stopFlow];
 }
@@ -4311,37 +4650,37 @@ static NSString *hotspot_name(void) {
     NSString *currentPass = self.cars.apPassword ?: @"";
 
     UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:@"Hotspot Details"
+        alertControllerWithTitle:L(@"Hotspot Details")
                          message:nil
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Name";
+        tf.placeholder = L(@"Name");
         tf.text = currentSSID;
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Password";
+        tf.placeholder = L(@"Password");
         tf.text = currentPass;
         tf.secureTextEntry = YES;
     }];
 
     __weak UIViewController *weakHost = host;
-    [ac addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
+    [ac addAction:[UIAlertAction actionWithTitle:L(@"Save") style:UIAlertActionStyleDefault
         handler:^(UIAlertAction *_a) {
             NSString *ssid = ac.textFields[0].text ?: @"";
             NSString *pass = ac.textFields[1].text ?: @"";
             NSString *err = validateSSID(ssid);
             if (!err && pass.length < 8) {
-                err = @"Hotspot passwords must be at least 8 characters.";
+                err = L(@"Hotspot passwords must be at least 8 characters.");
             }
             if (err) {
                 UIAlertController *e = [UIAlertController
-                    alertControllerWithTitle:@"Try Again"
+                    alertControllerWithTitle:L(@"Try Again")
                                      message:err
                               preferredStyle:UIAlertControllerStyleAlert];
-                [e addAction:[UIAlertAction actionWithTitle:@"OK"
+                [e addAction:[UIAlertAction actionWithTitle:L(@"OK")
                     style:UIAlertActionStyleDefault
                     handler:^(UIAlertAction *_b) {
                         [self promptForCredentialsFromController:weakHost];
@@ -4351,12 +4690,12 @@ static NSString *hotspot_name(void) {
             }
             if (deviceName && ![ssid isEqualToString:deviceName]) {
                 UIAlertController *m = [UIAlertController
-                    alertControllerWithTitle:@"Different Name"
+                    alertControllerWithTitle:L(@"Different Name")
                                      message:[NSString stringWithFormat:
-                        @"This iPad's hotspot is called \u201c%@\u201d. Your iPhone joins the name you enter here, so it has to match. To use \u201c%@\u201d, rename the iPad in Settings > General > About > Name.",
+                        L(@"This iPad's hotspot is called \u201c%@\u201d. Your iPhone joins the name you enter here, so it has to match. To use \u201c%@\u201d, rename the iPad in Settings > General > About > Name."),
                         deviceName, ssid]
                               preferredStyle:UIAlertControllerStyleAlert];
-                [m addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Use \u201c%@\u201d", deviceName]
+                [m addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:L(@"Use \u201c%@\u201d"), deviceName]
                     style:UIAlertActionStyleDefault handler:^(UIAlertAction *_b) {
                         if (validateSSID(deviceName)) {
                             [self promptForCredentialsFromController:weakHost];
@@ -4364,14 +4703,14 @@ static NSString *hotspot_name(void) {
                         }
                         [self saveSSID:deviceName password:pass host:weakHost];
                     }]];
-                [m addAction:[UIAlertAction actionWithTitle:@"Keep" style:UIAlertActionStyleCancel
+                [m addAction:[UIAlertAction actionWithTitle:L(@"Keep") style:UIAlertActionStyleCancel
                     handler:^(UIAlertAction *_b) { [self saveSSID:ssid password:pass host:weakHost]; }]];
                 [weakHost presentViewController:m animated:YES completion:nil];
                 return;
             }
             [self saveSSID:ssid password:pass host:weakHost];
         }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"Cancel"
+    [ac addAction:[UIAlertAction actionWithTitle:L(@"Cancel")
         style:UIAlertActionStyleCancel handler:nil]];
 
     [host presentViewController:ac animated:YES completion:nil];
@@ -4388,22 +4727,22 @@ static NSString *hotspot_name(void) {
 - (void)presentAlertWithTitle:(NSString *)title message:(NSString *)message {
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
         message:message preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"OK"
+    [ac addAction:[UIAlertAction actionWithTitle:L(@"OK")
         style:UIAlertActionStyleDefault handler:nil]];
     [[self topPresenter] presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)presentExportSavedAlertForPath:(NSString *)path reason:(NSString *)reason {
     dispatch_async(dispatch_get_main_queue(), ^{
-        NSString *msg = [NSString stringWithFormat:@"%@\n\nSaved to:\n%@",
-                         reason ?: @"The share sheet could not be shown.", path ?: @"(unknown)"];
-        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"Export Saved"
+        NSString *msg = [NSString stringWithFormat:L(@"%@\n\nSaved to:\n%@"),
+                         reason ?: L(@"The share sheet could not be shown."), path ?: @"(unknown)"];
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:L(@"Export Saved")
             message:msg preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Copy Path"
+        [ac addAction:[UIAlertAction actionWithTitle:L(@"Copy Path")
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
                 if (path.length) [UIPasteboard generalPasteboard].string = path;
             }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK"
+        [ac addAction:[UIAlertAction actionWithTitle:L(@"OK")
             style:UIAlertActionStyleCancel handler:nil]];
         UIViewController *presenter = [self topPresenter];
         if ([presenter isKindOfClass:[UIAlertController class]] && presenter.presentingViewController) {
@@ -4419,7 +4758,7 @@ static NSString *hotspot_name(void) {
         NSFileManager *fm = [NSFileManager defaultManager];
         if (!url || ![fm fileExistsAtPath:path] || ![fm isReadableFileAtPath:path]) {
             ip_log("[SHARE] file missing/unreadable path=%s", path ? [path UTF8String] : "(nil)");
-            [self presentAlertWithTitle:@"File Missing" message:@"The export file could not be found or read."];
+            [self presentAlertWithTitle:L(@"File Missing") message:L(@"The export file could not be found or read.")];
             return;
         }
 
@@ -4431,7 +4770,7 @@ static NSString *hotspot_name(void) {
         UIViewController *presenter = [self topPresenter];
         if (!presenter) {
             ip_log("[SHARE] share failed: no presenter path=%s", [path UTF8String]);
-            [self presentExportSavedAlertForPath:path reason:@"The share sheet could not be shown."];
+            [self presentExportSavedAlertForPath:path reason:L(@"The share sheet could not be shown.")];
             return;
         }
         if ([presenter isKindOfClass:[UIAlertController class]]) {
@@ -4447,7 +4786,7 @@ static NSString *hotspot_name(void) {
             UIView *source = presenter.view ?: self.vc.contentView ?: self.vc.view;
             if (!source || CGRectIsEmpty(source.bounds)) {
                 ip_log("[SHARE] share failed: no stable source view path=%s", [path UTF8String]);
-                [self presentExportSavedAlertForPath:path reason:@"The export was created, but the share sheet had no valid presentation view."];
+                [self presentExportSavedAlertForPath:path reason:L(@"The export was created, but the share sheet had no valid presentation view.")];
                 return;
             }
             avc.popoverPresentationController.sourceView = source;
@@ -4599,15 +4938,15 @@ static NSString *hotspot_name(void) {
     self.tcpdumpMissingPromptShown = YES;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIAlertController *ac = [UIAlertController
-            alertControllerWithTitle:@"Network Dump Unavailable"
-            message:@"tcpdump is not installed. Install the package named tcpdump in Sileo, then reopen Showcase. CarPlay can still run; only the network dump is disabled."
+            alertControllerWithTitle:L(@"Network Dump Unavailable")
+            message:L(@"tcpdump is not installed. Install the package named tcpdump in Sileo, then reopen Showcase. CarPlay can still run; only the network dump is disabled.")
             preferredStyle:UIAlertControllerStyleAlert];
-        [ac addAction:[UIAlertAction actionWithTitle:@"Open Sileo"
+        [ac addAction:[UIAlertAction actionWithTitle:L(@"Open Sileo")
             style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) {
                 NSURL *u = [NSURL URLWithString:@"sileo://package/tcpdump"];
                 [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
             }]];
-        [ac addAction:[UIAlertAction actionWithTitle:@"OK"
+        [ac addAction:[UIAlertAction actionWithTitle:L(@"OK")
             style:UIAlertActionStyleCancel handler:nil]];
         UIViewController *p = self.vc.presentedViewController ?: self.vc;
         [p presentViewController:ac animated:YES completion:nil];
@@ -5463,6 +5802,27 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 - (void)fire { if (self.changed) self.changed(self.on); }
 @end
 
+@interface SettingsSegments : UISegmentedControl
+@property (nonatomic, copy) void (^changed)(NSInteger index);
+@end
+@implementation SettingsSegments
+- (instancetype)initWithItems:(NSArray *)items {
+    if ((self = [super initWithItems:items])) {
+        [self addTarget:self action:@selector(fire)
+       forControlEvents:UIControlEventValueChanged];
+        if ([self respondsToSelector:@selector(setSelectedSegmentTintColor:)]) {
+            [self setValue:[UIColor whiteColor] forKey:@"selectedSegmentTintColor"];
+            [self setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor blackColor]}
+                                forState:UIControlStateSelected];
+            [self setTitleTextAttributes:@{NSForegroundColorAttributeName: [UIColor whiteColor]}
+                                forState:UIControlStateNormal];
+        }
+    }
+    return self;
+}
+- (void)fire { if (self.changed) self.changed(self.selectedSegmentIndex); }
+@end
+
 /* A rounded group of rows with hairline separators, as in iOS Settings but
  * drawn for Showcase's black canvas. */
 @interface SettingsCard : UIView
@@ -5577,10 +5937,10 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
         UIView *senderWaves = nil, *receiverWaves = nil;
         self.receiverGroup = [self groupWithOutline:
             (pad ? CGSizeMake(68, 86) : CGSizeMake(34, 62))
-            title:[NSString stringWithFormat:@"This %@", showcase_device_noun()]
+            title:[NSString stringWithFormat:L(@"This %@"), showcase_device_noun()]
             waves:&receiverWaves action:@selector(receiverTapped)];
         self.senderGroup = [self groupWithOutline:CGSizeMake(34, 62)
-                                            title:@"CarPlay sender"
+                                            title:L(@"CarPlay sender")
                                             waves:&senderWaves action:@selector(senderTapped)];
         self.senderWaves = senderWaves;
         self.receiverWaves = receiverWaves;
@@ -5694,6 +6054,7 @@ static UIEdgeInsets showcase_safe_insets(UIView *view) {
 @property (nonatomic, copy) NSString *draftCarName;
 @property (nonatomic, copy) NSString *draftSSID;
 @property (nonatomic, copy) NSString *draftPassword;
+@property (nonatomic, assign) CGFloat fieldTitleWidth;
 @end
 
 static NSDictionary<NSString *, NSString *> *g_settings_hardware_info = nil;
@@ -5757,15 +6118,17 @@ static BOOL g_settings_hardware_loading = NO;
 }
 
 - (NSString *)titleForPage:(NSString *)page {
-    if ([page isEqualToString:@"root"]) return @"Settings";
-    if ([page isEqualToString:@"cars"]) return @"Cars";
-    if ([page isEqualToString:@"car"]) return self.editingCar ? @"Edit Car" : @"New Car";
-    if ([page isEqualToString:@"hotspot"]) return @"Hotspot";
-    if ([page isEqualToString:@"sound"]) return @"Sound";
-    if ([page isEqualToString:@"display"]) return @"Display";
-    if ([page isEqualToString:@"logs"]) return @"Troubleshooting";
-    if ([page isEqualToString:@"about"]) return @"About";
-    return @"Settings";
+    if ([page isEqualToString:@"root"]) return L(@"Settings");
+    if ([page isEqualToString:@"cars"]) return L(@"Cars");
+    if ([page isEqualToString:@"car"]) return self.editingCar ? L(@"Edit Car") : L(@"New Car");
+    if ([page isEqualToString:@"hotspot"]) return L(@"Hotspot");
+    if ([page isEqualToString:@"sound"]) return L(@"Sound");
+    if ([page isEqualToString:@"display"]) return L(@"Display");
+    if ([page isEqualToString:@"resolution"]) return L(@"Resolution");
+    if ([page isEqualToString:@"language"]) return L(@"Language");
+    if ([page isEqualToString:@"logs"]) return L(@"Troubleshooting");
+    if ([page isEqualToString:@"about"]) return L(@"About");
+    return L(@"Settings");
 }
 
 /* ─── navigation ─── */
@@ -5860,6 +6223,7 @@ static BOOL g_settings_hardware_loading = NO;
 
     NSString *page = self.stack.lastObject;
     CGFloat sidebarW = self.wide ? 320 : 0;
+    self.fieldTitleWidth = 0;
 
     /* Header */
     self.header = [[UIView alloc] initWithFrame:CGRectMake(0, safe.top, W, headerH)];
@@ -5874,7 +6238,7 @@ static BOOL g_settings_hardware_loading = NO;
     [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont systemFontOfSize:26 weight:UIFontWeightLight];
     close.titleEdgeInsets = UIEdgeInsetsMake(-2, 0, 0, 0);
-    close.accessibilityLabel = @"Close";
+    close.accessibilityLabel = L(@"Close");
     [close addTarget:self action:@selector(close) forControlEvents:UIControlEventTouchUpInside];
     [self.header addSubview:close];
 
@@ -5891,7 +6255,7 @@ static BOOL g_settings_hardware_loading = NO;
     if (self.wide) {
         UILabel *settingsTitle = [[UILabel alloc] initWithFrame:
             CGRectMake(left + 16, 0, sidebarW - 16, headerH)];
-        settingsTitle.text = @"Settings";
+        settingsTitle.text = L(@"Settings");
         settingsTitle.textColor = [UIColor whiteColor];
         settingsTitle.font = [UIFont systemFontOfSize:30 weight:UIFontWeightLight];
         [self.header addSubview:settingsTitle];
@@ -5950,6 +6314,8 @@ static BOOL g_settings_hardware_loading = NO;
     else if ([page isEqualToString:@"hotspot"]) [self buildHotspot:b];
     else if ([page isEqualToString:@"sound"]) [self buildSound:b];
     else if ([page isEqualToString:@"display"]) [self buildDisplay:b];
+    else if ([page isEqualToString:@"resolution"]) [self buildResolution:b];
+    else if ([page isEqualToString:@"language"]) [self buildLanguage:b];
     else if ([page isEqualToString:@"logs"]) [self buildLogs:b];
     else if ([page isEqualToString:@"about"]) [self buildAbout:b];
     CGRect cf = column.frame;
@@ -6074,6 +6440,51 @@ static BOOL g_settings_hardware_loading = NO;
     return row;
 }
 
+- (SettingsRow *)choiceRow:(NSString *)title value:(NSString *)value checked:(BOOL)checked
+                     width:(CGFloat)w action:(ShowcaseAction)action {
+    SettingsRow *row = [[SettingsRow alloc] initWithFrame:CGRectMake(0, 0, w, 52)];
+    row.action = action;
+    [row addSubview:[self rowTitle:title frame:CGRectMake(16, 0, w * 0.5, 52)]];
+    UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(w * 0.5, 0, w * 0.5 - 52, 52)];
+    v.text = value;
+    v.textAlignment = NSTextAlignmentRight;
+    v.textColor = [UIColor colorWithWhite:1 alpha:0.45];
+    v.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
+    [row addSubview:v];
+    UILabel *check = [[UILabel alloc] initWithFrame:CGRectMake(w - 40, 0, 24, 52)];
+    check.text = checked ? @"✓" : @"";
+    check.textColor = [UIColor whiteColor];
+    check.font = [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold];
+    [row addSubview:check];
+    if (checked) row.accessibilityTraits |= UIAccessibilityTraitSelected;
+    return row;
+}
+
+- (UIView *)segmentRow:(NSString *)title items:(NSArray<NSString *> *)items selected:(NSInteger)selected
+                 width:(CGFloat)w enabled:(BOOL)enabled changed:(void (^)(NSInteger index))changed {
+    UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 52)];
+    [row addSubview:[self rowTitle:title frame:CGRectMake(16, 0, w * 0.5, 52)]];
+    SettingsSegments *segments = [[SettingsSegments alloc] initWithItems:items];
+    segments.selectedSegmentIndex = MIN(selected, (NSInteger)items.count - 1);
+    segments.tintColor = [UIColor whiteColor];
+    segments.enabled = enabled;
+    segments.changed = changed;
+    CGFloat segmentW = 56.0 * items.count;
+    segments.frame = CGRectMake(w - 16 - segmentW, 11, segmentW, 30);
+    [row addSubview:segments];
+    row.alpha = enabled ? 1 : 0.35;
+    return row;
+}
+
+/* Field titles share one column: the widest title, at least 100 points. */
+- (CGFloat)titleWidthFor:(NSArray<NSString *> *)titles {
+    CGFloat widest = 100;
+    UIFont *font = [UIFont systemFontOfSize:17 weight:UIFontWeightRegular];
+    for (NSString *title in titles)
+        widest = MAX(widest, ceil([title sizeWithAttributes:@{NSFontAttributeName: font}].width) + 8);
+    return widest;
+}
+
 - (UITextField *)fieldRowInCard:(SettingsCard *)card title:(NSString *)title
                            text:(NSString *)text placeholder:(NSString *)placeholder
                          secure:(BOOL)secure trailing:(UIView *)trailing {
@@ -6081,8 +6492,9 @@ static BOOL g_settings_hardware_loading = NO;
     UIView *row = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 52)];
     CGFloat fieldX = 16;
     if (title.length) {
-        [row addSubview:[self rowTitle:title frame:CGRectMake(16, 0, 100, 52)]];
-        fieldX = 120;
+        CGFloat titleW = self.fieldTitleWidth ?: [self titleWidthFor:@[title]];
+        [row addSubview:[self rowTitle:title frame:CGRectMake(16, 0, titleW, 52)]];
+        fieldX = 16 + titleW + 4;
     }
     CGFloat trailingW = trailing ? trailing.bounds.size.width + 8 : 0;
     UITextField *field = [[UITextField alloc] initWithFrame:
@@ -6171,37 +6583,40 @@ static BOOL g_settings_hardware_loading = NO;
     BOOL receiverAudio = [d boolForKey:RECEIVER_AUDIO_KEY];
 
     [b card:^(SettingsCard *card) {
-        [card addRow:[self navRow:@"Cars" value:app.cars.selected.name ?: @""
+        [card addRow:[self navRow:L(@"Cars") value:app.cars.selected.name ?: @""
             width:w selected:[selected isEqualToString:@"cars"]
             action:^{ [weakSelf selectSection:@"cars"]; }] height:52];
-        [card addRow:[self navRow:@"Hotspot"
-            value:app.cars.apSSID.length ? app.cars.apSSID : @"Not set"
+        [card addRow:[self navRow:L(@"Hotspot")
+            value:app.cars.apSSID.length ? app.cars.apSSID : L(@"Not set")
             width:w selected:[selected isEqualToString:@"hotspot"]
             action:^{ [weakSelf selectSection:@"hotspot"]; }] height:52];
     }];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self navRow:@"Sound"
+        [card addRow:[self navRow:L(@"Sound")
             value:receiverAudio
-                ? [NSString stringWithFormat:@"This %@", showcase_device_noun()]
-                : @"CarPlay sender"
+                ? [NSString stringWithFormat:L(@"This %@"), showcase_device_noun()]
+                : L(@"CarPlay sender")
             width:w selected:[selected isEqualToString:@"sound"]
             action:^{ [weakSelf selectSection:@"sound"]; }] height:52];
-        [card addRow:[self navRow:@"Display" value:@""
+        [card addRow:[self navRow:L(@"Display") value:@""
             width:w selected:[selected isEqualToString:@"display"]
             action:^{ [weakSelf selectSection:@"display"]; }] height:52];
+        [card addRow:[self navRow:L(@"Language") value:showcase_language_name(showcase_language())
+            width:w selected:[selected isEqualToString:@"language"]
+            action:^{ [weakSelf selectSection:@"language"]; }] height:52];
     }];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self navRow:@"Troubleshooting"
-            value:app.diagnosticsEnabled ? @"Logging on" : @""
+        [card addRow:[self navRow:L(@"Troubleshooting")
+            value:app.diagnosticsEnabled ? L(@"Logging on") : @""
             width:w selected:[selected isEqualToString:@"logs"]
             action:^{ [weakSelf selectSection:@"logs"]; }] height:52];
-        [card addRow:[self navRow:@"About" value:@""
+        [card addRow:[self navRow:L(@"About") value:@""
             width:w selected:[selected isEqualToString:@"about"]
             action:^{ [weakSelf selectSection:@"about"]; }] height:52];
     }];
     if (self.sessionRunning) {
         [b card:^(SettingsCard *card) {
-            [card addRow:[self actionRow:@"Stop CarPlay" color:[self destructiveColor]
+            [card addRow:[self actionRow:L(@"Stop CarPlay") color:[self destructiveColor]
                 width:w enabled:YES action:^{
                     AppDelegate *strongApp = weakSelf.appDelegate;
                     [weakSelf close];
@@ -6232,7 +6647,7 @@ static BOOL g_settings_hardware_loading = NO;
             }
             UIButton *edit = [UIButton buttonWithType:UIButtonTypeSystem];
             edit.frame = CGRectMake(w - 70, 8, 60, 36);
-            [edit setTitle:@"Edit" forState:UIControlStateNormal];
+            [edit setTitle:L(@"Edit") forState:UIControlStateNormal];
             edit.tintColor = [UIColor colorWithWhite:1 alpha:0.6];
             edit.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
             objc_setAssociatedObject(edit, "car", car, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -6243,7 +6658,7 @@ static BOOL g_settings_hardware_loading = NO;
         }
     }];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self actionRow:@"Add Car" color:nil width:w enabled:YES action:^{
+        [card addRow:[self actionRow:L(@"Add Car") color:nil width:w enabled:YES action:^{
             weakSelf.editingCar = nil;
             [weakSelf push:@"car"];
         }] height:52];
@@ -6261,7 +6676,7 @@ static BOOL g_settings_hardware_loading = NO;
     __weak SettingsViewController *weakSelf = self;
     Car *car = self.editingCar;
     [b card:^(SettingsCard *card) {
-        self.carNameField = [self fieldRowInCard:card title:@"Name"
+        self.carNameField = [self fieldRowInCard:card title:L(@"Name")
             text:self.draftCarName ?: car.name placeholder:@"Miata"
             secure:NO trailing:nil];
         self.carNameField.autocapitalizationType = UITextAutocapitalizationTypeWords;
@@ -6269,11 +6684,11 @@ static BOOL g_settings_hardware_loading = NO;
     }];
     [b gap:8];
     [self showPageMessage:b];
-    [self placePill:[self pillButton:@"Save" action:@selector(saveCar) width:w] builder:b];
+    [self placePill:[self pillButton:L(@"Save") action:@selector(saveCar) width:w] builder:b];
 
     if (car && car != app.cars.selected) {
         [b card:^(SettingsCard *card) {
-            [card addRow:[self actionRow:@"Use This Car" color:nil width:w enabled:YES action:^{
+            [card addRow:[self actionRow:L(@"Use This Car") color:nil width:w enabled:YES action:^{
                 [app.cars selectCar:car];
                 [app renderState];
                 [weakSelf pop];
@@ -6283,7 +6698,7 @@ static BOOL g_settings_hardware_loading = NO;
     if (car && app.cars.cars.count > 1) {
         [b card:^(SettingsCard *card) {
             [card addRow:[self actionRow:
-                self.confirmingDestructive ? @"Tap Again to Delete" : @"Delete Car"
+                self.confirmingDestructive ? L(@"Tap Again to Delete") : L(@"Delete Car")
                 color:[self destructiveColor] width:w enabled:YES action:^{
                     if (!weakSelf.confirmingDestructive) {
                         [weakSelf armDestructiveConfirmation];
@@ -6304,14 +6719,14 @@ static BOOL g_settings_hardware_loading = NO;
     NSString *name = [self.carNameField.text stringByTrimmingCharactersInSet:
         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
     NSString *error = nil;
-    if (name.length == 0) error = @"Enter a name for the car.";
+    if (name.length == 0) error = L(@"Enter a name for the car.");
     else if ([name lengthOfBytesUsingEncoding:NSUTF8StringEncoding] > 31)
-        error = @"Use a shorter name. CarPlay allows up to 31 characters.";
+        error = L(@"Use a shorter name. CarPlay allows up to 31 characters.");
     else {
         for (Car *other in app.cars.cars) {
             if (other != self.editingCar &&
                 [other.name caseInsensitiveCompare:name] == NSOrderedSame) {
-                error = @"Another car already uses this name.";
+                error = L(@"Another car already uses this name.");
                 break;
             }
         }
@@ -6337,30 +6752,34 @@ static BOOL g_settings_hardware_loading = NO;
     AppDelegate *app = self.appDelegate;
     CGFloat w = b.width;
     UIButton *show = [UIButton buttonWithType:UIButtonTypeSystem];
-    show.frame = CGRectMake(0, 0, 52, 32);
-    [show setTitle:self.passwordVisible ? @"Hide" : @"Show" forState:UIControlStateNormal];
+    [show setTitle:self.passwordVisible ? L(@"Hide") : L(@"Show") forState:UIControlStateNormal];
     show.tintColor = [UIColor colorWithWhite:1 alpha:0.6];
     show.titleLabel.font = [UIFont systemFontOfSize:15];
+    /* Wide enough for either word, so the field does not move on toggle. */
+    NSDictionary *font = @{NSFontAttributeName: show.titleLabel.font};
+    CGFloat showW = MAX([L(@"Hide") sizeWithAttributes:font].width, [L(@"Show") sizeWithAttributes:font].width);
+    show.frame = CGRectMake(0, 0, MAX(52, ceil(showW) + 12), 32);
+    self.fieldTitleWidth = [self titleWidthFor:@[L(@"Name"), L(@"Password")]];
     [show addTarget:self action:@selector(togglePasswordVisible)
    forControlEvents:UIControlEventTouchUpInside];
     NSString *ssid = self.draftSSID ?: app.cars.apSSID;
     NSString *password = self.draftPassword ?: app.cars.apPassword;
     [b card:^(SettingsCard *card) {
-        self.ssidField = [self fieldRowInCard:card title:@"Name" text:ssid
+        self.ssidField = [self fieldRowInCard:card title:L(@"Name") text:ssid
             placeholder:@"Carplay-Receiver" secure:NO trailing:nil];
         self.ssidField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         self.ssidField.returnKeyType = UIReturnKeyNext;
-        self.passwordField = [self fieldRowInCard:card title:@"Password" text:password
-            placeholder:@"8 characters or more" secure:!self.passwordVisible trailing:show];
+        self.passwordField = [self fieldRowInCard:card title:L(@"Password") text:password
+            placeholder:L(@"8 characters or more") secure:!self.passwordVisible trailing:show];
         self.passwordField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         self.passwordField.returnKeyType = UIReturnKeyDone;
     }];
     [b gap:8];
     [self showPageMessage:b];
-    [self placePill:[self pillButton:@"Save" action:@selector(saveHotspot) width:w] builder:b];
+    [self placePill:[self pillButton:L(@"Save") action:@selector(saveHotspot) width:w] builder:b];
 
     [b card:^(SettingsCard *card) {
-        [card addRow:[self actionRow:[NSString stringWithFormat:@"Rename This %@", showcase_device_noun()]
+        [card addRow:[self actionRow:[NSString stringWithFormat:L(@"Rename This %@"), showcase_device_noun()]
             color:nil width:w enabled:YES action:^{
             NSURL *u = [NSURL URLWithString:@"App-Prefs:root=General&path=About"];
             UIApplication *a = [UIApplication sharedApplication];
@@ -6382,7 +6801,7 @@ static BOOL g_settings_hardware_loading = NO;
     NSString *pass = self.passwordField.text ?: @"";
     NSString *error = validateSSID(ssid);
     if (!error && pass.length < 8)
-        error = @"Hotspot passwords must be at least 8 characters.";
+        error = L(@"Hotspot passwords must be at least 8 characters.");
     [self.view endEditing:YES];
     if (error) { [self setMessage:error error:YES]; return; }
     [app.cars setAPSSID:ssid password:pass];
@@ -6390,11 +6809,11 @@ static BOOL g_settings_hardware_loading = NO;
     NSString *deviceName = hotspot_name();
     if (deviceName && ![deviceName isEqualToString:ssid]) {
         [self setMessage:[NSString stringWithFormat:
-            @"Saved, but this iPad's hotspot is called \u201c%@\u201d. Your iPhone can't join until the names match.",
+            L(@"Saved, but this iPad's hotspot is called \u201c%@\u201d. Your iPhone can't join until the names match."),
             deviceName] error:YES];
         return;
     }
-    [self setMessage:@"Saved." error:NO];
+    [self setMessage:L(@"Saved.") error:NO];
 }
 
 - (void)buildSound:(SettingsPageBuilder *)b {
@@ -6418,41 +6837,143 @@ static BOOL g_settings_hardware_loading = NO;
     self.soundRoute = route;
 
     [b card:^(SettingsCard *card) {
-        UIView *row = [self switchRow:[NSString stringWithFormat:@"Play Sound on This %@", showcase_device_noun()]
+        UIView *row = [self switchRow:[NSString stringWithFormat:L(@"Play Sound on This %@"), showcase_device_noun()]
             subtitle:nil on:receiverAudio width:w changed:choose];
         [card addRow:row height:row.bounds.size.height];
     }];
 }
 
+- (NSString *)sizeText:(CarPlayVideoSize)size {
+    return [NSString stringWithFormat:@"%u × %u", size.width, size.height];
+}
+
+- (NSString *)videoDescription {
+    CarPlayDisplayProfile profile = preferred_carplay_display_profile();
+    return [NSString stringWithFormat:L(@"%u × %u at %u fps"),
+        profile.width, profile.height, profile.framesPerSecond];
+}
+
 - (void)buildDisplay:(SettingsPageBuilder *)b {
     CGFloat w = b.width;
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    __weak SettingsViewController *weakSelf = self;
     void (^setter)(NSString *, BOOL) = ^(NSString *key, BOOL on) {
         [[NSUserDefaults standardUserDefaults] setBool:on forKey:key];
         [[NSUserDefaults standardUserDefaults] synchronize];
         ip_log("settings: %s=%d", key.UTF8String, on ? 1 : 0);
     };
+    /* At most one priority is on; either one sets resolution and rate. */
+    void (^prioritize)(NSString *, NSString *, BOOL) = ^(NSString *key, NSString *other, BOOL on) {
+        setter(key, on);
+        if (on) setter(other, NO);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [weakSelf render]; });
+    };
+    CarPlayVideoPriority priority = carplay_video_priority();
+    CarPlayDisplayProfile profile = preferred_carplay_display_profile();
+    BOOL custom = priority == CarPlayVideoCustom;
+    CarPlayDisplayHardware hardware = carplay_display_hardware();
+
     [b card:^(SettingsCard *card) {
-        UIView *dock = [self switchRow:@"Dock on the Right" subtitle:nil
+        UIView *dock = [self switchRow:L(@"Dock on the Right") subtitle:nil
             on:[d boolForKey:RIGHT_HAND_DRIVE_KEY] width:w
             changed:^(BOOL on) { setter(RIGHT_HAND_DRIVE_KEY, on); }];
         [card addRow:dock height:dock.bounds.size.height];
-        UIView *smooth = [self switchRow:@"Prefer Smooth Video" subtitle:nil
-            on:[d boolForKey:SMOOTH_VIDEO_KEY] width:w
-            changed:^(BOOL on) { setter(SMOOTH_VIDEO_KEY, on); }];
-        [card addRow:smooth height:smooth.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        UIView *radio = [self switchRow:@"Dedicate Wi-Fi to CarPlay" subtitle:nil
+        UIView *quality = [self switchRow:L(@"Prioritize Quality") subtitle:nil
+            on:priority == CarPlayVideoQuality width:w
+            changed:^(BOOL on) { prioritize(QUALITY_VIDEO_KEY, SMOOTH_VIDEO_KEY, on); }];
+        [card addRow:quality height:quality.bounds.size.height];
+        UIView *performance = [self switchRow:L(@"Prioritize Performance") subtitle:nil
+            on:priority == CarPlayVideoPerformance width:w
+            changed:^(BOOL on) { prioritize(SMOOTH_VIDEO_KEY, QUALITY_VIDEO_KEY, on); }];
+        [card addRow:performance height:performance.bounds.size.height];
+    }];
+    [b card:^(SettingsCard *card) {
+        CarPlayVideoSize size = {profile.width, profile.height};
+        SettingsRow *resolution = [self navRow:L(@"Resolution") value:[self sizeText:size]
+            width:w selected:NO action:^{ [weakSelf push:@"resolution"]; }];
+        resolution.enabled = custom;
+        resolution.alpha = custom ? 1 : 0.35;
+        [card addRow:resolution height:52];
+        NSArray *rates = hardware.screenFPS >= 60 ? @[@"30", @"60"] : @[@"30"];
+        UIView *rate = [self segmentRow:L(@"Frame Rate") items:rates
+            selected:profile.framesPerSecond >= 60 ? 1 : 0 width:w enabled:custom
+            changed:^(NSInteger index) {
+                [[NSUserDefaults standardUserDefaults] setInteger:index ? 60 : 30 forKey:VIDEO_FPS_KEY];
+                [[NSUserDefaults standardUserDefaults] synchronize];
+                ip_log("settings: %s=%d", VIDEO_FPS_KEY.UTF8String, index ? 60 : 30);
+            }];
+        [card addRow:rate height:52];
+    }];
+    [b card:^(SettingsCard *card) {
+        UIView *radio = [self switchRow:L(@"Dedicate Wi-Fi to CarPlay") subtitle:nil
             on:[d boolForKey:DEDICATED_RADIO_KEY] width:w
             changed:^(BOOL on) { setter(DEDICATED_RADIO_KEY, on); }];
         [card addRow:radio height:radio.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        UIView *autoStart = [self switchRow:@"Start CarPlay Automatically" subtitle:nil
+        UIView *autoStart = [self switchRow:L(@"Start CarPlay Automatically") subtitle:nil
             on:[d boolForKey:AUTO_START_KEY] width:w
             changed:^(BOOL on) { setter(AUTO_START_KEY, on); }];
         [card addRow:autoStart height:autoStart.bounds.size.height];
+    }];
+}
+
+- (void)buildResolution:(SettingsPageBuilder *)b {
+    CGFloat w = b.width;
+    __weak SettingsViewController *weakSelf = self;
+    CarPlayVideoSize options[CARPLAY_MAX_OPTIONS], fallback;
+    unsigned count = carplay_offered_resolutions(options, &fallback);
+    CarPlayDisplayProfile profile = preferred_carplay_display_profile();
+    NSMutableArray<NSValue *> *sizes = [NSMutableArray array];
+    for (unsigned i = 0; i < count; i++)
+        [sizes addObject:[NSValue valueWithBytes:&options[i] objCType:@encode(CarPlayVideoSize)]];
+    [b card:^(SettingsCard *card) {
+        for (NSValue *value in sizes) {
+            CarPlayVideoSize size;
+            [value getValue:&size];
+            BOOL isDefault = size.width == fallback.width && size.height == fallback.height;
+            BOOL checked = size.width == profile.width && size.height == profile.height;
+            [card addRow:[self choiceRow:[self sizeText:size] value:isDefault ? L(@"Default") : @""
+                checked:checked width:w action:^{
+                    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+                    /* The default follows the hardware; only another size is kept. */
+                    if (isDefault) {
+                        [d removeObjectForKey:VIDEO_WIDTH_KEY];
+                        [d removeObjectForKey:VIDEO_HEIGHT_KEY];
+                    } else {
+                        [d setInteger:size.width forKey:VIDEO_WIDTH_KEY];
+                        [d setInteger:size.height forKey:VIDEO_HEIGHT_KEY];
+                    }
+                    [d synchronize];
+                    ip_log("settings: resolution=%ux%u", size.width, size.height);
+                    [weakSelf pop];
+                }] height:52];
+        }
+    }];
+}
+
+- (void)buildLanguage:(SettingsPageBuilder *)b {
+    CGFloat w = b.width;
+    __weak SettingsViewController *weakSelf = self;
+    NSString *chosen = showcase_chosen_language();
+    void (^choose)(NSString *) = ^(NSString *language) {
+        showcase_set_language(language);
+        ip_log("settings: language=%s", language ? language.UTF8String : "device");
+        [weakSelf.appDelegate renderState];
+        [weakSelf render];
+    };
+    [b card:^(SettingsCard *card) {
+        [card addRow:[self choiceRow:L(@"Device Language") value:showcase_language_name(showcase_device_language())
+            checked:chosen == nil width:w action:^{ choose(nil); }] height:52];
+    }];
+    [b card:^(SettingsCard *card) {
+        for (NSString *language in showcase_languages())
+            [card addRow:[self choiceRow:showcase_language_name(language) value:@""
+                checked:[chosen isEqualToString:language] width:w
+                action:^{ choose(language); }] height:52];
     }];
 }
 
@@ -6466,7 +6987,7 @@ static BOOL g_settings_hardware_loading = NO;
     NSString *lastCapture = capturing ? nil : [app latestNetworkDumpPath];
 
     [b card:^(SettingsCard *card) {
-        UIView *row = [self switchRow:@"Detailed Logging" subtitle:nil
+        UIView *row = [self switchRow:L(@"Detailed Logging") subtitle:nil
             on:logging width:w changed:^(BOOL on) {
                 [app applyDiagnosticsEnabled:on];
                 weakSelf.pageMessage = nil;
@@ -6475,18 +6996,18 @@ static BOOL g_settings_hardware_loading = NO;
         [card addRow:row height:row.bounds.size.height];
     }];
     [b card:^(SettingsCard *card) {
-        [card addRow:[self actionRow:self.preparingLogs ? @"Preparing Logs…" : @"Send Logs"
+        [card addRow:[self actionRow:self.preparingLogs ? L(@"Preparing Logs…") : L(@"Send Logs")
             color:nil width:w enabled:!self.preparingLogs action:^{
                 [weakSelf sendLogs];
             }] height:52];
         if (!haveTcpdump) {
-            [card addRow:[self actionRow:@"Install tcpdump"
+            [card addRow:[self actionRow:L(@"Install tcpdump")
                 color:nil width:w enabled:YES action:^{
                     NSURL *u = [NSURL URLWithString:@"sileo://package/tcpdump"];
                     [[UIApplication sharedApplication] openURL:u options:@{} completionHandler:nil];
                 }] height:52];
         } else if (capturing) {
-            [card addRow:[self actionRow:@"Stop and Send Network Capture"
+            [card addRow:[self actionRow:L(@"Stop and Send Network Capture")
                 color:nil width:w enabled:YES action:^{
                     [app stopNetworkDumpCaptureWithReason:@"user requested export"];
                     NSString *dump = [app latestNetworkDumpPath];
@@ -6495,13 +7016,13 @@ static BOOL g_settings_hardware_loading = NO;
                     if (dump) [app presentShareForURL:[NSURL fileURLWithPath:dump]];
                 }] height:52];
         } else {
-            [card addRow:[self actionRow:@"Start Network Capture"
+            [card addRow:[self actionRow:L(@"Start Network Capture")
                 color:nil width:w enabled:logging action:^{
                     [app startNetworkDumpCapture];
-                    [weakSelf setMessage:@"Capturing" error:NO];
+                    [weakSelf setMessage:L(@"Capturing") error:NO];
                 }] height:52];
             if (lastCapture) {
-                [card addRow:[self actionRow:@"Send Last Network Capture"
+                [card addRow:[self actionRow:L(@"Send Last Network Capture")
                     color:nil width:w enabled:YES action:^{
                         [app presentShareForURL:[NSURL fileURLWithPath:lastCapture]];
                     }] height:52];
@@ -6512,7 +7033,7 @@ static BOOL g_settings_hardware_loading = NO;
 
     [b card:^(SettingsCard *card) {
         [card addRow:[self actionRow:
-            self.confirmingDestructive ? @"Tap Again to Clear" : @"Clear Logs and Captures"
+            self.confirmingDestructive ? L(@"Tap Again to Clear") : L(@"Clear Logs and Captures")
             color:[self destructiveColor] width:w enabled:YES action:^{
                 if (!weakSelf.confirmingDestructive) {
                     [weakSelf armDestructiveConfirmation];
@@ -6520,7 +7041,7 @@ static BOOL g_settings_hardware_loading = NO;
                 }
                 weakSelf.confirmingDestructive = NO;
                 [app clearLogsAndDumps];
-                [weakSelf setMessage:@"Cleared" error:NO];
+                [weakSelf setMessage:L(@"Cleared") error:NO];
             }] height:52];
     }];
 }
@@ -6536,7 +7057,7 @@ static BOOL g_settings_hardware_loading = NO;
         dispatch_async(dispatch_get_main_queue(), ^{
             weakSelf.preparingLogs = NO;
             if (!archive) {
-                [weakSelf setMessage:@"Could not create the log archive" error:YES];
+                [weakSelf setMessage:L(@"Could not create the log archive") error:YES];
                 return;
             }
             [weakSelf render];
@@ -6548,19 +7069,16 @@ static BOOL g_settings_hardware_loading = NO;
 - (void)loadHardwareInfo {
     if (g_settings_hardware_info || g_settings_hardware_loading) return;
     g_settings_hardware_loading = YES;
-    BOOL smooth = [[NSUserDefaults standardUserDefaults] boolForKey:SMOOTH_VIDEO_KEY];
     __weak SettingsViewController *weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         BluetoothRegistryProbeState bt = bluetooth_registry_probe();
-        CarPlayDisplayProfile profile = preferred_carplay_display_profile(smooth);
+        CarPlayDisplayHardware hardware = carplay_display_hardware();
         NSString *bluetooth = bt == BluetoothRegistryProbeSkywalk ? @"Skywalk"
             : (bt == BluetoothRegistryProbeLegacyUART ? @"UART"
-               : (bt == BluetoothRegistryProbeMissing ? @"Not supported" : @"Unknown"));
-        NSString *wifi = profile.wlanAttachment == CarPlayWLANAttachmentHSIC ? @"HSIC"
-            : (profile.wlanAttachment == CarPlayWLANAttachmentPCIe ? @"PCIe" : @"Unknown");
-        NSString *video = [NSString stringWithFormat:@"%u × %u at %u fps",
-            profile.width, profile.height, profile.framesPerSecond];
-        NSDictionary *info = @{ @"bluetooth": bluetooth, @"wifi": wifi, @"video": video };
+               : (bt == BluetoothRegistryProbeMissing ? L(@"Not supported") : L(@"Unknown")));
+        NSString *wifi = hardware.wlanAttachment == CarPlayWLANAttachmentHSIC ? @"HSIC"
+            : (hardware.wlanAttachment == CarPlayWLANAttachmentPCIe ? @"PCIe" : L(@"Unknown"));
+        NSDictionary *info = @{ @"bluetooth": bluetooth, @"wifi": wifi };
         dispatch_async(dispatch_get_main_queue(), ^{
             g_settings_hardware_info = info;
             g_settings_hardware_loading = NO;
@@ -6579,7 +7097,7 @@ static BOOL g_settings_hardware_loading = NO;
     mark.font = [UIFont systemFontOfSize:44 weight:UIFontWeightUltraLight];
     [b place:mark height:54 gapAfter:2];
     UILabel *by = [[UILabel alloc] init];
-    by.text = [NSString stringWithFormat:@"by %s\u2003\u2003%s", APP_AUTHOR, APP_VERSION];
+    by.text = [NSString stringWithFormat:L(@"by %s\u2003\u2003%s"), APP_AUTHOR, APP_VERSION];
     by.textAlignment = NSTextAlignmentCenter;
     by.textColor = [UIColor colorWithWhite:1 alpha:0.5];
     by.font = [UIFont systemFontOfSize:14];
@@ -6587,19 +7105,19 @@ static BOOL g_settings_hardware_loading = NO;
 
     [self loadHardwareInfo];
     NSDictionary *hw = g_settings_hardware_info;
-    NSString *checking = @"Checking…";
+    NSString *checking = L(@"Checking…");
 #ifdef SHOWCASE_ROOTLESS
     NSString *package = @"Rootless";
 #else
     NSString *package = @"Rootful";
 #endif
     [b card:^(SettingsCard *card) {
-        [card addRow:[self valueRow:@"Model" value:hardware_machine_identifier() width:w] height:48];
+        [card addRow:[self valueRow:L(@"Model") value:hardware_machine_identifier() width:w] height:48];
         [card addRow:[self valueRow:@"iOS" value:[UIDevice currentDevice].systemVersion width:w] height:48];
-        [card addRow:[self valueRow:@"Package" value:package width:w] height:48];
+        [card addRow:[self valueRow:L(@"Package") value:package width:w] height:48];
         [card addRow:[self valueRow:@"Bluetooth" value:hw[@"bluetooth"] ?: checking width:w] height:48];
-        [card addRow:[self valueRow:@"Wi-Fi Bus" value:hw[@"wifi"] ?: checking width:w] height:48];
-        [card addRow:[self valueRow:@"CarPlay Video" value:hw[@"video"] ?: checking width:w] height:48];
+        [card addRow:[self valueRow:L(@"Wi-Fi Bus") value:hw[@"wifi"] ?: checking width:w] height:48];
+        [card addRow:[self valueRow:L(@"CarPlay Video") value:hw ? [self videoDescription] : checking width:w] height:48];
     }];
 }
 
@@ -6735,7 +7253,7 @@ static BOOL g_settings_hardware_loading = NO;
     }
 
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"Wi-Fi Setup";
+    title.text = L(@"Wi-Fi Setup");
     title.textAlignment = NSTextAlignmentCenter;
     title.textColor = [UIColor whiteColor];
     title.font = [UIFont systemFontOfSize:(phone ? 34 : 44) weight:UIFontWeightUltraLight];
@@ -6748,19 +7266,19 @@ static BOOL g_settings_hardware_loading = NO;
     CGFloat y = phone ? 104 : 168;
 
     /* Step 1: the hotspot is named after the device. */
-    [root addSubview:[self headlineLabel:[NSString stringWithFormat:@"1.  Rename This %@", showcase_device_noun()]
+    [root addSubview:[self headlineLabel:[NSString stringWithFormat:L(@"1.  Rename This %@"), showcase_device_noun()]
                                     rect:CGRectMake(colX, y, colW, 30)]];
     y += 46;
     [root addSubview:[self buildCopyPillWithText:@"Carplay-Receiver" rect:CGRectMake(colX, y, colW, 56)]];
     y += 72;
-    [root addSubview:[self primaryButton:@"Open Settings" rect:CGRectMake(colX, y, colW, 50)
+    [root addSubview:[self primaryButton:L(@"Open Settings") rect:CGRectMake(colX, y, colW, 50)
                                   action:@selector(openSettingsTapped)]];
     y += 82;
 
     /* Step 2 */
-    [root addSubview:[self headlineLabel:@"2.  Enter Hotspot Details" rect:CGRectMake(colX, y, colW, 30)]];
+    [root addSubview:[self headlineLabel:L(@"2.  Enter Hotspot Details") rect:CGRectMake(colX, y, colW, 30)]];
     y += 46;
-    [root addSubview:[self primaryButton:@"Enter Details" rect:CGRectMake(colX, y, colW, 50)
+    [root addSubview:[self primaryButton:L(@"Enter Details") rect:CGRectMake(colX, y, colW, 50)
                                   action:@selector(credsTapped)]];
 
     if (scroll) {
@@ -6808,7 +7326,7 @@ static BOOL g_settings_hardware_loading = NO;
     [container addSubview:txt];
 
     UILabel *hint = [[UILabel alloc] init];
-    hint.text = @"Copy";
+    hint.text = L(@"Copy");
     hint.textColor = [UIColor whiteColor];
     hint.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
     hint.textAlignment = NSTextAlignmentRight;
@@ -6826,7 +7344,7 @@ static BOOL g_settings_hardware_loading = NO;
 
 - (void)copyExampleTapped:(UITapGestureRecognizer *)gr {
     [UIPasteboard generalPasteboard].string = @"Carplay-Receiver";
-    self.pillHintLabel.text = @"Copied";
+    self.pillHintLabel.text = L(@"Copied");
     UIView *pill = self.pillView;
     [UIView animateWithDuration:0.12 animations:^{
         pill.transform = CGAffineTransformMakeScale(1.02, 1.02);
@@ -6838,8 +7356,8 @@ static BOOL g_settings_hardware_loading = NO;
     }];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if ([self.pillHintLabel.text isEqualToString:@"Copied"]) {
-            self.pillHintLabel.text = @"Copy";
+        if ([self.pillHintLabel.text isEqualToString:L(@"Copied")]) {
+            self.pillHintLabel.text = L(@"Copy");
             [UIView animateWithDuration:0.25 animations:^{
                 pill.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
             }];

@@ -1,0 +1,23 @@
+Package: com.rostane.showcase-taurine
+Name: Showcase for Taurine
+Version: @PACKAGE_VERSION@
+Architecture: iphoneos-arm
+Section: Utilities
+Maintainer: Amine Rostane <amine.rostane@outlook.com>
+Author: Amine Rostane <amine.rostane@outlook.com>
+Depends: firmware (>= 14.0), firmware (<< 15.0), uikittools
+Conflicts: ch.ringwald.btstack, com.rostane.showcase
+Replaces: ch.ringwald.btstack (<= 1.1-1), com.rostane.showcase
+Provides: com.rostane.showcase
+Homepage: https://github.com/amineross/showcase
+Icon: https://aminerostane.com/repo/icons/showcase.png
+Depiction: https://aminerostane.com/repo/depictions/cydia.html
+SileoDepiction: https://aminerostane.com/repo/depictions/sileo.json
+Description: Wireless CarPlay receiver for Taurine on iOS 14.
+ Showcase turns a jailbroken iPhone or iPad into a wireless CarPlay
+ receiver. This package is for Taurine on iOS 14 only. Other jailbreaks
+ use the regular Showcase package.
+ .
+ It starts BTstack before Apple's Bluetooth stops, waits longer for the
+ controller, uses the newer BTstack daemon and adds BTQuiet, which slows
+ Bluetooth clients' reconnects while Showcase owns the controller.

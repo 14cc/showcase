@@ -14,6 +14,16 @@
     <string>@BUNDLE_VERSION@</string>
     <key>CFBundleShortVersionString</key>
     <string>@SHORT_VERSION@</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleLocalizations</key>
+    <array>
+        <string>en</string>
+        <string>fr</string>
+        <string>es</string>
+        <string>zh-Hans</string>
+        <string>ja</string>
+    </array>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundlePackageType</key>

@@ -26,6 +26,9 @@ SDK_REMOTE="/tmp/iPhoneOS10.3.sdk"
 BTSTACK_DYLIB="$DIR/packaging/payload/usr/lib/libBTstack.dylib"
 . "$DIR/packaging/scripts/version.sh"
 STAGED="$(mktemp -d)"
+# VARIANT=taurine builds the app the Taurine package ships (iOS 14 Taurine only).
+APP_FLAGS=""
+[ "${VARIANT:-}" = taurine ] && APP_FLAGS="-DSHOWCASE_TAURINE"
 fill_version "$SRC/Info.plist" > "$STAGED/Info.plist"
 
 ssh_cmd() { sshpass -p "$IPAD_PASS" ssh $SSHOPTS -p "$IPAD_PORT" "$IPAD_USER@$IPAD_HOST" "$@"; }
@@ -73,7 +76,7 @@ fi
 echo ""
 echo "[1/7] Sending sources + icons"
 COPYFILE_DISABLE=1 tar --format ustar -C "$SRC" \
-    -cf /tmp/showcase-crypto-vendor.tar vendor
+    -cf /tmp/showcase-crypto-vendor.tar vendor Localizations
 scp_cmd "$SRC/Showcase.m" \
         "$SRC/carplay_bt.m" \
         "$SRC/carplay_services.m" \
@@ -108,7 +111,7 @@ echo "[2/7] Compiling Showcase"
 # the SDK's .tbd stubs as 'out of sync' for libSystem (memset/strcmp etc).
 # Symbols resolve at runtime via dyld through libSystem.B.dylib (linked via Foundation).
 ssh_cmd "clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot $SDK_REMOTE \
-    -DAPP_VERSION='\"$DISPLAY_VERSION\"' -o /tmp/Showcase /tmp/Showcase.m \
+    -DAPP_VERSION='\"$DISPLAY_VERSION\"' $APP_FLAGS -o /tmp/Showcase /tmp/Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup 2>&1" || { echo "FAIL"; exit 1; }
@@ -150,6 +153,9 @@ cp /tmp/carplay_bt       \$STAGE/carplay_bt
 cp /tmp/carplay_services \$STAGE/carplay_services
 cp /tmp/Info.plist       \$STAGE/Info.plist
 cp /tmp/Icon*.png        \$STAGE/
+cp -R /tmp/Localizations/*.lproj \$STAGE/
+chmod 0755 \$STAGE/*.lproj
+chmod 0644 \$STAGE/*.lproj/*
 
 # Sign each binary with its own entitlements
 ldid -S/tmp/ent_app.xml \$STAGE/Showcase

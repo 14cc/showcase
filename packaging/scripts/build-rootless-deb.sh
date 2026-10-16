@@ -220,6 +220,8 @@ cp "$REPO_ROOT/source/ent_bt.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_bt
 cp "$REPO_ROOT/source/ent_svc.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_svc.xml"
 cp "$REPO_ROOT/source/ent_btdaemon.xml" "$WORK/rootfs/var/jb/usr/share/showcase/ent_btdaemon.xml"
 cp "$REPO_ROOT/icon/generated/"*.png "$WORK/rootfs/var/jb/Applications/Showcase.app/"
+rm -rf "$WORK/rootfs/var/jb/Applications/Showcase.app/"*.lproj
+cp -R "$REPO_ROOT/source/Localizations/"*.lproj "$WORK/rootfs/var/jb/Applications/Showcase.app/"
 if [ ! -x "$BTSTACK_SOURCE_BUILD" ]; then
   copy_arm64_binary "$BTSTACK_DAEMON" "$WORK/rootfs/var/jb/usr/bin/BTdaemon"
 fi
@@ -271,6 +273,8 @@ as_root chown root:wheel .
 as_root chown -R root:wheel var DEBIAN
 as_root chmod 0755 . var var/jb var/jb/Applications var/jb/Applications/Showcase.app var/jb/usr var/jb/usr/bin var/jb/usr/lib var/jb/usr/share var/jb/usr/share/showcase var/jb/Library var/jb/Library/LaunchDaemons
 as_root chmod 0644 var/jb/Applications/Showcase.app/Info.plist var/jb/Applications/Showcase.app/Icon*.png
+as_root chmod 0755 var/jb/Applications/Showcase.app/*.lproj
+as_root chmod 0644 var/jb/Applications/Showcase.app/*.lproj/*
 as_root chmod 0644 var/jb/usr/share/showcase/ent_app.xml var/jb/usr/share/showcase/ent_bt.xml var/jb/usr/share/showcase/ent_svc.xml var/jb/usr/share/showcase/ent_btdaemon.xml
 as_root chmod 4755 var/jb/Applications/Showcase.app/Showcase var/jb/Applications/Showcase.app/CarDisplaySim 'var/jb/Applications/Showcase.app/CarPlay Simulator'
 as_root chmod 0755 var/jb/usr/bin/BTdaemon var/jb/usr/lib/libBTstack.dylib

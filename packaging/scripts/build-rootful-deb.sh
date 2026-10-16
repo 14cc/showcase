@@ -3,7 +3,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
-CONTROL="$ROOT/control/control"
+# VARIANT=taurine builds com.rostane.showcase-taurine (iOS 14 Taurine only):
+# Showcase built with SHOWCASE_TAURINE, the BTdaemon from btstack-rootless and
+# BTQuiet. Use scripts/build-taurine-deb.sh, which builds those two first.
+VARIANT="${VARIANT:-}"
+CONTROL_DIR="$ROOT/control"
+APP_FLAGS=""
+if [ "$VARIANT" = taurine ]; then
+  CONTROL_DIR="$ROOT/control-taurine"
+  APP_FLAGS="-DSHOWCASE_TAURINE"
+elif [ -n "$VARIANT" ]; then
+  echo "Unknown VARIANT: $VARIANT"
+  exit 1
+fi
+CONTROL="$CONTROL_DIR/control"
+TAURINE_BUILD="$REPO_ROOT/build/taurine"
 PAYLOAD="$ROOT/payload"
 PAYLOAD_APP="$ROOT/payload/Applications/Showcase.app"
 BTSTACK_DYLIB="$PAYLOAD/usr/lib/libBTstack.dylib"
@@ -59,6 +73,11 @@ if [ ! -d "$PAYLOAD_APP" ]; then
 fi
 
 need_file "$BTSTACK_DYLIB"
+if [ "$VARIANT" = taurine ]; then
+  need_file "$TAURINE_BUILD/BTdaemon"
+  need_file "$TAURINE_BUILD/BTQuiet.dylib"
+  need_file "$REPO_ROOT/tweak/BTQuiet.plist"
+fi
 need_file "$REPO_ROOT/source/Showcase.m"
 need_file "$REPO_ROOT/source/carplay_bt.m"
 need_file "$REPO_ROOT/source/carplay_services.m"
@@ -116,7 +135,7 @@ cd '$REMOTE_BASE'
 tar -xf crypto-vendor.tar
 
 clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
-    -DAPP_VERSION='\"$DISPLAY_VERSION\"' -o Showcase Showcase.m \
+    -DAPP_VERSION='\"$DISPLAY_VERSION\"' $APP_FLAGS -o Showcase Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup
@@ -143,15 +162,23 @@ for bin in Showcase carplay_bt carplay_services; do
     "$WORK/rootfs/Applications/Showcase.app/$bin"
 done
 fill_version "$REPO_ROOT/source/Info.plist" > "$WORK/rootfs/Applications/Showcase.app/Info.plist"
+rm -rf "$WORK/rootfs/Applications/Showcase.app/"*.lproj
+cp -R "$REPO_ROOT/source/Localizations/"*.lproj "$WORK/rootfs/Applications/Showcase.app/"
 cp "$REPO_ROOT/icon/generated/Icon-OEM-104.png" \
    "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-104.png"
 cp "$REPO_ROOT/icon/generated/Icon-OEM-120.png" \
    "$WORK/rootfs/Applications/Showcase.app/Icon-OEM-120.png"
 
 fill_version "$CONTROL" > "$WORK/rootfs/DEBIAN/control"
-cp "$ROOT/control/postinst" "$WORK/rootfs/DEBIAN/postinst"
-cp "$ROOT/control/prerm" "$WORK/rootfs/DEBIAN/prerm"
-cp "$ROOT/control/postrm" "$WORK/rootfs/DEBIAN/postrm"
+cp "$CONTROL_DIR/postinst" "$WORK/rootfs/DEBIAN/postinst"
+cp "$CONTROL_DIR/prerm" "$WORK/rootfs/DEBIAN/prerm"
+cp "$CONTROL_DIR/postrm" "$WORK/rootfs/DEBIAN/postrm"
+if [ "$VARIANT" = taurine ]; then
+  cp "$TAURINE_BUILD/BTdaemon" "$WORK/rootfs/usr/bin/BTdaemon"
+  mkdir -p "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries"
+  cp "$TAURINE_BUILD/BTQuiet.dylib" "$REPO_ROOT/tweak/BTQuiet.plist" \
+     "$WORK/rootfs/Library/MobileSubstrate/DynamicLibraries/"
+fi
 cp "$REPO_ROOT/source/ent_app.xml" "$WORK/rootfs/DEBIAN/ent_app.xml"
 cp "$REPO_ROOT/source/ent_bt.xml" "$WORK/rootfs/DEBIAN/ent_bt.xml"
 cp "$REPO_ROOT/source/ent_svc.xml" "$WORK/rootfs/DEBIAN/ent_svc.xml"
@@ -181,9 +208,15 @@ chown root:wheel .
 chown -R root:wheel Applications usr Library DEBIAN
 chmod 0755 . Applications Applications/Showcase.app usr usr/bin usr/lib Library Library/LaunchDaemons
 chmod 0644 Applications/Showcase.app/Info.plist Applications/Showcase.app/Icon*.png
+chmod 0755 Applications/Showcase.app/*.lproj
+chmod 0644 Applications/Showcase.app/*.lproj/*
 chmod 4755 Applications/Showcase.app/Showcase Applications/Showcase.app/carplay_bt Applications/Showcase.app/carplay_services
 chmod 0755 usr/bin/BTdaemon usr/lib/libBTstack.dylib
 chmod 0644 Library/LaunchDaemons/ch.ringwald.BTstack.plist
+if [ -d Library/MobileSubstrate ]; then
+  chmod 0755 Library/MobileSubstrate Library/MobileSubstrate/DynamicLibraries
+  chmod 0644 Library/MobileSubstrate/DynamicLibraries/*
+fi
 chmod 0755 DEBIAN/postinst DEBIAN/prerm DEBIAN/postrm
 chmod 0644 DEBIAN/control
 
