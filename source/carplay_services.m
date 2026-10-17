@@ -39,6 +39,8 @@
 #include <mach/mach_time.h>
 #include "carplay_pair.h"
 #include "baa_broker.h"
+#include "local_mfi.h"
+#include "local_mfi_apple.inc.h"
 #include "vendor/monocypher/monocypher.h"
 
 /*
@@ -332,6 +334,11 @@ static uint8_t   *g_baa_inter_der = NULL;
 static int        g_baa_inter_len = 0;
 static bool       g_baa_ready = false;
 static SecKeyRef  g_baa_broker_key = NULL;
+/* When a user-provided certificate is present, the broker signs with its key
+ * and never contacts DeviceIdentity. g_local_mfi_mode gates the offline path:
+ * the leaf buffer then holds the whole certificate.p7b, intermediate is empty,
+ * and signing uses raw-digest ECDSA (MFi auth v3) rather than BAA's scheme. */
+static bool       g_local_mfi_mode = false;
 
 static void load_baa_from_broker(void) {
     printf("[BAA] Loading preheated certificate from Showcase...\n");
@@ -343,14 +350,36 @@ static void load_baa_from_broker(void) {
     }
     if (rc == 0) {
         g_baa_ready = true;
-        printf("[BAA] Leaf=%d Inter=%d — preheated and ready\n",
-               g_baa_leaf_len, g_baa_inter_len);
+        g_local_mfi_mode = (g_baa_inter_len == 0);
+        printf("[BAA] Leaf=%d Inter=%d — preheated and ready%s\n",
+               g_baa_leaf_len, g_baa_inter_len,
+               g_local_mfi_mode ? " [local MFi certificate]" : "");
     } else {
         printf("[BAA] Could not retrieve preheated certificate (rc=%d)\n", rc);
     }
 }
 
 static bool issue_baa_for_broker(void) {
+    /* Prefer a user-provided certificate. If present, we authenticate fully
+     * offline — no DeviceIdentity, no network refresh. */
+    uint8_t *p7b = NULL;
+    int p7b_len = 0;
+    SecKeyRef localKey = NULL;
+    /* Loose files win (lets you override the embedded cert for testing); the
+     * embedded certificate is the default for shipped builds. */
+    if (local_mfi_load(&p7b, &p7b_len, &localKey) ||
+        local_mfi_load_embedded(&p7b, &p7b_len, &localKey)) {
+        g_baa_leaf_der = p7b;              /* whole p7b, sent verbatim */
+        g_baa_leaf_len = p7b_len;
+        g_baa_inter_der = NULL;            /* empty => local-MFi signal */
+        g_baa_inter_len = 0;
+        g_baa_broker_key = localKey;
+        g_baa_ready = true;
+        g_local_mfi_mode = true;
+        printf("[BAA] Using local MFi certificate (offline, no network).\n");
+        return true;
+    }
+
     printf("[BAA] Preheating DeviceIdentity certificate before hotspot...\n");
     void *framework = dlopen(
         "/System/Library/PrivateFrameworks/DeviceIdentity.framework/DeviceIdentity",
@@ -451,8 +480,9 @@ static void baa_broker_handle_client(int client) {
             baa_write_le32(response, (uint32_t)g_baa_leaf_len);
             baa_write_le32(response + 4, (uint32_t)g_baa_inter_len);
             memcpy(response + 8, g_baa_leaf_der, g_baa_leaf_len);
-            memcpy(response + 8 + g_baa_leaf_len,
-                   g_baa_inter_der, g_baa_inter_len);
+            if (g_baa_inter_len > 0)
+                memcpy(response + 8 + g_baa_leaf_len,
+                       g_baa_inter_der, g_baa_inter_len);
             status = BAA_STATUS_OK;
         }
     } else if (opcode == BAA_OP_SIGN &&
@@ -477,6 +507,19 @@ static void baa_broker_handle_client(int client) {
                 NSLog(@"[BAA] Broker sign failed: %@", error);
                 CFRelease(error);
             }
+        }
+    } else if (opcode == BAA_OP_SIGN_RAW && requestLength == 32) {
+        /* Local-MFi: ECDSA over the 32-byte digest, raw r||s out. */
+        uint8_t raw[64];
+        if (local_mfi_sign_raw(g_baa_broker_key, request, raw)) {
+            response = malloc(sizeof(raw));
+            if (response) {
+                memcpy(response, raw, sizeof(raw));
+                responseLength = (uint32_t)sizeof(raw);
+                status = BAA_STATUS_OK;
+            }
+        } else {
+            status = BAA_STATUS_SIGN_FAILED;
         }
     }
     free(request);
@@ -1583,29 +1626,35 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
     CC_SHA1_Update(&sha, sharedSecret, 32);
     CC_SHA1_Final(aesIV, &sha);
 
-    /* Sign SHA1(ourPK || peerPK) with BAA private key (ECDSA-SHA256) */
+    /* Sign over (ourPK || peerPK) with the accessory private key. */
     @autoreleasepool {
-        /* Build the data to sign: SHA1(ourPK || peerPK) = 20 bytes
-         * But we'll sign the raw concatenation with ECDSA-SHA256 instead of
-         * doing SHA1-then-RSA like MFi does. The iPhone needs to accept this. */
         uint8_t digestData[64];  /* ourPK || peerPK */
         memcpy(digestData, ourPK, 32);
         memcpy(digestData + 32, peerPK, 32);
 
-        /* Sign with ECDSA-SHA256 (BAA key's native algorithm) */
         uint8_t *sigBytesOwned = NULL;
         int sigLength = 0;
-        int signRC = baa_broker_sign(digestData, sizeof(digestData),
+        int signRC;
+        if (g_local_mfi_mode) {
+            /* MFi auth v3: digest = SHA256(ourPK||peerPK), raw r||s out. */
+            uint8_t md[CC_SHA256_DIGEST_LENGTH];
+            CC_SHA256(digestData, sizeof(digestData), md);
+            signRC = baa_broker_sign_raw(md, &sigBytesOwned, &sigLength);
+        } else {
+            /* BAA: ECDSA-SHA256 over the raw concatenation, DER out. */
+            signRC = baa_broker_sign(digestData, sizeof(digestData),
                                      &sigBytesOwned, &sigLength);
+        }
         if (signRC != 0) {
-            printf("[AP] auth-setup: BAA broker sign FAILED: %d\n", signRC);
+            printf("[AP] auth-setup: broker sign FAILED: %d\n", signRC);
             send_response(sock, proto, 403, "Forbidden", NULL, NULL, 0, r->cseq);
             return;
         }
 
         const uint8_t *sigBytes = sigBytesOwned;
         size_t sigLen = (size_t)sigLength;
-        printf("[AP] auth-setup: ECDSA signature: %zu bytes\n", sigLen);
+        printf("[AP] auth-setup: %s signature: %zu bytes\n",
+               g_local_mfi_mode ? "local-MFi" : "BAA", sigLen);
 
         /* Encrypt signature with AES-128-CTR */
         uint8_t *encSig = malloc(sigLen);
@@ -1622,68 +1671,64 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
 
         /* ── Build OPACK blob for intermediate cert: {"baIC": inter_der} ──
          *
+         * BAA only. In local-MFi mode there is no intermediate, so the MFi-SAP
+         * response carries just pk + leaf-cert + encrypted-signature (the plain
+         * MFi layout xcertplay uses), with no baIC trailer at all.
+         *
          * OPACK encoding (from pyatv/Apple CoreUtils):
-         *   0xE1             = dict with 1 entry
-         *   0x44             = string of length 4 (0x40 + 4)
-         *   "baIC"           = 62 61 49 43
-         *   0x92 LL LL       = bytes with 2-byte LE length (for 256-65535)
-         *   [data...]        = intermediate cert DER
-         *
-         * For certs <= 255 bytes, use 0x91 + 1-byte LE length instead.
-         * For certs <= 32 bytes, use 0x70+len inline (unlikely for certs).
+         *   0xE1  dict(1)   0x44 "baIC"   <len-prefixed bytes>   [data...]
          */
-        size_t opackHdrLen;
-        uint8_t opackHdr[16];
-        opackHdr[0] = 0xE1;             /* dict, 1 entry */
-        opackHdr[1] = 0x44;             /* string len=4 */
-        opackHdr[2] = 'b'; opackHdr[3] = 'a'; opackHdr[4] = 'I'; opackHdr[5] = 'C';
-        if (g_baa_inter_len <= 0x20) {
-            opackHdr[6] = 0x70 + (uint8_t)g_baa_inter_len;
-            opackHdrLen = 7;
-        } else if (g_baa_inter_len <= 0xFF) {
-            opackHdr[6] = 0x91;
-            opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);
-            opackHdrLen = 8;
-        } else if (g_baa_inter_len <= 0xFFFF) {
-            opackHdr[6] = 0x92;
-            opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);        /* LE low */
-            opackHdr[8] = (uint8_t)((g_baa_inter_len >> 8) & 0xFF); /* LE high */
-            opackHdrLen = 9;
-        } else {
-            opackHdr[6] = 0x93;
-            opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);
-            opackHdr[8] = (uint8_t)((g_baa_inter_len >> 8) & 0xFF);
-            opackHdr[9] = (uint8_t)((g_baa_inter_len >> 16) & 0xFF);
-            opackHdr[10] = (uint8_t)((g_baa_inter_len >> 24) & 0xFF);
-            opackHdrLen = 11;
+        size_t opackBlobLen = 0;
+        uint8_t *opackBlob = NULL;
+        if (!g_local_mfi_mode) {
+            size_t opackHdrLen;
+            uint8_t opackHdr[16];
+            opackHdr[0] = 0xE1;             /* dict, 1 entry */
+            opackHdr[1] = 0x44;             /* string len=4 */
+            opackHdr[2] = 'b'; opackHdr[3] = 'a'; opackHdr[4] = 'I'; opackHdr[5] = 'C';
+            if (g_baa_inter_len <= 0x20) {
+                opackHdr[6] = 0x70 + (uint8_t)g_baa_inter_len;
+                opackHdrLen = 7;
+            } else if (g_baa_inter_len <= 0xFF) {
+                opackHdr[6] = 0x91;
+                opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);
+                opackHdrLen = 8;
+            } else if (g_baa_inter_len <= 0xFFFF) {
+                opackHdr[6] = 0x92;
+                opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);        /* LE low */
+                opackHdr[8] = (uint8_t)((g_baa_inter_len >> 8) & 0xFF); /* LE high */
+                opackHdrLen = 9;
+            } else {
+                opackHdr[6] = 0x93;
+                opackHdr[7] = (uint8_t)(g_baa_inter_len & 0xFF);
+                opackHdr[8] = (uint8_t)((g_baa_inter_len >> 8) & 0xFF);
+                opackHdr[9] = (uint8_t)((g_baa_inter_len >> 16) & 0xFF);
+                opackHdr[10] = (uint8_t)((g_baa_inter_len >> 24) & 0xFF);
+                opackHdrLen = 11;
+            }
+            opackBlobLen = opackHdrLen + g_baa_inter_len;
+            opackBlob = malloc(opackBlobLen);
+            memcpy(opackBlob, opackHdr, opackHdrLen);
+            memcpy(opackBlob + opackHdrLen, g_baa_inter_der, g_baa_inter_len);
+            printf("[AP] auth-setup: OPACK baIC blob: %zu bytes (hdr=%zu + inter=%d)\n",
+                   opackBlobLen, opackHdrLen, g_baa_inter_len);
         }
-        size_t opackBlobLen = opackHdrLen + g_baa_inter_len;
-        uint8_t *opackBlob = malloc(opackBlobLen);
-        memcpy(opackBlob, opackHdr, opackHdrLen);
-        memcpy(opackBlob + opackHdrLen, g_baa_inter_der, g_baa_inter_len);
 
-        printf("[AP] auth-setup: OPACK baIC blob: %zu bytes (hdr=%zu + inter=%d)\n",
-               opackBlobLen, opackHdrLen, g_baa_inter_len);
-
-        /* ── Build BAA MFi-SAP M2 response ──
-         *
-         * New layout (from CarPlay Simulator disassembly):
+        /* ── Build MFi-SAP M2 response ──
          *   server_curve25519_pub[32]
-         *   leaf_len_be[4]
-         *   leaf_der[leaf_len]         ← ONLY leaf, not leaf+intermediate
-         *   enc_sig_len_be[4]
-         *   enc_sig[enc_sig_len]
-         *   baIC_len_be[4]             ← OPACK blob length
-         *   OPACK({"baIC": inter})[baIC_len]
+         *   leaf_len_be[4] | leaf_der[leaf_len]
+         *   enc_sig_len_be[4] | enc_sig[enc_sig_len]
+         *   (BAA only) baIC_len_be[4] | OPACK({"baIC": inter})[baIC_len]
          */
-        size_t respLen = 32 + 4 + g_baa_leaf_len + 4 + encLen + 4 + opackBlobLen;
+        size_t respLen = 32 + 4 + g_baa_leaf_len + 4 + encLen;
+        if (!g_local_mfi_mode) respLen += 4 + opackBlobLen;
         uint8_t *resp = malloc(respLen);
         uint8_t *p = resp;
 
         /* 1) Server Curve25519 public key */
         memcpy(p, ourPK, 32); p += 32;
 
-        /* 2) Leaf cert only */
+        /* 2) Leaf cert (BAA) or whole p7b (local MFi) */
         p[0] = (g_baa_leaf_len >> 24) & 0xFF;
         p[1] = (g_baa_leaf_len >> 16) & 0xFF;
         p[2] = (g_baa_leaf_len >> 8)  & 0xFF;
@@ -1691,7 +1736,7 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         p += 4;
         memcpy(p, g_baa_leaf_der, g_baa_leaf_len); p += g_baa_leaf_len;
 
-        /* 3) Encrypted ECDSA signature */
+        /* 3) Encrypted signature */
         p[0] = (encLen >> 24) & 0xFF;
         p[1] = (encLen >> 16) & 0xFF;
         p[2] = (encLen >> 8)  & 0xFF;
@@ -1699,18 +1744,21 @@ static void handle_auth_setup(int sock, const HTTPReq *r) {
         p += 4;
         memcpy(p, encSig, encLen); p += encLen;
 
-        /* 4) OPACK {"baIC": intermediate_der} */
-        uint32_t opackBlobLen32 = (uint32_t)opackBlobLen;
-        p[0] = (opackBlobLen32 >> 24) & 0xFF;
-        p[1] = (opackBlobLen32 >> 16) & 0xFF;
-        p[2] = (opackBlobLen32 >> 8)  & 0xFF;
-        p[3] =  opackBlobLen32        & 0xFF;
-        p += 4;
-        memcpy(p, opackBlob, opackBlobLen); p += opackBlobLen;
+        /* 4) OPACK {"baIC": intermediate_der} — BAA only */
+        if (!g_local_mfi_mode) {
+            uint32_t opackBlobLen32 = (uint32_t)opackBlobLen;
+            p[0] = (opackBlobLen32 >> 24) & 0xFF;
+            p[1] = (opackBlobLen32 >> 16) & 0xFF;
+            p[2] = (opackBlobLen32 >> 8)  & 0xFF;
+            p[3] =  opackBlobLen32        & 0xFF;
+            p += 4;
+            memcpy(p, opackBlob, opackBlobLen); p += opackBlobLen;
+        }
 
         printf("[AP] auth-setup M2 response: %zu bytes "
-               "(pk=32 + leaf=%d + sig=%zu + opack=%zu)\n",
-               respLen, g_baa_leaf_len, encLen, opackBlobLen);
+               "(pk=32 + leaf=%d + sig=%zu + opack=%zu)%s\n",
+               respLen, g_baa_leaf_len, encLen, opackBlobLen,
+               g_local_mfi_mode ? " [local MFi]" : "");
 
         send_response(sock, proto, 200, "OK",
                      "application/octet-stream", resp, respLen, r->cseq);

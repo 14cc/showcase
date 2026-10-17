@@ -27,7 +27,8 @@
 #define BAA_BROKER_MAX_PAYLOAD   (64U * 1024U)
 
 #define BAA_OP_GET_CERTS  1
-#define BAA_OP_SIGN       2
+#define BAA_OP_SIGN       2   /* BAA: ECDSA message/SHA256, DER signature out */
+#define BAA_OP_SIGN_RAW   3   /* local MFi: ECDSA over 32-byte digest, raw r||s */
 
 #define BAA_STATUS_OK          0
 #define BAA_STATUS_NOT_READY   1
@@ -182,7 +183,9 @@ static inline int baa_broker_get_certs(uint8_t **leaf, int *leafLength,
 
     uint32_t leafLen = baa_read_le32(response);
     uint32_t interLen = baa_read_le32(response + 4);
-    if (leafLen == 0 || interLen == 0 ||
+    /* interLen == 0 is valid: it signals a user-provided single certificate
+     * (local-MFi mode) with no intermediate. */
+    if (leafLen == 0 ||
         leafLen > BAA_BROKER_MAX_PAYLOAD ||
         interLen > BAA_BROKER_MAX_PAYLOAD ||
         8U + leafLen + interLen != responseLength) {
@@ -191,15 +194,15 @@ static inline int baa_broker_get_certs(uint8_t **leaf, int *leafLength,
     }
 
     uint8_t *leafCopy = (uint8_t *)malloc(leafLen);
-    uint8_t *interCopy = (uint8_t *)malloc(interLen);
-    if (!leafCopy || !interCopy) {
+    uint8_t *interCopy = interLen > 0 ? (uint8_t *)malloc(interLen) : NULL;
+    if (!leafCopy || (interLen > 0 && !interCopy)) {
         free(leafCopy);
         free(interCopy);
         free(response);
         return -1;
     }
     memcpy(leafCopy, response + 8, leafLen);
-    memcpy(interCopy, response + 8 + leafLen, interLen);
+    if (interLen > 0) memcpy(interCopy, response + 8 + leafLen, interLen);
     free(response);
 
     *leaf = leafCopy;
@@ -221,6 +224,28 @@ static inline int baa_broker_sign(const uint8_t *message,
     uint8_t *response = NULL;
     uint32_t responseLength = 0;
     int rc = baa_broker_request(BAA_OP_SIGN, message, messageLength,
+                                &response, &responseLength);
+    if (rc != 0) return rc;
+    if (responseLength == 0 || responseLength > 1024) {
+        free(response);
+        return -1;
+    }
+    *signature = response;
+    *signatureLength = (int)responseLength;
+    return 0;
+}
+
+/* Local-MFi signing: send a 32-byte digest, receive a raw r||s signature. */
+static inline int baa_broker_sign_raw(const uint8_t *digest32,
+                                      uint8_t **signature,
+                                      int *signatureLength) {
+    if (!digest32 || !signature || !signatureLength) return -1;
+    *signature = NULL;
+    *signatureLength = 0;
+
+    uint8_t *response = NULL;
+    uint32_t responseLength = 0;
+    int rc = baa_broker_request(BAA_OP_SIGN_RAW, digest32, 32,
                                 &response, &responseLength);
     if (rc != 0) return rc;
     if (responseLength == 0 || responseLength > 1024) {

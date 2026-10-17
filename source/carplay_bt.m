@@ -155,6 +155,10 @@ static int have_local_addr = 0;
 /* ── BAA state ── */
 static uint8_t *baa_leaf_der = NULL, *baa_inter_der = NULL;
 static int baa_leaf_len = 0, baa_inter_len = 0, baa_ready = 0;
+/* An empty intermediate from the broker means a user-provided certificate is
+ * in use: the "leaf" buffer is the whole certificate.p7b, there is no second
+ * cert, and challenges are signed with raw-digest ECDSA (MFi auth v3). */
+static int local_mfi_mode = 0;
 
 static uint8_t iap2_detect[] = { 0xFF, 0x55, 0x02, 0x00, 0xEE, 0x10 };
 
@@ -310,8 +314,10 @@ static void issue_baa_cert(void) {
     }
     if (rc == 0) {
         baa_ready = 1;
-        printf("[BAA] Leaf=%d Inter=%d — preheated and ready\n",
-               baa_leaf_len, baa_inter_len);
+        local_mfi_mode = (baa_inter_len == 0);
+        printf("[BAA] Leaf=%d Inter=%d — preheated and ready%s\n",
+               baa_leaf_len, baa_inter_len,
+               local_mfi_mode ? " [local MFi certificate]" : "");
     } else {
         printf("[BAA] Could not retrieve preheated certificate (rc=%d)\n", rc);
     }
@@ -544,18 +550,34 @@ static void send_control_msg(uint16_t msg_id, uint8_t *params, int params_len) {
 static void send_auth_cert(void) {
     if(!baa_ready) return;
     PB pb; pb_init(&pb,2048);
-    pb_blob(&pb,0x0000,baa_leaf_der,baa_leaf_len);
-    pb_u8(&pb,0x0001,1);
-    pb_blob(&pb,0x0002,baa_inter_der,baa_inter_len);
+    if (local_mfi_mode) {
+        /* MFi accessory certificate: single param, the whole p7b. */
+        pb_blob(&pb,0x0000,baa_leaf_der,baa_leaf_len);
+    } else {
+        pb_blob(&pb,0x0000,baa_leaf_der,baa_leaf_len);
+        pb_u8(&pb,0x0001,1);
+        pb_blob(&pb,0x0002,baa_inter_der,baa_inter_len);
+    }
     send_control_msg(0xAA01,pb.buf,pb.off); pb_free(&pb);
 }
 
 static void send_auth_response(uint8_t *chal, int clen) {
     uint8_t *sig = NULL;
     int sigLen = 0;
-    int rc = baa_broker_sign(chal, (uint32_t)clen, &sig, &sigLen);
+    int rc;
+    if (local_mfi_mode) {
+        /* MFi auth v3: the 32-byte challenge is signed directly as the digest,
+         * raw r||s out. */
+        if (clen != 32) {
+            printf("[AA03] local MFi challenge must be 32 bytes, got %d\n", clen);
+            return;
+        }
+        rc = baa_broker_sign_raw(chal, &sig, &sigLen);
+    } else {
+        rc = baa_broker_sign(chal, (uint32_t)clen, &sig, &sigLen);
+    }
     if (rc != 0) {
-        printf("[AA03] BAA broker sign FAIL: %d\n", rc);
+        printf("[AA03] broker sign FAIL: %d\n", rc);
         return;
     }
     @autoreleasepool {
