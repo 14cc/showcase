@@ -1,20 +1,3 @@
-.DS_Store
-._*
-*.log
-*.pcap
-*.deb
-__pycache__/
-
-packaging/payload/
-packaging/payload-rootless/
-packaging/build/
-packaging/repo/
-
-report/
-AGENT_RELEASE_GUIDE.md
-evidence-*/
-
-source/*.o
-source/*.dSYM/
-
-build/
+# 私钥(真内置头)永不进 git
+source/embedded_cert.real.h
+*.real.h
