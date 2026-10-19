@@ -87,6 +87,14 @@
       "views": [
         {
           "class": "DepictionHeaderView",
+          "title": "a5 · Beta 5.1.6 — 2026-10-19"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "修复：隐根版报「蓝牙设置失败」（The BTstack daemon did not create its control socket）。5.1.5 的修法没生效：隐根越狱会自动改写蓝牙后台服务的启动配置，把通道文件放进隐根目录。现在改为找到这个文件后，在系统目录建一个指向它的链接。⚠️ 未在隐根真机上验证。\n\n隐根版的诊断报告现在会带上蓝牙后台服务的日志。\n\n有根版、无根版、Taurine 版不受影响，本次只是一起升级版本号。\n\nShare Beta 2-6 · 隐根版：运行时到隐根目录里查找 ElleKit/Substrate，修复隐根设备上 Share 无法注入。不创建 /var/jb。 ⚠️ 未在隐根真机上验证。"
+        },
+        {
+          "class": "DepictionHeaderView",
           "title": "a5 · Beta 5.1.5 — 2026-10-19"
         },
         {

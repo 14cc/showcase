@@ -232,6 +232,12 @@ static void ip_log_open(void) {
 #ifndef SHOWCASE_BTSTACK_LOG_PATH
 #define SHOWCASE_BTSTACK_LOG_PATH "/var/log/BTstack.log"
 #endif
+/* RootHide moves the daemon's StandardOutPath into the jbroot too. */
+#ifdef SHOWCASE_ROOTHIDE
+#define BTSTACK_LOG_NSPATH @(jb_path(SHOWCASE_BTSTACK_LOG_PATH))
+#else
+#define BTSTACK_LOG_NSPATH @SHOWCASE_BTSTACK_LOG_PATH
+#endif
 #ifdef SHOWCASE_ROOTLESS
 #define BT_HELPER_NAME    "CarDisplaySim"
 #define SVC_HELPER_NAME   "CarPlay Simulator"
@@ -901,7 +907,7 @@ static NSString *bluetooth_diagnostic_report(
     NSString *retry = retryAttempted
         ? bounded_log_tail(@LOG_DIR "/carplay_bt-retry.log", 8192, 18)
         : @"";
-    NSString *daemon = bounded_log_tail(@SHOWCASE_BTSTACK_LOG_PATH, 8192, 18);
+    NSString *daemon = bounded_log_tail(BTSTACK_LOG_NSPATH, 8192, 18);
     NSString *combined = [NSString stringWithFormat:@"%@\n%@\n%@",
                           initial ?: @"", retry ?: @"", daemon ?: @""];
     NSString *failureClass =
@@ -1754,6 +1760,42 @@ static BOOL wait_for_path(const char *path, int seconds, const char *name) {
     return NO;
 }
 
+/* Waits for BTstack's listening socket at BTSTACK_SOCKET. RootHide patches
+ * the launch daemon plist (it adds __Patched) and moves SockPathName into the
+ * jbroot, so launchd creates the socket at <jbroot>/tmp/BTstack. Link it to
+ * the fixed path the app and the BTstack client library connect to. */
+static BOOL wait_for_btstack_socket(int seconds, const char *name) {
+#ifdef SHOWCASE_ROOTHIDE
+    NSDictionary *plist = [NSDictionary dictionaryWithContentsOfFile:@(BTSTACK_PLIST)];
+    NSDictionary *sockets = [plist[@"Sockets"] isKindOfClass:[NSDictionary class]] ? plist[@"Sockets"] : nil;
+    NSDictionary *listeners = [sockets[@"Listeners"] isKindOfClass:[NSDictionary class]] ? sockets[@"Listeners"] : nil;
+    NSString *declared = [listeners[@"SockPathName"] isKindOfClass:[NSString class]] ? listeners[@"SockPathName"] : nil;
+    const char *candidates[] = { declared.UTF8String, jb_path(BTSTACK_SOCKET) };
+    for (int i = 0; i < seconds * 10; i++) {
+        if (access(BTSTACK_SOCKET, F_OK) == 0) {
+            ip_log("%s ready at %s", name, BTSTACK_SOCKET);
+            return YES;
+        }
+        for (size_t c = 0; c < sizeof(candidates) / sizeof(candidates[0]); c++) {
+            const char *path = candidates[c];
+            if (!path || strcmp(path, BTSTACK_SOCKET) == 0 || access(path, F_OK) != 0) continue;
+            unlink(BTSTACK_SOCKET);
+            if (symlink(path, BTSTACK_SOCKET) == 0) {
+                ip_log("%s ready at %s, linked to %s", name, path, BTSTACK_SOCKET);
+                return YES;
+            }
+            ip_log("%s: could not link %s to %s: %s", name, path, BTSTACK_SOCKET, strerror(errno));
+        }
+        usleep(100000);
+    }
+    ip_log("%s not ready after %d sec (plist SockPathName=%s)", name, seconds,
+           declared.UTF8String ?: "(none)");
+    return NO;
+#else
+    return wait_for_path(BTSTACK_SOCKET, seconds, name);
+#endif
+}
+
 static void kill_pid(pid_t pid) {
     if (!pid_alive(pid)) return;
     kill(pid, SIGTERM);
@@ -1848,19 +1890,8 @@ static void roothide_prepare_btstack_plist(void) {
     NSMutableDictionary *plist = [NSMutableDictionary dictionaryWithContentsOfFile:path];
     if (!plist) return;
     NSArray *program = @[@(BTDAEMON_PATH)];
-    /* RootHide's launchctl creates the listening socket itself and sees the
-     * jbroot as "/", so "/tmp/BTstack" would land in <jbroot>/tmp. */
-    NSString *socketPath = @(jb_tool_path(BTSTACK_SOCKET));
-    NSMutableDictionary *sockets = [plist[@"Sockets"] mutableCopy];
-    NSMutableDictionary *listeners = [sockets[@"Listeners"] mutableCopy];
-    if ([plist[@"ProgramArguments"] isEqual:program] &&
-        (!listeners || [listeners[@"SockPathName"] isEqual:socketPath])) return;
+    if ([plist[@"ProgramArguments"] isEqual:program]) return;
     plist[@"ProgramArguments"] = program;
-    if (listeners) {
-        listeners[@"SockPathName"] = socketPath;
-        sockets[@"Listeners"] = listeners;
-        plist[@"Sockets"] = sockets;
-    }
     if (![plist writeToFile:path atomically:YES])
         ip_log("[BT] WARNING: could not update %s", BTSTACK_PLIST);
 }
@@ -4236,7 +4267,7 @@ static pid_t reusable_baa_broker(void) {
                              unsupported:NO];
         return;
     }
-    if (!wait_for_path(BTSTACK_SOCKET, 8, "BTstack socket")) {
+    if (!wait_for_btstack_socket(8, "BTstack socket")) {
         [self failBluetoothWithReason:
             @"The BTstack daemon did not create its control socket."
                              unsupported:NO];
@@ -4305,7 +4336,7 @@ static pid_t reusable_baa_broker(void) {
         sleep(2);
         rc = run_blocking(launchctl, loadBTstackArgv);
         if (rc == 0 &&
-            wait_for_path(BTSTACK_SOCKET, 8, "BTstack retry socket")) {
+            wait_for_btstack_socket(8, "BTstack retry socket")) {
             unlink(BT_READY_PATH);
             self.carplayBtPid =
                 spawn_daemon([btPath UTF8String], btArgv,
@@ -4343,7 +4374,7 @@ static pid_t reusable_baa_broker(void) {
                              unsupported:NO];
         return NO;
     }
-    if (!wait_for_path(BTSTACK_SOCKET, 8, "BTstack socket")) {
+    if (!wait_for_btstack_socket(8, "BTstack socket")) {
         [self failBluetoothWithReason:
             @"The BTstack daemon did not create its control socket."
                              unsupported:NO];
@@ -4875,7 +4906,7 @@ static NSString *hotspot_name(void) {
         @TCPDUMP_DIR,
         @"/var/mobile/Library/Showcase/diagnostics",
         @"/tmp/hci_dump.pklg",
-        @SHOWCASE_BTSTACK_LOG_PATH
+        BTSTACK_LOG_NSPATH
     ];
     for (NSString *path in paths) {
         [fm removeItemAtPath:path error:nil];
@@ -5189,7 +5220,7 @@ static NSString *hotspot_name(void) {
 
     [self copyLogDirectoryToDiagnosticsDir:work];
     [self copyPath:@"/tmp/hci_dump.pklg" toDiagnosticsDir:work name:@"hci_dump.pklg"];
-    [self copyPath:@SHOWCASE_BTSTACK_LOG_PATH toDiagnosticsDir:work name:@"BTstack.log"];
+    [self copyPath:BTSTACK_LOG_NSPATH toDiagnosticsDir:work name:@"BTstack.log"];
     [self copyPath:@TCPDUMP_LOG toDiagnosticsDir:work name:@"tcpdump.log"];
     [self copyPath:[NSString stringWithUTF8String:BTSTACK_PREFS]
   toDiagnosticsDir:work name:@"ch.ringwald.btstack.plist"];
