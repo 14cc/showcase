@@ -1,0 +1,60 @@
+#!/bin/sh
+set -e
+
+# RootHide keeps the jailbreak in a per-device random directory, not /var/jb.
+find_jbroot() {
+    if command -v jbroot >/dev/null 2>&1; then
+        root="$(jbroot / 2>/dev/null)"; root="${root%/}"
+        if [ -n "$root" ] && [ -d "$root/usr/bin" ]; then echo "$root"; return 0; fi
+    fi
+    case "$0" in
+        */var/lib/dpkg/info/*)
+            root="${0%/var/lib/dpkg/info/*}"
+            if [ -n "$root" ] && [ -d "$root/usr/bin" ]; then echo "$root"; return 0; fi ;;
+    esac
+    for root in /var/containers/Bundle/Application/.jbroot-*; do
+        if [ -d "$root/usr/bin" ]; then echo "$root"; return 0; fi
+    done
+    return 1
+}
+if ! JBROOT="$(find_jbroot)"; then
+    exit 0   # nothing of ours to clean up; never block removal
+fi
+
+BTSTACK_PLIST="$JBROOT/Library/LaunchDaemons/ch.ringwald.BTstack.plist"
+BLUETOOTHD_PLIST="/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
+
+launchctl_path() {
+    for tool in $JBROOT/usr/bin/launchctl $JBROOT/bin/launchctl /bin/launchctl /usr/bin/launchctl; do
+        if [ -x "$tool" ]; then
+            echo "$tool"
+            return 0
+        fi
+    done
+    return 1
+}
+
+case "$1" in
+    remove|deconfigure|upgrade)
+        killall carplay_services 2>/dev/null || true
+        killall carplay_bt 2>/dev/null || true
+        killall CarDisplaySim 2>/dev/null || true
+        killall "CarPlay Simulator" 2>/dev/null || true
+        killall "CarPlay Simulato" 2>/dev/null || true
+        killall Showcase 2>/dev/null || true
+        if [ -f "$BTSTACK_PLIST" ]; then
+            if LAUNCHCTL="$(launchctl_path)"; then
+                "$LAUNCHCTL" unload "$BTSTACK_PLIST" 2>/dev/null || true
+            fi
+        fi
+        killall BTdaemon 2>/dev/null || true
+
+        if [ -f "$BLUETOOTHD_PLIST" ]; then
+            if LAUNCHCTL="$(launchctl_path)"; then
+                "$LAUNCHCTL" load "$BLUETOOTHD_PLIST" 2>/dev/null || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

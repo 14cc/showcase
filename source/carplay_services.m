@@ -339,6 +339,49 @@ static SecKeyRef  g_baa_broker_key = NULL;
  * the leaf buffer then holds the whole certificate.p7b, intermediate is empty,
  * and signing uses raw-digest ECDSA (MFi auth v3) rather than BAA's scheme. */
 static bool       g_local_mfi_mode = false;
+/* What the broker signs with, reported to Settings › About. */
+static const char *g_cert_source = "none";
+static time_t     g_cert_issued_at = 0;
+static time_t     g_cert_not_after = 0;
+
+static time_t der_time(const uint8_t *s, int tag, int len) {
+    char buf[16];
+    if (len <= 0 || len > 15) return 0;
+    memcpy(buf, s, len);
+    buf[len] = 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    int year = 0;
+    if (tag == 0x17) {
+        if (sscanf(buf, "%2d%2d%2d%2d%2d%2d", &year, &tm.tm_mon, &tm.tm_mday,
+                   &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) return 0;
+        year += year < 50 ? 2000 : 1900;
+    } else if (sscanf(buf, "%4d%2d%2d%2d%2d%2d", &year, &tm.tm_mon, &tm.tm_mday,
+                      &tm.tm_hour, &tm.tm_min, &tm.tm_sec) != 6) {
+        return 0;
+    }
+    tm.tm_year = year - 1900;
+    tm.tm_mon -= 1;
+    return timegm(&tm);
+}
+
+/* notAfter of the first certificate in a DER blob (a bare certificate or a
+ * PKCS#7 bundle): the first Validity SEQUENCE of two UTC/Generalized times.
+ * Returns 0 when there is none. */
+static time_t cert_not_after(const uint8_t *der, int len) {
+    for (int i = 0; der && i + 6 < len; i++) {
+        if (der[i] != 0x30 || (der[i + 1] & 0x80)) continue;
+        int a = i + 2, t1 = der[a], l1 = der[a + 1];
+        if (!((t1 == 0x17 && l1 == 13) || (t1 == 0x18 && l1 == 15))) continue;
+        int b = a + 2 + l1;
+        if (b + 2 > len) continue;
+        int t2 = der[b], l2 = der[b + 1];
+        if (!((t2 == 0x17 && l2 == 13) || (t2 == 0x18 && l2 == 15))) continue;
+        if (der[i + 1] != 4 + l1 + l2 || b + 2 + l2 > len) continue;
+        return der_time(der + b + 2, t2, l2);
+    }
+    return 0;
+}
 
 static void load_baa_from_broker(void) {
     printf("[BAA] Loading preheated certificate from Showcase...\n");
@@ -367,8 +410,10 @@ static bool issue_baa_for_broker(void) {
     SecKeyRef localKey = NULL;
     /* Loose files win (lets you override the embedded cert for testing); the
      * embedded certificate is the default for shipped builds. */
-    if (local_mfi_load(&p7b, &p7b_len, &localKey) ||
-        local_mfi_load_embedded(&p7b, &p7b_len, &localKey)) {
+    const char *source = NULL;
+    if (local_mfi_load(&p7b, &p7b_len, &localKey)) source = "file";
+    else if (local_mfi_load_embedded(&p7b, &p7b_len, &localKey)) source = "embedded";
+    if (source) {
         g_baa_leaf_der = p7b;              /* whole p7b, sent verbatim */
         g_baa_leaf_len = p7b_len;
         g_baa_inter_der = NULL;            /* empty => local-MFi signal */
@@ -376,7 +421,10 @@ static bool issue_baa_for_broker(void) {
         g_baa_broker_key = localKey;
         g_baa_ready = true;
         g_local_mfi_mode = true;
-        printf("[BAA] Using local MFi certificate (offline, no network).\n");
+        g_cert_source = source;
+        g_cert_issued_at = time(NULL);
+        g_cert_not_after = cert_not_after(p7b, p7b_len);
+        printf("[BAA] Using local MFi certificate (offline, no network) source=%s.\n", source);
         return true;
     }
 
@@ -446,6 +494,9 @@ static bool issue_baa_for_broker(void) {
     if (g_baa_ready) {
         printf("[BAA] Preheated: leaf=%d intermediate=%d\n",
                g_baa_leaf_len, g_baa_inter_len);
+        g_cert_source = "baa";
+        g_cert_issued_at = time(NULL);
+        g_cert_not_after = cert_not_after(g_baa_leaf_der, g_baa_leaf_len);
     }
     return g_baa_ready && g_baa_broker_key;
 }
@@ -520,6 +571,15 @@ static void baa_broker_handle_client(int client) {
             }
         } else {
             status = BAA_STATUS_SIGN_FAILED;
+        }
+    } else if (opcode == BAA_OP_STATUS && requestLength == 0) {
+        char text[160];
+        int n = snprintf(text, sizeof(text), "source=%s\nissued=%ld\nnotafter=%ld\n",
+                         g_cert_source, (long)g_cert_issued_at, (long)g_cert_not_after);
+        if (n > 0 && (size_t)n < sizeof(text) && (response = malloc((size_t)n))) {
+            memcpy(response, text, (size_t)n);
+            responseLength = (uint32_t)n;
+            status = BAA_STATUS_OK;
         }
     }
     free(request);

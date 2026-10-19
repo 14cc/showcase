@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Showcase</title>
+  <title>Showcase · a5</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 24px; line-height: 1.45; color: #111; }
     h1 { font-size: 28px; margin: 0 0 8px; }
@@ -13,8 +13,13 @@
   </style>
 </head>
 <body>
-  <h1>Showcase</h1>
+  <h1>Showcase · a5</h1>
   <p>Turn a jailbroken iPhone or iPad into a wireless CarPlay receiver.</p>
+  <div style="background:#eef6f5;border-left:4px solid #1F6F6A;padding:10px 14px;border-radius:8px;margin:14px 0;">
+    <p style="margin:0 0 6px;"><b>基于开源项目改编</b>：本插件在开源项目 <b>Showcase</b> 基础上改编，遵循其 GPL 许可。</p>
+    <p style="margin:0 0 6px;">原项目地址：<a href="https://github.com/amineross/showcase">https://github.com/amineross/showcase</a></p>
+    <p style="margin:0;">a5 版<b>仅新增 MFi 证书离线认证</b>：证书已内置，装上即用，正常无需联网刷新苹果 BAA（找不到内置证书时自动回退联网 BAA）。未包含投屏、浏览器转发、域名绑定、限速等其他改动。</p>
+  </div>
 
   <h2>Compatibility</h2>
   <ul>
@@ -30,16 +35,33 @@
     <code>bluetoothd</code> when stopped. Diagnostics and packet dumps are off
     by default. Enable them in Settings, under Troubleshooting, only when collecting a report.
   </p>
-  <p>
-    Showcase needs internet to prepare CarPlay authentication. It stays
-    ready across launches for up to 12 hours.
-  </p>
+  <p>本版内置 MFi 证书，CarPlay 认证离线完成，正常无需联网；仅在未找到内置证书时回退到联网 BAA（约 12 小时刷新一次）。</p>
   <p>
     Tap with three fingers during CarPlay to reveal the stop and settings
     controls. Tap anywhere to return to CarPlay.
   </p>
 
   <h2>Changelog</h2>
+  <h3>a5 · Beta 5.1.3 — 2026-10-19</h3>
+  <ul>
+    <li>修复：无根版和隐根版蓝牙后台连接失败（bt_open rc=-1），5.1.2 修好函数名后暴露出的第二个问题：我们编译的蓝牙库连错了通道。已改正，编译时也会自动检查。</li>
+  </ul>
+  <h3>a5 · Beta 5.1.2 — 2026-10-19</h3>
+  <ul>
+    <li>修复：无根版和隐根版打开后蓝牙启动失败（报错 symbol not found _rfcomm_accept_connection）。原因是我们自己编译的蓝牙库和程序用的函数名对不上，已补齐，并在编译时自动检查，以后不会再漏。</li>
+    <li>有根版、Taurine 版不受影响，本次只是一起升级版本号。</li>
+  </ul>
+  <h3>a5 · Beta 5.1.1 — 2026-10-18（首发）</h3>
+  <ul>
+    <li>基于上游 Showcase Beta 5 改编。</li>
+    <li>新增：自备 MFi 证书离线认证，证书内置二进制，装上即用，无需联网刷 BAA（找不到证书时回退联网 BAA）。</li>
+    <li>新增：设置 › 关于 里显示「当前证书」（内置证书 / 证书文件 / 苹果 BAA）和有效期，BAA 显示剩余时间。</li>
+    <li>支持有根（unc0ver / checkra1n 等）、无根（Dopamine / palera1n 无根模式等）、隐根（RootHide），安装时自动匹配，不用自己选。</li>
+    <li>新增：Taurine 专用版「Showcase · a5 (Taurine)」，单独一个安装包，只适用于 iOS 14 的 Taurine 越狱（Taurine 上普通有根版蓝牙打不开）。Taurine 用户请装这个，不要装普通版。⚠️ 同样还没有真机测试，不保证能用。</li>
+    <li>⚠️ 隐根版是新增的，还没有在隐根真机上测试过，不保证能用。遇到问题请反馈。</li>
+    <li>未包含投屏 / 浏览器 / 域名 / 限速等私有改动。配套 share（上游 Beta 2-5）：程序未改动，仅新增隐根安装包。</li>
+  </ul>
+  <p style="color:#666;margin-top:18px;"><b>———— 以下为上游 Showcase 更新历史 ————</b></p>
   <h3>1.0 Beta 5</h3>
   <ul>
     <li>Settings &gt; Display has a resolution picker that follows your screen&#39;s shape, like on a Mac, and a 30 or 60 fps choice.</li>

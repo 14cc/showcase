@@ -36,13 +36,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "jbroot.h"
+
 #define LOCAL_MFI_CERT_NAME  "certificate.p7b"
 #define LOCAL_MFI_KEY_NAME   "identity.pk8"
 #define LOCAL_MFI_MAX_FILE   (64U * 1024U)
 #define LOCAL_MFI_SIG_BYTES  64   /* raw r||s for P-256 */
 
 static const char *const LOCAL_MFI_DIRS[] = {
-    "/var/jb/etc/showcase",       /* rootless (Dopamine) */
+    "/var/jb/etc/showcase",       /* rootless (Dopamine); RootHide maps it via jb_fix */
     "/etc/showcase",              /* rootful */
     "/var/mobile/showcase-cert",  /* fallback, no root write needed */
 };
@@ -264,8 +266,8 @@ static inline bool lmfi_locate(char *cert_path, char *key_path, size_t cap) {
     size_t n = sizeof(LOCAL_MFI_DIRS) / sizeof(LOCAL_MFI_DIRS[0]);
     for (size_t i = 0; i < n; i++) {
         char c[1024], k[1024];
-        snprintf(c, sizeof(c), "%s/%s", LOCAL_MFI_DIRS[i], LOCAL_MFI_CERT_NAME);
-        snprintf(k, sizeof(k), "%s/%s", LOCAL_MFI_DIRS[i], LOCAL_MFI_KEY_NAME);
+        snprintf(c, sizeof(c), "%s/%s", jb_fix(LOCAL_MFI_DIRS[i]), LOCAL_MFI_CERT_NAME);
+        snprintf(k, sizeof(k), "%s/%s", jb_fix(LOCAL_MFI_DIRS[i]), LOCAL_MFI_KEY_NAME);
         FILE *cf = fopen(c, "rb");
         if (!cf) continue;
         fclose(cf);

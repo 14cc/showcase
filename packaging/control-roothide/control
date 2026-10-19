@@ -1,0 +1,21 @@
+Package: com.rostane.showcase
+Name: Showcase (RootHide)
+Version: @PACKAGE_VERSION@
+Architecture: iphoneos-arm64e
+Section: Utilities
+Maintainer: Amine Rostane <amine.rostane@outlook.com>
+Author: Amine Rostane <amine.rostane@outlook.com>
+Depends: firmware (>= 15.0), uikittools, ldid
+Conflicts: ch.ringwald.btstack
+Replaces: ch.ringwald.btstack (<= 1.1-1)
+Homepage: https://github.com/amineross/showcase
+Icon: https://aminerostane.com/repo/icons/showcase.png
+Depiction: https://aminerostane.com/repo/depictions/cydia.html
+SileoDepiction: https://aminerostane.com/repo/depictions/sileo.json
+Description: Wireless CarPlay receiver for RootHide jailbreaks.
+ Showcase turns a jailbroken iPhone or iPad into a wireless CarPlay
+ receiver. This package uses the RootHide layout and supports
+ iOS 15 or newer.
+ .
+ Beta 5 adds a resolution and frame rate picker, Prioritize Quality and
+ Performance, and French, Spanish, Chinese and Japanese.

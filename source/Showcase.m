@@ -45,6 +45,7 @@
 #include <mach/mach_time.h>
 #include <notify.h>
 #include "baa_broker.h"
+#include "jbroot.h"
 
 extern char **environ;
 
@@ -195,6 +196,9 @@ static void ip_log_open(void) {
 #define BLUETOOTHD_PLIST  "/System/Library/LaunchDaemons/com.apple.bluetoothd.plist"
 #define BT_READY_PATH     "/tmp/showcase_bt_ready"
 #define BLUETOOL_PLIST    "/System/Library/LaunchDaemons/com.apple.BlueTool.plist"
+#ifdef SHOWCASE_ROOTHIDE
+#define JB_PATH(path)     jb_path(path)   /* jbroot is only known at run time */
+#endif
 #ifdef SHOWCASE_ROOTLESS
 #define JB_PREFIX         "/var/jb"
 #ifndef SHOWCASE_BTSTACK_PLIST
@@ -212,7 +216,9 @@ static void ip_log_open(void) {
 #define SHOWCASE_BTSTACK_SOCKET "/tmp/BTstack"
 #endif
 #endif
+#ifndef JB_PATH
 #define JB_PATH(path)     JB_PREFIX path
+#endif
 #define BTSTACK_PLIST     SHOWCASE_BTSTACK_PLIST
 #define BTSTACK_SOCKET    SHOWCASE_BTSTACK_SOCKET
 #ifndef SHOWCASE_BTDAEMON_PATH
@@ -302,7 +308,7 @@ static const char *launchctl_path(void) {
     };
 #endif
     for (int i = 0; paths[i]; i++) {
-        if (access(paths[i], X_OK) == 0) return paths[i];
+        if (access(jb_fix(paths[i]), X_OK) == 0) return jb_fix(paths[i]);
     }
     return NULL;
 }
@@ -365,13 +371,14 @@ static BOOL start_bluetooth_guard(void) {
          "rm -f \"$6\"";
     NSDictionary *job = @{
         @"Label": @"com.reng.showcase.bluetooth-recovery",
-        @"ProgramArguments": @[@JB_PATH("/bin/sh"), @"-c", script,
+        @"ProgramArguments": @[@(JB_PATH("/bin/sh")), @"-c", script,
             @"showcase-bluetooth-recovery", [NSString stringWithFormat:@"%d", getpid()],
-            @(ctl), @BTSTACK_PLIST, @BLUETOOL_PLIST, @BLUETOOTHD_PLIST,
-            @BT_GUARD_READY, @JB_PATH("/usr/bin/killall"), @BTSTACK_SOCKET,
+            @(ctl), @(BTSTACK_PLIST), @BLUETOOL_PLIST, @BLUETOOTHD_PLIST,
+            @BT_GUARD_READY, @(JB_PATH("/usr/bin/killall")), @BTSTACK_SOCKET,
             @BT_OWNED_FLAG],
         @"RunAtLoad": @YES,
-        @"EnvironmentVariables": @{@"PATH": @JB_PATH("/usr/bin") ":" JB_PATH("/bin") ":/usr/bin:/bin"},
+        @"EnvironmentVariables": @{@"PATH": [NSString stringWithFormat:@"%s:%s:/usr/bin:/bin",
+                                                   JB_PATH("/usr/bin"), JB_PATH("/bin")]},
         @"StandardOutPath": @LOG_DIR "/bluetooth-recovery.log",
         @"StandardErrorPath": @LOG_DIR "/bluetooth-recovery.log"
     };
@@ -902,7 +909,9 @@ static NSString *bluetooth_diagnostic_report(
             ? @"converged-skywalk-present"
             : (registry == BluetoothRegistryProbeMissing
                 ? @"supported-transport-missing" : @"unavailable"));
-#ifdef SHOWCASE_ROOTLESS
+#if defined(SHOWCASE_ROOTHIDE)
+    NSString *layout = @"roothide";
+#elif defined(SHOWCASE_ROOTLESS)
     NSString *layout = @"rootless";
 #else
     NSString *layout = @"rootful";
@@ -924,8 +933,12 @@ static NSString *bluetooth_diagnostic_report(
             X_OK) == 0 ? "yes" : "no"];
     [report appendFormat:@"btdaemon=%s executable=%s\n", BTDAEMON_PATH,
         access(BTDAEMON_PATH, X_OK) == 0 ? "yes" : "no"];
+#ifdef SHOWCASE_ROOTHIDE
+    [report appendString:@"libbtstack=static\n"];
+#else
     [report appendFormat:@"libbtstack=%s readable=%s\n", BTSTACK_DYLIB_PATH,
         access(BTSTACK_DYLIB_PATH, R_OK) == 0 ? "yes" : "no"];
+#endif
     [report appendFormat:@"launch_plist=%s readable=%s\n", BTSTACK_PLIST,
         access(BTSTACK_PLIST, R_OK) == 0 ? "yes" : "no"];
     [report appendFormat:@"retry=%@\n", retryAttempted ? @"yes" : @"no"];
@@ -1537,7 +1550,7 @@ static void awdl_restore(BOOL logEachInterface) {
 
 static const char *first_existing_tool(const char *const paths[]) {
     for (int i = 0; paths[i]; i++) {
-        if (access(paths[i], X_OK) == 0) return paths[i];
+        if (access(jb_fix(paths[i]), X_OK) == 0) return jb_fix(paths[i]);
     }
     return NULL;
 }
@@ -1822,6 +1835,22 @@ static void reap_stale_helpers(pid_t preservedPid) {
     unlink(BTSTACK_SOCKET);
 #endif
 }
+
+#ifdef SHOWCASE_ROOTHIDE
+/* The package ships ProgramArguments as "/usr/bin/BTdaemon"; launchd needs
+ * the real path under this device's jbroot. postinst rewrites it too; this
+ * covers a plist restored or edited since. */
+static void roothide_prepare_btstack_plist(void) {
+    NSString *path = @(BTSTACK_PLIST);
+    NSMutableDictionary *plist = [NSMutableDictionary dictionaryWithContentsOfFile:path];
+    if (!plist) return;
+    NSArray *program = @[@(BTDAEMON_PATH)];
+    if ([plist[@"ProgramArguments"] isEqual:program]) return;
+    plist[@"ProgramArguments"] = program;
+    if (![plist writeToFile:path atomically:YES])
+        ip_log("[BT] WARNING: could not update %s", BTSTACK_PLIST);
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════
  * Data model + persistence
@@ -4093,12 +4122,16 @@ static pid_t reusable_baa_broker(void) {
                              unsupported:NO];
         return;
     }
+#ifndef SHOWCASE_ROOTHIDE   /* RootHide links BTstack into CarDisplaySim */
     if (access(BTSTACK_DYLIB_PATH, R_OK) != 0) {
         [self failBluetoothWithReason:
             @"The bundled BTstack library is missing or is not readable."
                              unsupported:NO];
         return;
     }
+#else
+    roothide_prepare_btstack_plist();
+#endif
     if (access(BTSTACK_PLIST, R_OK) != 0) {
         [self failBluetoothWithReason:
             @"The BTstack launch daemon configuration is missing or unreadable."
@@ -5102,7 +5135,9 @@ static NSString *hotspot_name(void) {
     NSMutableString *env = [NSMutableString string];
     [env appendFormat:@"Showcase diagnostics\n"];
     [env appendFormat:@"version=%s\n", APP_VERSION];
-#ifdef SHOWCASE_ROOTLESS
+#if defined(SHOWCASE_ROOTHIDE)
+    [env appendFormat:@"layout=roothide jbroot=%s\n", jb_root()];
+#elif defined(SHOWCASE_ROOTLESS)
     [env appendString:@"layout=rootless\n"];
 #else
     [env appendString:@"layout=rootful\n"];
@@ -7087,6 +7122,42 @@ static BOOL g_settings_hardware_loading = NO;
     });
 }
 
+/* Which certificate CarPlay authentication uses, asked from the running
+ * broker. A BAA certificate is re-issued once the broker's 12-hour reuse
+ * window ends, so its row counts down to that or to notAfter if sooner. */
+- (NSArray<NSString *> *)certificateStatus {
+    char text[256];
+    int rc = baa_broker_status(text, sizeof(text));
+    if (rc == -(int)BAA_STATUS_NOT_READY - 1) return @[L(@"Preparing…"), @"—"];
+    if (rc != 0) return @[L(@"Not running"), @"—"];
+    NSString *source = @"";
+    long long issued = 0, notAfter = 0;
+    for (NSString *line in [@(text) componentsSeparatedByString:@"\n"]) {
+        if ([line hasPrefix:@"source="]) source = [line substringFromIndex:7];
+        else if ([line hasPrefix:@"issued="]) issued = [[line substringFromIndex:7] longLongValue];
+        else if ([line hasPrefix:@"notafter="]) notAfter = [[line substringFromIndex:9] longLongValue];
+    }
+    NSString *until = @"—";
+    if (notAfter > 0) {
+        NSDateFormatter *format = [[NSDateFormatter alloc] init];
+        format.dateFormat = @"yyyy-MM-dd";
+        until = [NSString stringWithFormat:L(@"Until %@"),
+                 [format stringFromDate:[NSDate dateWithTimeIntervalSince1970:notAfter]]];
+    }
+    if ([source isEqualToString:@"embedded"]) return @[L(@"Built-in (offline)"), until];
+    if ([source isEqualToString:@"file"]) return @[L(@"Certificate file (offline)"), until];
+    if ([source isEqualToString:@"baa"]) {
+        long long end = issued + BAA_BROKER_REUSE_SECONDS;
+        if (notAfter > 0 && notAfter < end) end = notAfter;
+        long long left = end - (long long)time(NULL);
+        NSString *remaining = left > 0
+            ? [NSString stringWithFormat:L(@"%d h %d min left"), (int)(left / 3600), (int)(left % 3600 / 60)]
+            : L(@"Renews on next start");
+        return @[L(@"Apple BAA (online)"), remaining];
+    }
+    return @[L(@"Unknown"), @"—"];
+}
+
 - (void)buildAbout:(SettingsPageBuilder *)b {
     CGFloat w = b.width;
     [b gap:8];
@@ -7106,7 +7177,9 @@ static BOOL g_settings_hardware_loading = NO;
     [self loadHardwareInfo];
     NSDictionary *hw = g_settings_hardware_info;
     NSString *checking = L(@"Checking…");
-#ifdef SHOWCASE_ROOTLESS
+#if defined(SHOWCASE_ROOTHIDE)
+    NSString *package = @"RootHide";
+#elif defined(SHOWCASE_ROOTLESS)
     NSString *package = @"Rootless";
 #else
     NSString *package = @"Rootful";
@@ -7115,6 +7188,9 @@ static BOOL g_settings_hardware_loading = NO;
         [card addRow:[self valueRow:L(@"Model") value:hardware_machine_identifier() width:w] height:48];
         [card addRow:[self valueRow:@"iOS" value:[UIDevice currentDevice].systemVersion width:w] height:48];
         [card addRow:[self valueRow:L(@"Package") value:package width:w] height:48];
+        NSArray<NSString *> *certificate = [self certificateStatus];
+        [card addRow:[self valueRow:L(@"Certificate") value:certificate[0] width:w] height:48];
+        [card addRow:[self valueRow:L(@"Certificate Validity") value:certificate[1] width:w] height:48];
         [card addRow:[self valueRow:@"Bluetooth" value:hw[@"bluetooth"] ?: checking width:w] height:48];
         [card addRow:[self valueRow:L(@"Wi-Fi Bus") value:hw[@"wifi"] ?: checking width:w] height:48];
         [card addRow:[self valueRow:L(@"CarPlay Video") value:hw ? [self videoDescription] : checking width:w] height:48];
@@ -7395,7 +7471,9 @@ int main(int argc, char *argv[]) {
     ip_log_open();
     ip_log("main: ruid=%u euid=%u argc=%d", getuid(), geteuid(), argc);
     ip_log("bundle: %s", [[[NSBundle mainBundle] bundlePath] UTF8String]);
-#ifdef SHOWCASE_ROOTLESS
+#if defined(SHOWCASE_ROOTHIDE)
+    ip_log("build: %s roothide jbroot=%s", APP_VERSION, jb_root());
+#elif defined(SHOWCASE_ROOTLESS)
     ip_log("build: %s rootless", APP_VERSION);
 #else
     ip_log("build: %s rootful", APP_VERSION);

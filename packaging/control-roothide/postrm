@@ -1,0 +1,34 @@
+#!/bin/sh
+set -e
+
+# RootHide keeps the jailbreak in a per-device random directory, not /var/jb.
+find_jbroot() {
+    if command -v jbroot >/dev/null 2>&1; then
+        root="$(jbroot / 2>/dev/null)"; root="${root%/}"
+        if [ -n "$root" ] && [ -d "$root/usr/bin" ]; then echo "$root"; return 0; fi
+    fi
+    case "$0" in
+        */var/lib/dpkg/info/*)
+            root="${0%/var/lib/dpkg/info/*}"
+            if [ -n "$root" ] && [ -d "$root/usr/bin" ]; then echo "$root"; return 0; fi ;;
+    esac
+    for root in /var/containers/Bundle/Application/.jbroot-*; do
+        if [ -d "$root/usr/bin" ]; then echo "$root"; return 0; fi
+    done
+    return 1
+}
+if ! JBROOT="$(find_jbroot)"; then
+    exit 0   # nothing of ours to clean up; never block removal
+fi
+
+APP="$JBROOT/Applications/Showcase.app"
+
+for tool in $JBROOT/usr/bin/uicache /usr/bin/uicache; do
+    if [ -x "$tool" ]; then
+        "$tool" --unregister "$APP" 2>/dev/null || true
+        "$tool" --all 2>/dev/null || true
+        break
+    fi
+done
+
+exit 0

@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 
 #define BAA_BROKER_PATH          "/tmp/showcase_baa.sock"
@@ -29,6 +30,7 @@
 #define BAA_OP_GET_CERTS  1
 #define BAA_OP_SIGN       2   /* BAA: ECDSA message/SHA256, DER signature out */
 #define BAA_OP_SIGN_RAW   3   /* local MFi: ECDSA over 32-byte digest, raw r||s */
+#define BAA_OP_STATUS     4   /* text: source=embedded|file|baa, issued=, notafter= */
 
 #define BAA_STATUS_OK          0
 #define BAA_STATUS_NOT_READY   1
@@ -255,6 +257,37 @@ static inline int baa_broker_sign_raw(const uint8_t *digest32,
     *signature = response;
     *signatureLength = (int)responseLength;
     return 0;
+}
+
+/* Which certificate the broker signs with, as "source=...\nissued=<unix>\n
+ * notafter=<unix>\n". Gives up after one second so a stuck broker cannot
+ * freeze the caller. Returns 0, or -(status)-1 when the broker answered with
+ * an error (BAA_STATUS_NOT_READY while it is still preparing). */
+static inline int baa_broker_status(char *text, size_t textSize) {
+    if (!text || textSize == 0) return -1;
+    text[0] = 0;
+    int fd = baa_broker_connect();
+    if (fd < 0) return -1;
+    struct timeval timeout = { 1, 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    uint8_t header[BAA_BROKER_HEADER_SIZE];
+    baa_make_header(header, BAA_OP_STATUS, 0, 0);
+    int rc = -1;
+    if (baa_write_exact(fd, header, sizeof(header)) &&
+        baa_read_exact(fd, header, sizeof(header)) &&
+        memcmp(header, BAA_BROKER_MAGIC, 4) == 0 &&
+        header[4] == BAA_OP_STATUS) {
+        uint32_t length = baa_read_le32(header + 8);
+        if (header[5] != BAA_STATUS_OK) {
+            rc = -(int)header[5] - 1;
+        } else if (length < textSize && baa_read_exact(fd, text, length)) {
+            text[length] = 0;
+            rc = 0;
+        }
+    }
+    close(fd);
+    return rc;
 }
 
 #endif
