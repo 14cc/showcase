@@ -41,10 +41,12 @@
 "Save" = "保存";
 "Hotspot passwords must be at least 8 characters." = "ホットスポットのパスワードは8文字以上にしてください。";
 "OK" = "OK";
-"Different Name" = "名前が一致しません";
-"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "このiPadのホットスポット名は「%@」です。iPhoneはここに入力した名前に接続するため、一致させる必要があります。「%@」を使うには、「設定 > 一般 > 情報 > 名前」でiPadの名前を変更してください。";
+"Check the Apostrophe" = "アポストロフィを確認";
+"The hotspot uses this %@'s name exactly, and iOS writes apostrophes in names as ’. You entered a straight ', which won't match." = "ホットスポットはこの%@の名前をそのまま使い、iOSは名前のアポストロフィを ’ と書きます。入力されたのはまっすぐな ' なので一致しません。";
 "Use “%@”" = "「%@」を使用";
 "Keep" = "そのままにする";
+"Different Name" = "名前が一致しません";
+"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "このiPadのホットスポット名は「%@」です。iPhoneはここに入力した名前に接続するため、一致させる必要があります。「%@」を使うには、「設定 > 一般 > 情報 > 名前」でiPadの名前を変更してください。";
 "%@\n\nSaved to:\n%@" = "%@\n\n保存先:\n%@";
 "The share sheet could not be shown." = "共有シートを表示できませんでした。";
 "Export Saved" = "書き出しを保存しました";
@@ -82,6 +84,7 @@
 "Show" = "表示";
 "8 characters or more" = "8文字以上";
 "Rename This %@" = "この%@の名前を変更";
+"Saved. Check the apostrophe: iOS writes it as ’ in device names, and you entered a straight '. The names must match exactly." = "保存しました。アポストロフィを確認してください：iOSはデバイス名で ’ と書きますが、入力されたのはまっすぐな ' です。名前は完全に一致する必要があります。";
 "Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match." = "保存しましたが、このiPadのホットスポット名は「%@」です。名前が一致するまでiPhoneは接続できません。";
 "Saved." = "保存しました。";
 "Play Sound on This %@" = "この%@でサウンドを再生";

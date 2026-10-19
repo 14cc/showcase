@@ -1955,6 +1955,36 @@ static NSString *validateSSID(NSString *ssid) {
     return nil;
 }
 
+/* iOS types the device name with curly quotes (Licy’s), Personal Hotspot
+ * uses that name byte for byte, and a hand-typed SSID usually has the
+ * straight ASCII ones, so the iPhone looks for a network that isn't there.
+ * Folds every quote style to ASCII so the two names can be compared. */
+static NSString *ssid_fold_quotes(NSString *ssid) {
+    NSMutableString *folded = [ssid mutableCopy] ?: [NSMutableString string];
+    NSDictionary *quotes = @{@"\u2018": @"'", @"\u2019": @"'", @"\u02BC": @"'",
+                             @"\u201C": @"\"", @"\u201D": @"\""};
+    for (NSString *quote in quotes)
+        [folded replaceOccurrencesOfString:quote withString:quotes[quote]
+                                   options:0 range:NSMakeRange(0, folded.length)];
+    return folded;
+}
+
+/* The device name when it differs from the typed name only by quote style,
+ * otherwise the typed name. */
+static NSString *ssid_matching_device_name(NSString *ssid, NSString *deviceName) {
+    if (deviceName && ![ssid isEqualToString:deviceName] &&
+        [ssid_fold_quotes(ssid) isEqualToString:ssid_fold_quotes(deviceName)])
+        return deviceName;
+    return ssid;
+}
+
+/* The typed name with straight apostrophes turned into the ’ iOS uses, or
+ * nil when it has none. For when the device name can't be read. */
+static NSString *ssid_with_curly_apostrophes(NSString *ssid) {
+    if ([ssid rangeOfString:@"'"].location == NSNotFound) return nil;
+    return [ssid stringByReplacingOccurrencesOfString:@"'" withString:@"\u2019"];
+}
+
 @interface CarStore : NSObject
 @property (nonatomic, strong) NSMutableArray<Car *> *cars;
 @property (nonatomic, strong) Car *selected;
@@ -2715,28 +2745,16 @@ static OSStatus carplay_aac_input_callback(
 
 @end
 
-/* The interface-orientation names describe the content rotation, not the
- * physical device rotation. LandscapeLeft therefore places the top edge
- * (and a notch or Dynamic Island) on the right side of the display. Long
- * phone panels are used as the hardware signal so this remains independent
- * of model identifier, OS version, and jailbreak layout. */
-static BOOL showcase_phone_has_landscape_cutout(void) {
-    if (UI_USER_INTERFACE_IDIOM() != UIUserInterfaceIdiomPhone) return NO;
-    CGSize pixels = [UIScreen mainScreen].nativeBounds.size;
-    CGFloat shortEdge = MIN(pixels.width, pixels.height);
-    CGFloat longEdge = MAX(pixels.width, pixels.height);
-    return shortEdge > 0.0 && (longEdge / shortEdge) > 2.0;
-}
-
 /* "iPad" or "iPhone", for text that names the device running Showcase. */
 static NSString *showcase_device_noun(void) {
     return UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad ? @"iPad" : @"iPhone";
 }
 
+/* Both landscape sides on every device, so a phone with a notch or Dynamic
+ * Island can be mounted either way round. Nothing in the CarPlay layout
+ * depends on which side the cutout is on. */
 static UIInterfaceOrientationMask showcase_orientation_mask(void) {
-    return showcase_phone_has_landscape_cutout()
-        ? UIInterfaceOrientationMaskLandscapeLeft
-        : UIInterfaceOrientationMaskLandscape;
+    return UIInterfaceOrientationMaskLandscape;
 }
 
 static UIInterfaceOrientation showcase_preferred_orientation(void) {
@@ -3977,7 +3995,16 @@ static pid_t reusable_baa_broker(void) {
            [self.cars.selected.name UTF8String],
            [self.cars.apSSID UTF8String]);
     NSString *deviceName = hotspot_name();
-    if (deviceName && ![deviceName isEqualToString:self.cars.apSSID])
+    NSString *matched = ssid_matching_device_name(self.cars.apSSID ?: @"", deviceName);
+    if (![matched isEqualToString:self.cars.apSSID ?: @""]) {
+        ip_log("[HOTSPOT] SSID '%s' differs from the device name only by quotes; using '%s'",
+               self.cars.apSSID.UTF8String, matched.UTF8String);
+        [self.cars setAPSSID:matched password:self.cars.apPassword];
+    }
+    if (!deviceName)
+        ip_log("[HOTSPOT] device name unreadable; can't check the SSID against it%s",
+               ssid_with_curly_apostrophes(self.cars.apSSID) ? " (SSID has a straight ')" : "");
+    else if (![deviceName isEqualToString:self.cars.apSSID])
         ip_log("[HOTSPOT] WARNING: hotspot is named '%s' but Showcase sends '%s'",
                deviceName.UTF8String, self.cars.apSSID.UTF8String);
     self.bluetoothHandedOff = NO;
@@ -4712,6 +4739,8 @@ static NSString *gestalt_string(CFStringRef key) {
 /* Without access, iOS 16 and later answer with the model ("iPad"). */
 static NSString *hotspot_name(void) {
     NSString *name = gestalt_string(CFSTR("UserAssignedDeviceName"));
+    if (!name) name = [UIDevice currentDevice].name;
+    if ([name isEqualToString:[UIDevice currentDevice].model]) return nil;
     return [name isEqualToString:gestalt_string(CFSTR("DeviceName"))] ? nil : name;
 }
 
@@ -4764,6 +4793,24 @@ static NSString *hotspot_name(void) {
                         [self promptForCredentialsFromController:weakHost];
                     }]];
                 [weakHost presentViewController:e animated:YES completion:nil];
+                return;
+            }
+            ssid = ssid_matching_device_name(ssid, deviceName);
+            NSString *curly = deviceName ? nil : ssid_with_curly_apostrophes(ssid);
+            if (curly) {
+                UIAlertController *q = [UIAlertController
+                    alertControllerWithTitle:L(@"Check the Apostrophe")
+                                     message:[NSString stringWithFormat:
+                        L(@"The hotspot uses this %@'s name exactly, and iOS writes apostrophes in names as \u2019. You entered a straight ', which won't match."),
+                        showcase_device_noun()]
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [q addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:L(@"Use \u201c%@\u201d"), curly]
+                    style:UIAlertActionStyleDefault handler:^(UIAlertAction *_b) {
+                        [self saveSSID:curly password:pass host:weakHost];
+                    }]];
+                [q addAction:[UIAlertAction actionWithTitle:L(@"Keep") style:UIAlertActionStyleCancel
+                    handler:^(UIAlertAction *_b) { [self saveSSID:ssid password:pass host:weakHost]; }]];
+                [weakHost presentViewController:q animated:YES completion:nil];
                 return;
             }
             if (deviceName && ![ssid isEqualToString:deviceName]) {
@@ -5193,6 +5240,7 @@ static NSString *hotspot_name(void) {
     [env appendFormat:@"state=%ld\n", (long)self.state];
     [env appendFormat:@"selected_car=%@\n", self.cars.selected.name ?: @""];
     [env appendFormat:@"hotspot_ssid=%@\n", self.cars.apSSID ?: @""];
+    [env appendFormat:@"device_name=%@\n", hotspot_name() ?: @"(unreadable)"];
     [env appendFormat:@"launchctl=%s\n", launchctl ?: "(missing)"];
     [env appendFormat:@"tar=%s\n", tarPath ?: "(missing)"];
     [env appendFormat:@"dpkg=%s\n", dpkgPath ?: "(missing)"];
@@ -6890,9 +6938,16 @@ static BOOL g_settings_hardware_loading = NO;
         error = L(@"Hotspot passwords must be at least 8 characters.");
     [self.view endEditing:YES];
     if (error) { [self setMessage:error error:YES]; return; }
+    NSString *deviceName = hotspot_name();
+    ssid = ssid_matching_device_name(ssid, deviceName);
+    self.ssidField.text = ssid;
     [app.cars setAPSSID:ssid password:pass];
     [app renderState];
-    NSString *deviceName = hotspot_name();
+    if (!deviceName && ssid_with_curly_apostrophes(ssid)) {
+        [self setMessage:L(@"Saved. Check the apostrophe: iOS writes it as \u2019 in device names, and you entered a straight '. The names must match exactly.")
+                   error:YES];
+        return;
+    }
     if (deviceName && ![deviceName isEqualToString:ssid]) {
         [self setMessage:[NSString stringWithFormat:
             L(@"Saved, but this iPad's hotspot is called \u201c%@\u201d. Your iPhone can't join until the names match."),

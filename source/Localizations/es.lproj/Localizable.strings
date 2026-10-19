@@ -41,10 +41,12 @@
 "Save" = "Guardar";
 "Hotspot passwords must be at least 8 characters." = "La contraseña del punto de acceso debe tener al menos 8 caracteres.";
 "OK" = "OK";
-"Different Name" = "Nombre distinto";
-"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "El punto de acceso de este iPad se llama “%@”. Tu iPhone se conecta al nombre que introduzcas aquí, así que deben coincidir. Para usar “%@”, cambia el nombre del iPad en Ajustes > General > Información > Nombre.";
+"Check the Apostrophe" = "Revisa el apóstrofo";
+"The hotspot uses this %@'s name exactly, and iOS writes apostrophes in names as ’. You entered a straight ', which won't match." = "El punto de acceso usa exactamente el nombre de este %@, e iOS escribe los apóstrofos de los nombres como ’. Has introducido un apóstrofo recto ', que no coincidirá.";
 "Use “%@”" = "Usar “%@”";
 "Keep" = "Mantener";
+"Different Name" = "Nombre distinto";
+"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "El punto de acceso de este iPad se llama “%@”. Tu iPhone se conecta al nombre que introduzcas aquí, así que deben coincidir. Para usar “%@”, cambia el nombre del iPad en Ajustes > General > Información > Nombre.";
 "%@\n\nSaved to:\n%@" = "%@\n\nGuardado en:\n%@";
 "The share sheet could not be shown." = "No se ha podido mostrar la hoja para compartir.";
 "Export Saved" = "Exportación guardada";
@@ -82,6 +84,7 @@
 "Show" = "Mostrar";
 "8 characters or more" = "8 caracteres o más";
 "Rename This %@" = "Cambiar el nombre de este %@";
+"Saved. Check the apostrophe: iOS writes it as ’ in device names, and you entered a straight '. The names must match exactly." = "Guardado. Revisa el apóstrofo: iOS lo escribe como ’ en los nombres de dispositivo y has introducido uno recto '. Los nombres deben coincidir exactamente.";
 "Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match." = "Guardado, pero el punto de acceso de este iPad se llama “%@”. Tu iPhone no podrá conectarse hasta que los nombres coincidan.";
 "Saved." = "Guardado.";
 "Play Sound on This %@" = "Reproducir el sonido en este %@";

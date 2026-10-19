@@ -297,4 +297,15 @@ T = {
         '2.  ホットスポット情報を入力'),
     'Enter Details': ('Saisir les infos', 'Introducir datos', '输入信息', '情報を入力'),
     'Copy': ('Copier', 'Copiar', '拷贝', 'コピー'),
+    'Check the Apostrophe': ('Vérifiez l’apostrophe', 'Revisa el apóstrofo', '检查撇号', 'アポストロフィを確認'),
+    "The hotspot uses this %@'s name exactly, and iOS writes apostrophes in names as ’. You entered a straight ', which won't match.": (
+        "Le point d’accès reprend exactement le nom de cet %@, et iOS écrit les apostrophes des noms ’. Vous avez saisi une apostrophe droite ', qui ne correspondra pas.",
+        "El punto de acceso usa exactamente el nombre de este %@, e iOS escribe los apóstrofos de los nombres como ’. Has introducido un apóstrofo recto ', que no coincidirá.",
+        "热点名称与这台 %@ 的名称完全一致，而 iOS 在名称里写的撇号是弯撇号 ’。你输入的是直撇号 '，两者对不上。",
+        "ホットスポットはこの%@の名前をそのまま使い、iOSは名前のアポストロフィを ’ と書きます。入力されたのはまっすぐな ' なので一致しません。"),
+    "Saved. Check the apostrophe: iOS writes it as ’ in device names, and you entered a straight '. The names must match exactly.": (
+        "Enregistré. Vérifiez l’apostrophe : iOS l’écrit ’ dans les noms d’appareil, et vous avez saisi une apostrophe droite '. Les noms doivent correspondre exactement.",
+        "Guardado. Revisa el apóstrofo: iOS lo escribe como ’ en los nombres de dispositivo y has introducido uno recto '. Los nombres deben coincidir exactamente.",
+        "已存储。请检查撇号：iOS 在设备名称里写的是弯撇号 ’，你输入的是直撇号 '。两个名称必须完全一致。",
+        "保存しました。アポストロフィを確認してください：iOSはデバイス名で ’ と書きますが、入力されたのはまっすぐな ' です。名前は完全に一致する必要があります。"),
 }

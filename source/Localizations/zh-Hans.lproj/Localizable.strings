@@ -41,10 +41,12 @@
 "Save" = "存储";
 "Hotspot passwords must be at least 8 characters." = "热点密码至少需要 8 个字符。";
 "OK" = "好";
-"Different Name" = "名称不一致";
-"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "此 iPad 的热点名为“%@”。你的 iPhone 会加入你在此输入的名称，因此两者必须一致。若要使用“%@”，请在“设置 > 通用 > 关于本机 > 名称”中重命名 iPad。";
+"Check the Apostrophe" = "检查撇号";
+"The hotspot uses this %@'s name exactly, and iOS writes apostrophes in names as ’. You entered a straight ', which won't match." = "热点名称与这台 %@ 的名称完全一致，而 iOS 在名称里写的撇号是弯撇号 ’。你输入的是直撇号 '，两者对不上。";
 "Use “%@”" = "使用“%@”";
 "Keep" = "保留";
+"Different Name" = "名称不一致";
+"This iPad's hotspot is called “%@”. Your iPhone joins the name you enter here, so it has to match. To use “%@”, rename the iPad in Settings > General > About > Name." = "此 iPad 的热点名为“%@”。你的 iPhone 会加入你在此输入的名称，因此两者必须一致。若要使用“%@”，请在“设置 > 通用 > 关于本机 > 名称”中重命名 iPad。";
 "%@\n\nSaved to:\n%@" = "%@\n\n已存储到：\n%@";
 "The share sheet could not be shown." = "无法显示共享表单。";
 "Export Saved" = "导出已存储";
@@ -82,6 +84,7 @@
 "Show" = "显示";
 "8 characters or more" = "至少 8 个字符";
 "Rename This %@" = "重命名这台 %@";
+"Saved. Check the apostrophe: iOS writes it as ’ in device names, and you entered a straight '. The names must match exactly." = "已存储。请检查撇号：iOS 在设备名称里写的是弯撇号 ’，你输入的是直撇号 '。两个名称必须完全一致。";
 "Saved, but this iPad's hotspot is called “%@”. Your iPhone can't join until the names match." = "已存储，但此 iPad 的热点名为“%@”。名称一致之前，你的 iPhone 无法加入。";
 "Saved." = "已存储。";
 "Play Sound on This %@" = "在这台 %@ 上播放声音";

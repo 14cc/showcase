@@ -87,6 +87,14 @@
       "views": [
         {
           "class": "DepictionHeaderView",
+          "title": "a5 · Beta 5.1.8 — 2026-10-19"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "新增：刘海屏和灵动岛 iPhone 现在两个横屏方向都能用（之前只能刘海朝右一个方向）。iPad 和其他 iPhone 本来就支持两个方向。⚠️ 未在真机上验证。\n\n新增：热点名称自动检查。iPhone 设置里的设备名用的是弯撇号 ’，手动输入的通常是直撇号 '，两者不一致时主 iPhone 就连不上热点。现在保存热点名称和开始连接时，如果只差引号样式，会自动改成和设备名一致；读不到设备名时，名称里有直撇号会弹出提醒。诊断报告里也会记下读到的设备名。⚠️ 未在真机上验证。\n\n四个版本（有根、无根、隐根、Taurine）都包含这两项改动。"
+        },
+        {
+          "class": "DepictionHeaderView",
           "title": "a5 · Beta 5.1.7 — 2026-10-19"
         },
         {
