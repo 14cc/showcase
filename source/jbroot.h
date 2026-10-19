@@ -102,8 +102,42 @@ static inline __attribute__((unused)) const char *jb_fix(const char *path) {
         return path;
     return jb_cached_join(path, path + 7);
 }
+/* Paths handed to RootHide's own tools (launchctl, sh, killall). Those tools
+ * see the jbroot as "/" and reach the real root through /rootfs, so a real
+ * path under the jbroot loses its prefix and any other real path gains
+ * "/rootfs". Results are cached per input pointer, so pass stable strings. */
+static inline __attribute__((unused)) const char *jb_tool_path(const char *path) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static struct { const char *key; char *value; } cache[32];
+    if (!path || path[0] != '/') return path;
+    const char *root = jb_root();
+    size_t rootLength = strlen(root);
+    if (strncmp(path, root, rootLength) == 0 &&
+        (path[rootLength] == '/' || path[rootLength] == 0))
+        return path[rootLength] ? path + rootLength : "/";
+    pthread_mutex_lock(&lock);
+    for (int i = 0; i < 32; i++) {
+        if (cache[i].key == path) {
+            pthread_mutex_unlock(&lock);
+            return cache[i].value;
+        }
+        if (!cache[i].key) {
+            size_t length = strlen("/rootfs") + strlen(path) + 1;
+            char *value = malloc(length);
+            if (!value) break;
+            snprintf(value, length, "/rootfs%s", path);
+            cache[i].key = path;
+            cache[i].value = value;
+            pthread_mutex_unlock(&lock);
+            return value;
+        }
+    }
+    pthread_mutex_unlock(&lock);
+    return path;
+}
 #else
 #define jb_fix(path) (path)
+#define jb_tool_path(path) (path)
 #endif
 
 #endif

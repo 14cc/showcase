@@ -344,7 +344,7 @@ static void stop_bluetooth_guard(void) {
     const char *ctl = launchctl_path();
     if (!ctl) return;
     char *args[] = { (char *)"launchctl", (char *)"unload",
-                     (char *)BT_GUARD_PLIST, NULL };
+                     (char *)jb_tool_path(BT_GUARD_PLIST), NULL };
     run_blocking(ctl, args);
     unlink(BT_GUARD_READY);
 }
@@ -373,9 +373,12 @@ static BOOL start_bluetooth_guard(void) {
         @"Label": @"com.reng.showcase.bluetooth-recovery",
         @"ProgramArguments": @[@(JB_PATH("/bin/sh")), @"-c", script,
             @"showcase-bluetooth-recovery", [NSString stringWithFormat:@"%d", getpid()],
-            @(ctl), @(BTSTACK_PLIST), @BLUETOOL_PLIST, @BLUETOOTHD_PLIST,
-            @BT_GUARD_READY, @(JB_PATH("/usr/bin/killall")), @BTSTACK_SOCKET,
-            @BT_OWNED_FLAG],
+            /* sh, launchctl and killall read these: RootHide tool paths. */
+            @(jb_tool_path(ctl)), @(jb_tool_path(BTSTACK_PLIST)),
+            @(jb_tool_path(BLUETOOL_PLIST)), @(jb_tool_path(BLUETOOTHD_PLIST)),
+            @(jb_tool_path(BT_GUARD_READY)),
+            @(jb_tool_path(JB_PATH("/usr/bin/killall"))),
+            @(jb_tool_path(BTSTACK_SOCKET)), @(jb_tool_path(BT_OWNED_FLAG))],
         @"RunAtLoad": @YES,
         @"EnvironmentVariables": @{@"PATH": [NSString stringWithFormat:@"%s:%s:/usr/bin:/bin",
                                                    JB_PATH("/usr/bin"), JB_PATH("/bin")]},
@@ -384,7 +387,7 @@ static BOOL start_bluetooth_guard(void) {
     };
     if (![job writeToFile:@BT_GUARD_PLIST atomically:YES]) return NO;
     char *args[] = { (char *)"launchctl", (char *)"load",
-                     (char *)BT_GUARD_PLIST, NULL };
+                     (char *)jb_tool_path(BT_GUARD_PLIST), NULL };
     if (run_blocking(ctl, args) != 0) return NO;
     for (int i = 0; i < 50; i++) {
         if (access(BT_GUARD_READY, F_OK) == 0) return YES;
@@ -398,9 +401,9 @@ static void restore_system_bluetooth(const char *reason) {
     const char *launchctl = launchctl_path();
     if (!launchctl) return;
     char *loadBlueTool[] = { (char *)"launchctl", (char *)"load",
-                             (char *)BLUETOOL_PLIST, NULL };
+                             (char *)jb_tool_path(BLUETOOL_PLIST), NULL };
     char *loadBluetoothd[] = { (char *)"launchctl", (char *)"load",
-                               (char *)BLUETOOTHD_PLIST, NULL };
+                               (char *)jb_tool_path(BLUETOOTHD_PLIST), NULL };
     int toolRc = run_blocking(launchctl, loadBlueTool);
     int daemonRc = run_blocking(launchctl, loadBluetoothd);
     unlink(BT_OWNED_FLAG);
@@ -3147,7 +3150,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
         const char *launchctl = launchctl_path();
         if (launchctl) {
             char *unloadBTstack[] = { (char *)"launchctl", (char *)"unload",
-                                      (char *)BTSTACK_PLIST, NULL };
+                                      (char *)jb_tool_path(BTSTACK_PLIST), NULL };
             run_blocking(launchctl, unloadBTstack);
             unlink(BTSTACK_SOCKET);
         }
@@ -4196,12 +4199,12 @@ static pid_t reusable_baa_broker(void) {
 #else
     /* 1. Unload bluetoothd */
     char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
-                           (char*)BLUETOOTHD_PLIST, NULL };
+                           (char*)jb_tool_path(BLUETOOTHD_PLIST), NULL };
     int rc = run_blocking(launchctl, unloadArgv);
     if (rc != 0) ip_log("  WARNING: launchctl unload returned %d", rc);
 #ifdef SHOWCASE_ROOTLESS
     char *unloadBlueToolArgv[] = { (char*)"launchctl", (char*)"unload",
-                                   (char*)BLUETOOL_PLIST, NULL };
+                                   (char*)jb_tool_path(BLUETOOL_PLIST), NULL };
     rc = run_blocking(launchctl, unloadBlueToolArgv);
     if (rc != 0) ip_log("  WARNING: BlueTool unload returned %d", rc);
 #endif
@@ -4209,12 +4212,12 @@ static pid_t reusable_baa_broker(void) {
 
     /* 2. Start bundled BTstack through launchd so the advertised socket exists. */
     char *unloadBTstackArgv[] = { (char*)"launchctl", (char*)"unload",
-                                  (char*)BTSTACK_PLIST, NULL };
+                                  (char*)jb_tool_path(BTSTACK_PLIST), NULL };
     run_blocking(launchctl, unloadBTstackArgv);
     unlink(BTSTACK_SOCKET);
 
     char *loadBTstackArgv[] = { (char*)"launchctl", (char*)"load",
-                                (char*)BTSTACK_PLIST, NULL };
+                                (char*)jb_tool_path(BTSTACK_PLIST), NULL };
     rc = run_blocking(launchctl, loadBTstackArgv);
     if (rc != 0) {
         [self failBluetoothWithReason:
@@ -4271,9 +4274,9 @@ static pid_t reusable_baa_broker(void) {
         /* Bring Apple's Bluetooth back first so launchd can spawn the
          * daemon again. */
         char *loadBlueToolArgv[] = { (char*)"launchctl", (char*)"load",
-                                     (char*)BLUETOOL_PLIST, NULL };
+                                     (char*)jb_tool_path(BLUETOOL_PLIST), NULL };
         char *loadArgv[] = { (char*)"launchctl", (char*)"load",
-                             (char*)BLUETOOTHD_PLIST, NULL };
+                             (char*)jb_tool_path(BLUETOOTHD_PLIST), NULL };
         run_blocking(launchctl, loadBlueToolArgv);
         run_blocking(launchctl, loadArgv);
         unlink(BT_OWNED_FLAG);
@@ -4315,9 +4318,9 @@ static pid_t reusable_baa_broker(void) {
 #ifdef SHOWCASE_TAURINE
 - (BOOL)startBTstackDaemon:(const char *)launchctl {
     char *unloadBTstackArgv[] = { (char*)"launchctl", (char*)"unload",
-                                  (char*)BTSTACK_PLIST, NULL };
+                                  (char*)jb_tool_path(BTSTACK_PLIST), NULL };
     char *loadBTstackArgv[] = { (char*)"launchctl", (char*)"load",
-                                (char*)BTSTACK_PLIST, NULL };
+                                (char*)jb_tool_path(BTSTACK_PLIST), NULL };
     char *startBTstackArgv[] = { (char*)"launchctl", (char*)"start",
                                  (char*)"ch.ringwald.BTstack", NULL };
     run_blocking(launchctl, unloadBTstackArgv);
@@ -4353,11 +4356,11 @@ static pid_t reusable_baa_broker(void) {
     int flag = open(BT_OWNED_FLAG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (flag >= 0) close(flag);
     char *unloadArgv[] = { (char*)"launchctl", (char*)"unload",
-                           (char*)BLUETOOTHD_PLIST, NULL };
+                           (char*)jb_tool_path(BLUETOOTHD_PLIST), NULL };
     int rc = run_blocking(launchctl, unloadArgv);
     if (rc != 0) ip_log("  WARNING: launchctl unload returned %d", rc);
     char *unloadBlueToolArgv[] = { (char*)"launchctl", (char*)"unload",
-                                   (char*)BLUETOOL_PLIST, NULL };
+                                   (char*)jb_tool_path(BLUETOOL_PLIST), NULL };
     rc = run_blocking(launchctl, unloadBlueToolArgv);
     if (rc != 0) ip_log("  WARNING: BlueTool unload returned %d", rc);
     /* An unload can stay in progress; make sure the UART is free. */
@@ -4488,7 +4491,7 @@ static pid_t reusable_baa_broker(void) {
         if (launchctl) {
             char *unloadBTstackArgv[] = {
                 (char *)"launchctl", (char *)"unload",
-                (char *)BTSTACK_PLIST, NULL
+                (char *)jb_tool_path(BTSTACK_PLIST), NULL
             };
             rc = run_blocking(launchctl, unloadBTstackArgv);
         }
@@ -4531,7 +4534,7 @@ static pid_t reusable_baa_broker(void) {
         const char *launchctl = launchctl_path();
         if (launchctl) {
             char *unloadBTstackArgv[] = { (char*)"launchctl", (char*)"unload",
-                                          (char*)BTSTACK_PLIST, NULL };
+                                          (char*)jb_tool_path(BTSTACK_PLIST), NULL };
             run_blocking(launchctl, unloadBTstackArgv);
             unlink(BTSTACK_SOCKET);
             restore_system_bluetooth("CarPlay stopped");
