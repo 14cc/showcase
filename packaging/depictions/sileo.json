@@ -87,6 +87,14 @@
       "views": [
         {
           "class": "DepictionHeaderView",
+          "title": "a5 · Beta 5.1.5 — 2026-10-19"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "修复：隐根版报「蓝牙设置失败」（The BTstack daemon did not create its control socket）。5.1.4 修好前两步后暴露出的同类问题：蓝牙后台服务的通道文件被隐根工具建到了隐根目录里，已改到正确位置。⚠️ 未在隐根真机上验证。\n\n有根版、无根版、Taurine 版不受影响，本次只是一起升级版本号。"
+        },
+        {
+          "class": "DepictionHeaderView",
           "title": "a5 · Beta 5.1.4 — 2026-10-19"
         },
         {

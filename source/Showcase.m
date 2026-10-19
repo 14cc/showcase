@@ -1848,8 +1848,19 @@ static void roothide_prepare_btstack_plist(void) {
     NSMutableDictionary *plist = [NSMutableDictionary dictionaryWithContentsOfFile:path];
     if (!plist) return;
     NSArray *program = @[@(BTDAEMON_PATH)];
-    if ([plist[@"ProgramArguments"] isEqual:program]) return;
+    /* RootHide's launchctl creates the listening socket itself and sees the
+     * jbroot as "/", so "/tmp/BTstack" would land in <jbroot>/tmp. */
+    NSString *socketPath = @(jb_tool_path(BTSTACK_SOCKET));
+    NSMutableDictionary *sockets = [plist[@"Sockets"] mutableCopy];
+    NSMutableDictionary *listeners = [sockets[@"Listeners"] mutableCopy];
+    if ([plist[@"ProgramArguments"] isEqual:program] &&
+        (!listeners || [listeners[@"SockPathName"] isEqual:socketPath])) return;
     plist[@"ProgramArguments"] = program;
+    if (listeners) {
+        listeners[@"SockPathName"] = socketPath;
+        sockets[@"Listeners"] = listeners;
+        plist[@"Sockets"] = sockets;
+    }
     if (![plist writeToFile:path atomically:YES])
         ip_log("[BT] WARNING: could not update %s", BTSTACK_PLIST);
 }
