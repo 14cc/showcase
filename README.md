@@ -8,6 +8,12 @@ This repository contains the Showcase source. Install the packaged tweak from th
 https://aminerostane.com/repo
 ```
 
+Beta 5-2
+
+- Turns on Prioritize Quality once for everyone, including existing setups. Turn it off in Settings > Display and it stays off.
+- Adds a star button on the home screen that links to this repository.
+- Adds anonymous usage reporting, on by default. Settings > Anonymous Usage turns it off or turns off single items. See [Anonymous Usage](#anonymous-usage).
+
 Beta 5
 
 - Adds a resolution picker and a 30 or 60 fps choice in Settings > Display. The resolutions follow your screen's shape, like on a Mac.
@@ -104,6 +110,25 @@ Either priority grays out Resolution and Frame Rate; only one can be on. The Abo
 
 The sharper stream started with [@edouaz](https://github.com/edouaz) in [#26](https://github.com/amineross/showcase/pull/26), tested on an iPad Air (iPad4,1) on iOS 12.5.7. `tests/test_display_profile.py` compiles the production selector and checks every mode across 576 receiver profiles.
 
+## Anonymous Usage
+
+Showcase reports how many people use it and on what, so I know which devices and jailbreaks to support. Settings > Anonymous Usage lists every item with the value Showcase sends, and turns each one off, or all of them.
+
+| Item | Example |
+| --- | --- |
+| `id` | `bedab7dc-d7d5-42e8-9ecb-6132d381e320`, a random UUID made on first use. It isn't derived from the device |
+| `model` | `iPad4,2` |
+| `ios` | `12.5.8` |
+| `jailbreak` | `amethyst`, guessed from the jailbreak's marker file, or `unknown` |
+| `version` | `1.0~beta5-2` |
+| `package` | `rootful`, `rootless` or `taurine` |
+| `language` | `fr` |
+| `country` | `true` asks the server to store the country Cloudflare sees for the request |
+
+Showcase posts these as JSON to `https://aminerostane.com/api/ping` 10 seconds after launch, only when the items differ from the last report or 30 days have passed. If the request fails, Showcase drops it and tries again next launch; nothing shows on screen.
+
+The endpoint is a Cloudflare Worker, `telemetry/worker.js`, with a D1 database. It keeps one row per `id` with first and last report dates and stores no IP address. An item turned off is cleared from that row on the next report. The app side is `send_anonymous_usage()` in `source/Showcase.m`.
+
 ## Languages
 
 Showcase speaks English, French, Spanish, Simplified Chinese and Japanese. It follows the device's preferred languages; Settings > Language picks another one. iOS places and features use Apple's own names in each language.
@@ -120,6 +145,7 @@ source/Localizations/
               generated translations
 packaging/    Debian control files, depictions, package scripts
 tweak/        BTQuiet, shipped only in the Taurine package
+telemetry/    Cloudflare Worker and schema behind anonymous usage
 tools/localization/
               translation table and generator
 icon/         app icons

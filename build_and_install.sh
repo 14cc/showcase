@@ -111,7 +111,7 @@ echo "[2/7] Compiling Showcase"
 # the SDK's .tbd stubs as 'out of sync' for libSystem (memset/strcmp etc).
 # Symbols resolve at runtime via dyld through libSystem.B.dylib (linked via Foundation).
 ssh_cmd "clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot $SDK_REMOTE \
-    -DAPP_VERSION='\"$DISPLAY_VERSION\"' $APP_FLAGS -o /tmp/Showcase /tmp/Showcase.m \
+    -DAPP_VERSION='\"$DISPLAY_VERSION\"' -DPACKAGE_VERSION='\"$PACKAGE_VERSION\"' $APP_FLAGS -o /tmp/Showcase /tmp/Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup 2>&1" || { echo "FAIL"; exit 1; }

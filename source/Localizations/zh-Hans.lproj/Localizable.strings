@@ -6,6 +6,9 @@
 "Copy Diagnostic" = "拷贝诊断信息";
 "Close" = "关闭";
 "Copied" = "已拷贝";
+"Give us a star on GitHub!" = "在 GitHub 上给我们点个 Star！";
+"Copy Link" = "拷贝链接";
+"Open GitHub" = "打开 GitHub";
 "Settings" = "设置";
 "CarPlay services" = "CarPlay 服务";
 "Verification" = "验证";
@@ -66,9 +69,12 @@
 "Resolution" = "分辨率";
 "Language" = "语言";
 "Troubleshooting" = "故障排除";
+"Anonymous Usage" = "匿名使用数据";
 "About" = "关于";
 "Not set" = "未设置";
 "Logging on" = "日志已打开";
+"On" = "打开";
+"Off" = "关闭";
 "Stop CarPlay" = "停止 CarPlay";
 "Edit" = "编辑";
 "Add Car" = "添加车辆";
@@ -92,6 +98,14 @@
 "Frame Rate" = "帧率";
 "Dedicate Wi-Fi to CarPlay" = "Wi-Fi 专用于 CarPlay";
 "Start CarPlay Automatically" = "自动启动 CarPlay";
+"Share Anonymous Usage" = "共享匿名使用数据";
+"Device Model" = "设备型号";
+"iOS Version" = "iOS 版本";
+"Jailbreak" = "越狱";
+"Showcase Version" = "Showcase 版本";
+"Package" = "软件包";
+"Country" = "国家/地区";
+"View Source" = "查看源代码";
 "Default" = "默认";
 "Device Language" = "设备语言";
 "Detailed Logging" = "详细日志";
@@ -111,7 +125,6 @@
 "by %s  %s" = "作者：%s  %s";
 "Checking…" = "正在检查…";
 "Model" = "型号";
-"Package" = "软件包";
 "Wi-Fi Bus" = "Wi-Fi 总线";
 "CarPlay Video" = "CarPlay 视频";
 "Wi-Fi Setup" = "Wi-Fi 设置";

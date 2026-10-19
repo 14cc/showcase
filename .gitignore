@@ -18,3 +18,6 @@ source/*.o
 source/*.dSYM/
 
 build/
+
+# Local Wrangler state
+telemetry/.wrangler/

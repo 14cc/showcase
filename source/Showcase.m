@@ -138,6 +138,13 @@ static NSString *L(NSString *english) {
 #define DEDICATED_RADIO_KEY     @"leaveOtherWiFiDuringCarPlay"
 #define HELD_WIFI_NETWORK_KEY   @"heldWiFiNetworkSSID"
 #define HOTSPOT_OWNED_KEY       @"hotspotStartedByShowcase"
+/* Beta 6 turns Prioritize Quality on once; later choices are kept. */
+#define QUALITY_DEFAULT_SET_KEY @"qualityDefaultApplied"
+#define USAGE_KEY               @"anonymousUsageEnabled"
+#define USAGE_ID_KEY            @"anonymousUsageID"
+#define USAGE_SENT_KEY          @"anonymousUsageSentPayload"
+#define USAGE_SENT_DATE_KEY     @"anonymousUsageSentDate"
+#define GITHUB_URL              @"https://github.com/amineross/showcase"
 #define MIS_STATE_OFF           1022
 #define MIS_STATE_ON            1023
 #define SHOWCASE_BT_PROGRESS_NOTIFICATION "com.rostane.showcase.bt-progress"
@@ -189,6 +196,9 @@ static void ip_log_open(void) {
 /* Release builds pass APP_VERSION from the VERSION file. */
 #ifndef APP_VERSION
 #define APP_VERSION       "development"
+#endif
+#ifndef PACKAGE_VERSION
+#define PACKAGE_VERSION   "development"
 #endif
 #define APP_AUTHOR        "Amine Rostane"
 #define SOCK_PATH         "/tmp/ipadplay.sock"   /* IPC socket — kept for compat with carplay_services */
@@ -1295,6 +1305,97 @@ static void showcase_release_other_wifi(const char *reason) {
            ssid.UTF8String, reason);
     [[NSUserDefaults standardUserDefaults] removeObjectForKey:HELD_WIFI_NETWORK_KEY];
     [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * Anonymous usage
+ *
+ * Counts how many people use Showcase and on what. Each item below can be
+ * turned off in Settings › Anonymous Usage, or all of it at once:
+ *
+ *   id         a random UUID made here, not derived from the device
+ *   version    Showcase package version, for example 1.0~beta5-2
+ *   package    rootful, rootless or taurine
+ *   model      hardware model, for example iPad4,2
+ *   ios        iOS version
+ *   jailbreak  guessed from the jailbreak's marker file, or "unknown"
+ *   language   Showcase's language
+ *   country    asks the server to keep the country Cloudflare reports
+ *
+ * It is posted to https://aminerostane.com/api/ping (telemetry/worker.js)
+ * when it differs from the last one sent, or after 30 days. The server keeps
+ * one row per id and never stores IP addresses. Failures are ignored.
+ * ═══════════════════════════════════════════════════════════════ */
+
+/* Settings key and payload key for each item, in Settings order. */
+static NSArray<NSArray<NSString *> *> *usage_items(void) {
+    return @[@[@"anonymousUsageModel", @"model"], @[@"anonymousUsageIOS", @"ios"],
+             @[@"anonymousUsageJailbreak", @"jailbreak"], @[@"anonymousUsageVersion", @"version"],
+             @[@"anonymousUsagePackage", @"package"], @[@"anonymousUsageLanguage", @"language"],
+             @[@"anonymousUsageCountry", @"country"]];
+}
+
+static NSString *usage_jailbreak(void) {
+    const char *markers[][2] = {
+        {"/var/jb/.installed_dopamine", "dopamine"}, {"/var/jb/.palecursus_strapped", "palera1n"},
+        {"/.palecursus_strapped", "palera1n"}, {"/.installed_amethyst", "amethyst"},
+        {"/.installed_taurine", "taurine"}, {"/.installed_odyssey", "odyssey"},
+        {"/.installed_unc0ver", "unc0ver"}, {"/.bootstrapped_electra", "chimera"},
+        {"/var/checkra1n.dmg", "checkra1n"}};
+    for (size_t i = 0; i < sizeof markers / sizeof markers[0]; i++)
+        if (access(markers[i][0], F_OK) == 0) return @(markers[i][1]);
+    return @"unknown";
+}
+
+static NSDictionary *usage_values(void) {
+#if defined(SHOWCASE_ROOTLESS)
+    NSString *package = @"rootless";
+#elif defined(SHOWCASE_TAURINE)
+    NSString *package = @"taurine";
+#else
+    NSString *package = @"rootful";
+#endif
+    NSOperatingSystemVersion os = [NSProcessInfo processInfo].operatingSystemVersion;
+    return @{@"model": hardware_machine_identifier(), @"jailbreak": usage_jailbreak(),
+             @"ios": [NSString stringWithFormat:@"%ld.%ld.%ld", (long)os.majorVersion,
+                      (long)os.minorVersion, (long)os.patchVersion],
+             @"version": @PACKAGE_VERSION, @"package": package,
+             @"language": showcase_language(), @"country": @YES};
+}
+
+static void send_anonymous_usage(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (![d boolForKey:USAGE_KEY]) return;
+    NSDictionary *values = usage_values();
+    NSMutableDictionary *payload = [NSMutableDictionary dictionary];
+    for (NSArray *item in usage_items())
+        if ([d boolForKey:item[0]]) payload[item[1]] = values[item[1]];
+    NSMutableString *summary = [NSMutableString string];
+    for (NSString *key in [payload.allKeys sortedArrayUsingSelector:@selector(compare:)])
+        [summary appendFormat:@"%@=%@;", key, payload[key]];
+    NSDate *sent = [d objectForKey:USAGE_SENT_DATE_KEY];
+    if ([summary isEqualToString:[d stringForKey:USAGE_SENT_KEY]] && [sent isKindOfClass:[NSDate class]] &&
+        -sent.timeIntervalSinceNow < 30 * 24 * 3600) return;
+
+    NSString *identifier = [d stringForKey:USAGE_ID_KEY];
+    if (!identifier.length) {
+        identifier = [NSUUID UUID].UUIDString.lowercaseString;
+        [d setObject:identifier forKey:USAGE_ID_KEY];
+    }
+    payload[@"id"] = identifier;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:
+        [NSURL URLWithString:@"https://aminerostane.com/api/ping"]];
+    request.HTTPMethod = @"POST";
+    request.timeoutInterval = 15;
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    request.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:request
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (error || ((NSHTTPURLResponse *)response).statusCode != 204) return;
+            [d setObject:summary forKey:USAGE_SENT_KEY];
+            [d setObject:[NSDate date] forKey:USAGE_SENT_DATE_KEY];
+            [d synchronize];
+        }] resume];
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -2669,6 +2770,100 @@ static UIInterfaceOrientation showcase_preferred_orientation(void) {
     return UIInterfaceOrientationLandscapeLeft;
 }
 
+static UIImage *showcase_star_image(CGFloat side);
+
+/* Asks for a GitHub star: the link, Copy Link and Open GitHub. Tapping
+ * outside the panel closes it. */
+@interface StarViewController : UIViewController
+@property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UIButton *linkButton;
+@end
+
+@implementation StarViewController
+
+- (UIButton *)button:(NSString *)title filled:(BOOL)filled action:(SEL)action {
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeCustom];
+    button.backgroundColor = filled ? [UIColor whiteColor] : [UIColor colorWithWhite:1 alpha:0.13];
+    [button setTitleColor:filled ? [UIColor blackColor] : [UIColor whiteColor] forState:UIControlStateNormal];
+    [button setTitle:title forState:UIControlStateNormal];
+    button.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightSemibold];
+    button.titleLabel.adjustsFontSizeToFitWidth = YES;
+    button.layer.cornerRadius = 10;
+    [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    [self.panel addSubview:button];
+    return button;
+}
+
+- (void)loadView {
+    UIView *root = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    root.backgroundColor = [UIColor colorWithWhite:0 alpha:0.7];
+    [root addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(close)]];
+    self.view = root;
+
+    self.panel = [[UIView alloc] init];
+    self.panel.backgroundColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+    self.panel.layer.cornerRadius = 16;
+    /* Taps on the panel itself must not close it. */
+    [self.panel addGestureRecognizer:[[UITapGestureRecognizer alloc] init]];
+    [root addSubview:self.panel];
+
+    UIImageView *star = [[UIImageView alloc] initWithImage:showcase_star_image(30)];
+    star.tintColor = [UIColor whiteColor];
+    star.tag = 1;
+    [self.panel addSubview:star];
+
+    UILabel *title = [[UILabel alloc] init];
+    title.text = L(@"Give us a star on GitHub!");
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont systemFontOfSize:22 weight:UIFontWeightSemibold];
+    title.textAlignment = NSTextAlignmentCenter;
+    title.adjustsFontSizeToFitWidth = YES;
+    title.minimumScaleFactor = 0.7;
+    title.tag = 2;
+    [self.panel addSubview:title];
+
+    UILabel *link = [[UILabel alloc] init];
+    link.text = [GITHUB_URL stringByReplacingOccurrencesOfString:@"https://" withString:@""];
+    link.textColor = [UIColor colorWithWhite:1 alpha:0.72];
+    link.font = [UIFont systemFontOfSize:16];
+    link.textAlignment = NSTextAlignmentCenter;
+    link.adjustsFontSizeToFitWidth = YES;
+    link.tag = 3;
+    [self.panel addSubview:link];
+
+    self.linkButton = [self button:L(@"Copy Link") filled:NO action:@selector(copyLink)];
+    [self button:L(@"Open GitHub") filled:YES action:@selector(openGitHub)].tag = 4;
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    CGSize size = self.view.bounds.size;
+    CGFloat w = MIN(size.width - 32, 420), h = 236, inset = 20;
+    self.panel.frame = CGRectMake((size.width - w) / 2, (size.height - h) / 2, w, h);
+    [self.panel viewWithTag:1].frame = CGRectMake((w - 30) / 2, 22, 30, 30);
+    [self.panel viewWithTag:2].frame = CGRectMake(inset, 64, w - inset * 2, 30);
+    [self.panel viewWithTag:3].frame = CGRectMake(inset, 100, w - inset * 2, 24);
+    CGFloat buttonW = (w - inset * 2 - 12) / 2;
+    self.linkButton.frame = CGRectMake(inset, h - 70, buttonW, 48);
+    [self.panel viewWithTag:4].frame = CGRectMake(inset + buttonW + 12, h - 70, buttonW, 48);
+}
+
+- (void)copyLink {
+    [UIPasteboard generalPasteboard].string = GITHUB_URL;
+    [self.linkButton setTitle:L(@"Copied") forState:UIControlStateNormal];
+}
+
+- (void)openGitHub {
+    [[UIApplication sharedApplication] openURL:[NSURL URLWithString:GITHUB_URL] options:@{} completionHandler:nil];
+    [self close];
+}
+
+- (void)close {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
 /* ═══════════════════════════════════════════════════════════════
  * RootViewController — landscape-only touch routing
  * ═══════════════════════════════════════════════════════════════ */
@@ -2817,6 +3012,29 @@ static UIImage *showcase_gear_image(CGFloat side) {
     [[UIColor whiteColor] setFill];
     [gear fill];
     (void)ctx;
+    UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+}
+
+/* A five-pointed star, drawn like the gear as a template image. */
+static UIImage *showcase_star_image(CGFloat side) {
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(side, side), NO, 0);
+    CGPoint c = CGPointMake(side / 2.0, side * 0.53);
+    CGFloat outer = side * 0.48, inner = outer * 0.42;
+    UIBezierPath *star = [UIBezierPath bezierPath];
+    for (int i = 0; i < 10; i++) {
+        CGFloat r = i % 2 ? inner : outer;
+        double angle = -M_PI_2 + i * M_PI / 5.0;
+        CGPoint p = CGPointMake(c.x + r * cos(angle), c.y + r * sin(angle));
+        if (i == 0) [star moveToPoint:p]; else [star addLineToPoint:p];
+    }
+    [star closePath];
+    star.lineJoinStyle = kCGLineJoinRound;
+    star.lineWidth = side * 0.06;
+    [[UIColor whiteColor] set];
+    [star fill];
+    [star stroke];
     UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     return [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
@@ -3005,6 +3223,7 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 /* Floating chrome */
 @property (nonatomic, strong) UIButton *closeButton;       /* top-right, only ACTIVE */
 @property (nonatomic, strong) UIButton *settingsButton;    /* top-left, revealed with close during Active */
+@property (nonatomic, strong) UIButton *starButton;        /* top-right on the setup screen */
 @property (nonatomic, strong) ControlsOverlayView *controlsOverlay;
 
 /* Three-finger tap is reserved for Showcase chrome and leaves pinch to CarPlay. */
@@ -3102,10 +3321,23 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     self.tcpdumpPid = 0;
     self.tcpdumpMissingPromptShown = NO;
     /* Opening Showcase is turning the car on: start and page the iPhone. */
-    [[NSUserDefaults standardUserDefaults] registerDefaults:@{
+    NSMutableDictionary *defaults = [@{
         DEDICATED_RADIO_KEY: @YES,
-        AUTO_START_KEY: @YES
-    }];
+        AUTO_START_KEY: @YES,
+        USAGE_KEY: @YES
+    } mutableCopy];
+    for (NSArray *item in usage_items()) defaults[item[0]] = @YES;
+    [[NSUserDefaults standardUserDefaults] registerDefaults:defaults];
+    /* Prioritize Quality becomes the default once, existing setups included. */
+    NSUserDefaults *prefs = [NSUserDefaults standardUserDefaults];
+    if (![prefs boolForKey:QUALITY_DEFAULT_SET_KEY]) {
+        [prefs setBool:YES forKey:QUALITY_VIDEO_KEY];
+        [prefs setBool:NO forKey:SMOOTH_VIDEO_KEY];
+        [prefs setBool:YES forKey:QUALITY_DEFAULT_SET_KEY];
+        [prefs synchronize];
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{ send_anonymous_usage(); });
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
     /* Settings reads the display hardware; probe the Wi-Fi bus off the main thread now. */
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ carplay_display_hardware(); });
@@ -3524,6 +3756,18 @@ static pid_t reusable_baa_broker(void) {
     [self.settingsButton addTarget:self action:@selector(settingsTapped) forControlEvents:UIControlEventTouchUpInside];
     [content addSubview:self.settingsButton];
 
+    /* GitHub star button, top right; part of the setup screen, so it hides with it. */
+    self.starButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.starButton.frame = CGRectMake(bs.width - sz - margin, margin, sz, sz);
+    self.starButton.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+    self.starButton.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12];
+    self.starButton.layer.cornerRadius = sz / 2.0;
+    self.starButton.tintColor = [UIColor whiteColor];
+    [self.starButton setImage:showcase_star_image(20) forState:UIControlStateNormal];
+    self.starButton.accessibilityLabel = L(@"Give us a star on GitHub!");
+    [self.starButton addTarget:self action:@selector(starTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.setupOverlay addSubview:self.starButton];
+
     self.controlsGesture = [[UITapGestureRecognizer alloc]
         initWithTarget:self action:@selector(toggleChrome:)];
     self.controlsGesture.numberOfTouchesRequired = 3;
@@ -3753,6 +3997,14 @@ static pid_t reusable_baa_broker(void) {
 
 - (void)closeTapped { [self stopFlow]; }
 - (void)settingsTapped { [self presentSettingsPage:nil]; }
+
+- (void)starTapped {
+    if (self.vc.presentedViewController) return;
+    StarViewController *star = [[StarViewController alloc] init];
+    star.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    star.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    [self.vc presentViewController:star animated:YES completion:nil];
+}
 
 - (void)presentSettingsPage:(NSString *)page {
     if ([self.vc.presentedViewController isKindOfClass:[SettingsViewController class]])
@@ -6127,6 +6379,7 @@ static BOOL g_settings_hardware_loading = NO;
     if ([page isEqualToString:@"resolution"]) return L(@"Resolution");
     if ([page isEqualToString:@"language"]) return L(@"Language");
     if ([page isEqualToString:@"logs"]) return L(@"Troubleshooting");
+    if ([page isEqualToString:@"usage"]) return L(@"Anonymous Usage");
     if ([page isEqualToString:@"about"]) return L(@"About");
     return L(@"Settings");
 }
@@ -6317,6 +6570,7 @@ static BOOL g_settings_hardware_loading = NO;
     else if ([page isEqualToString:@"resolution"]) [self buildResolution:b];
     else if ([page isEqualToString:@"language"]) [self buildLanguage:b];
     else if ([page isEqualToString:@"logs"]) [self buildLogs:b];
+    else if ([page isEqualToString:@"usage"]) [self buildUsage:b];
     else if ([page isEqualToString:@"about"]) [self buildAbout:b];
     CGRect cf = column.frame;
     cf.size.height = b.y;
@@ -6610,6 +6864,10 @@ static BOOL g_settings_hardware_loading = NO;
             value:app.diagnosticsEnabled ? L(@"Logging on") : @""
             width:w selected:[selected isEqualToString:@"logs"]
             action:^{ [weakSelf selectSection:@"logs"]; }] height:52];
+        [card addRow:[self navRow:L(@"Anonymous Usage")
+            value:[[NSUserDefaults standardUserDefaults] boolForKey:USAGE_KEY] ? L(@"On") : L(@"Off")
+            width:w selected:[selected isEqualToString:@"usage"]
+            action:^{ [weakSelf selectSection:@"usage"]; }] height:52];
         [card addRow:[self navRow:L(@"About") value:@""
             width:w selected:[selected isEqualToString:@"about"]
             action:^{ [weakSelf selectSection:@"about"]; }] height:52];
@@ -6918,6 +7176,63 @@ static BOOL g_settings_hardware_loading = NO;
             on:[d boolForKey:AUTO_START_KEY] width:w
             changed:^(BOOL on) { setter(AUTO_START_KEY, on); }];
         [card addRow:autoStart height:autoStart.bounds.size.height];
+    }];
+}
+
+/* Each item shows the value Showcase would send next to its switch. */
+- (void)buildUsage:(SettingsPageBuilder *)b {
+    CGFloat w = b.width;
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    __weak SettingsViewController *weakSelf = self;
+    BOOL enabled = [d boolForKey:USAGE_KEY];
+    void (^set)(NSString *, BOOL) = ^(NSString *key, BOOL on) {
+        [[NSUserDefaults standardUserDefaults] setBool:on forKey:key];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{ send_anonymous_usage(); });
+    };
+    [b card:^(SettingsCard *card) {
+        UIView *row = [self switchRow:L(@"Share Anonymous Usage") subtitle:nil on:enabled width:w
+            changed:^(BOOL on) {
+                set(USAGE_KEY, on);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ [weakSelf render]; });
+            }];
+        [card addRow:row height:row.bounds.size.height];
+    }];
+    NSDictionary *values = usage_values();
+    NSDictionary *titles = @{@"model": L(@"Device Model"), @"ios": L(@"iOS Version"),
+        @"jailbreak": L(@"Jailbreak"), @"version": L(@"Showcase Version"), @"package": L(@"Package"),
+        @"language": L(@"Language"), @"country": L(@"Country")};
+    [b card:^(SettingsCard *card) {
+        for (NSArray<NSString *> *item in usage_items()) {
+            NSString *key = item[0], *field = item[1];
+            UIView *row = [self switchRow:titles[field] subtitle:nil on:[d boolForKey:key] width:w
+                changed:^(BOOL on) { set(key, on); }];
+            NSString *value = [field isEqualToString:@"language"] ? showcase_language_name(values[field])
+                : [values[field] isKindOfClass:[NSString class]] ? values[field] : @"";
+            /* The title keeps its width; the value takes the rest before the switch. */
+            UILabel *title = row.subviews.firstObject;
+            CGFloat titleW = ceil([title sizeThatFits:CGSizeMake(CGFLOAT_MAX, 52)].width);
+            CGFloat valueX = 16 + titleW + 12;
+            UILabel *label = [[UILabel alloc] initWithFrame:
+                CGRectMake(valueX, 0, MAX(0, w - 16 - 51 - 12 - valueX), 52)];
+            label.text = value;
+            label.textAlignment = NSTextAlignmentRight;
+            label.textColor = [UIColor colorWithWhite:1 alpha:0.45];
+            label.font = [UIFont systemFontOfSize:16 weight:UIFontWeightRegular];
+            label.adjustsFontSizeToFitWidth = YES;
+            label.minimumScaleFactor = 0.75;
+            [row addSubview:label];
+            row.userInteractionEnabled = enabled;
+            row.alpha = enabled ? 1 : 0.35;
+            [card addRow:row height:row.bounds.size.height];
+        }
+    }];
+    [b card:^(SettingsCard *card) {
+        [card addRow:[self actionRow:L(@"View Source") color:nil width:w enabled:YES action:^{
+            [[UIApplication sharedApplication] openURL:[NSURL URLWithString:
+                GITHUB_URL @"/blob/main/telemetry/worker.js"] options:@{} completionHandler:nil];
+        }] height:52];
     }];
 }
 

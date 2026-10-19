@@ -6,6 +6,9 @@
 "Copy Diagnostic" = "Copiar diagnóstico";
 "Close" = "Cerrar";
 "Copied" = "Copiado";
+"Give us a star on GitHub!" = "¡Danos una estrella en GitHub!";
+"Copy Link" = "Copiar enlace";
+"Open GitHub" = "Abrir GitHub";
 "Settings" = "Ajustes";
 "CarPlay services" = "Servicios de CarPlay";
 "Verification" = "Verificación";
@@ -66,9 +69,12 @@
 "Resolution" = "Resolución";
 "Language" = "Idioma";
 "Troubleshooting" = "Solución de problemas";
+"Anonymous Usage" = "Uso anónimo";
 "About" = "Información";
 "Not set" = "Sin configurar";
 "Logging on" = "Registro activado";
+"On" = "Sí";
+"Off" = "No";
 "Stop CarPlay" = "Detener CarPlay";
 "Edit" = "Editar";
 "Add Car" = "Añadir vehículo";
@@ -92,6 +98,14 @@
 "Frame Rate" = "Frecuencia de fotogramas";
 "Dedicate Wi-Fi to CarPlay" = "Dedicar el Wi-Fi a CarPlay";
 "Start CarPlay Automatically" = "Iniciar CarPlay automáticamente";
+"Share Anonymous Usage" = "Compartir uso anónimo";
+"Device Model" = "Modelo del dispositivo";
+"iOS Version" = "Versión de iOS";
+"Jailbreak" = "Jailbreak";
+"Showcase Version" = "Versión de Showcase";
+"Package" = "Paquete";
+"Country" = "País";
+"View Source" = "Ver código fuente";
 "Default" = "Predeterminada";
 "Device Language" = "Idioma del dispositivo";
 "Detailed Logging" = "Registro detallado";
@@ -111,7 +125,6 @@
 "by %s  %s" = "por %s  %s";
 "Checking…" = "Comprobando…";
 "Model" = "Modelo";
-"Package" = "Paquete";
 "Wi-Fi Bus" = "Bus Wi-Fi";
 "CarPlay Video" = "Vídeo de CarPlay";
 "Wi-Fi Setup" = "Configuración de Wi-Fi";

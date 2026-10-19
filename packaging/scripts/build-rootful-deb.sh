@@ -135,7 +135,7 @@ cd '$REMOTE_BASE'
 tar -xf crypto-vendor.tar
 
 clang -fobjc-arc -miphoneos-version-min=12.0 -isysroot '$SDK_REMOTE' \
-    -DAPP_VERSION='\"$DISPLAY_VERSION\"' $APP_FLAGS -o Showcase Showcase.m \
+    -DAPP_VERSION='\"$DISPLAY_VERSION\"' -DPACKAGE_VERSION='\"$PACKAGE_VERSION\"' $APP_FLAGS -o Showcase Showcase.m \
     -framework UIKit -framework AVFoundation -framework AudioToolbox \
     -framework CoreMedia -framework Foundation -framework Security \
     -Wl,-undefined,dynamic_lookup

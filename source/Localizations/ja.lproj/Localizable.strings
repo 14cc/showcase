@@ -6,6 +6,9 @@
 "Copy Diagnostic" = "診断情報をコピー";
 "Close" = "閉じる";
 "Copied" = "コピーしました";
+"Give us a star on GitHub!" = "GitHubでスターをお願いします！";
+"Copy Link" = "リンクをコピー";
+"Open GitHub" = "GitHubを開く";
 "Settings" = "設定";
 "CarPlay services" = "CarPlayサービス";
 "Verification" = "認証";
@@ -66,9 +69,12 @@
 "Resolution" = "解像度";
 "Language" = "言語";
 "Troubleshooting" = "トラブルシューティング";
+"Anonymous Usage" = "匿名の使用状況";
 "About" = "情報";
 "Not set" = "未設定";
 "Logging on" = "ログ記録オン";
+"On" = "オン";
+"Off" = "オフ";
 "Stop CarPlay" = "CarPlayを停止";
 "Edit" = "編集";
 "Add Car" = "車を追加";
@@ -92,6 +98,14 @@
 "Frame Rate" = "フレームレート";
 "Dedicate Wi-Fi to CarPlay" = "Wi-FiをCarPlay専用にする";
 "Start CarPlay Automatically" = "CarPlayを自動的に開始";
+"Share Anonymous Usage" = "匿名の使用状況を共有";
+"Device Model" = "デバイスのモデル";
+"iOS Version" = "iOSのバージョン";
+"Jailbreak" = "脱獄";
+"Showcase Version" = "Showcaseのバージョン";
+"Package" = "パッケージ";
+"Country" = "国または地域";
+"View Source" = "ソースコードを見る";
 "Default" = "デフォルト";
 "Device Language" = "デバイスの言語";
 "Detailed Logging" = "詳細なログ";
@@ -111,7 +125,6 @@
 "by %s  %s" = "作者：%s  %s";
 "Checking…" = "確認中…";
 "Model" = "モデル";
-"Package" = "パッケージ";
 "Wi-Fi Bus" = "Wi-Fiバス";
 "CarPlay Video" = "CarPlayビデオ";
 "Wi-Fi Setup" = "Wi-Fi設定";

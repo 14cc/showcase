@@ -17,5 +17,5 @@ Description: Wireless CarPlay receiver for rootless jailbreaks.
  receiver. This package uses the rootless layout under /var/jb and supports
  iOS 12 or newer.
  .
- Beta 5 adds a resolution and frame rate picker, Prioritize Quality and
- Performance, and French, Spanish, Chinese and Japanese.
+ Beta 5-2 turns on Prioritize Quality once and adds anonymous usage
+ reporting, which Settings > Anonymous Usage turns off item by item.
