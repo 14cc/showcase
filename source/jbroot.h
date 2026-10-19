@@ -135,9 +135,21 @@ static inline __attribute__((unused)) const char *jb_tool_path(const char *path)
     pthread_mutex_unlock(&lock);
     return path;
 }
+/* jb_tool_path() for strings built at run time: writes into buf, no cache. */
+static inline __attribute__((unused)) const char *jb_tool_path_buf(const char *path, char *buf, size_t size) {
+    if (!path || path[0] != '/') return path;
+    const char *root = jb_root();
+    size_t rootLength = strlen(root);
+    if (strncmp(path, root, rootLength) == 0 &&
+        (path[rootLength] == '/' || path[rootLength] == 0))
+        return path[rootLength] ? path + rootLength : "/";
+    snprintf(buf, size, "/rootfs%s", path);
+    return buf;
+}
 #else
 #define jb_fix(path) (path)
 #define jb_tool_path(path) (path)
+#define jb_tool_path_buf(path, buf, size) (path)
 #endif
 
 #endif

@@ -5256,11 +5256,13 @@ static NSString *hotspot_name(void) {
         run_capture(launchctl, argv, [[commandsDir stringByAppendingPathComponent:@"launchctl-list.txt"] UTF8String]);
     }
     if (lsPath) {
-        char *argv1[] = { (char*)"ls", (char*)"-la", (char*)"/tmp", NULL };
+        char *argv1[] = { (char*)"ls", (char*)"-la", (char*)jb_tool_path("/tmp"), NULL };
         run_capture(lsPath, argv1, [[commandsDir stringByAppendingPathComponent:@"ls-tmp.txt"] UTF8String]);
-        char *argv2[] = { (char*)"ls", (char*)"-la", (char*)BTDAEMON_PATH, NULL };
+        char *argv2[] = { (char*)"ls", (char*)"-la", (char*)jb_tool_path(BTDAEMON_PATH), NULL };
         run_capture(lsPath, argv2, [[commandsDir stringByAppendingPathComponent:@"ls-btdaemon.txt"] UTF8String]);
-        char *argv3[] = { (char*)"ls", (char*)"-la", (char*)[[[NSBundle mainBundle] bundlePath] UTF8String], NULL };
+        char appPath[PATH_MAX];
+        char *argv3[] = { (char*)"ls", (char*)"-la",
+            (char*)jb_tool_path_buf([[[NSBundle mainBundle] bundlePath] UTF8String], appPath, sizeof(appPath)), NULL };
         run_capture(lsPath, argv3, [[commandsDir stringByAppendingPathComponent:@"ls-app.txt"] UTF8String]);
     }
 
@@ -5269,9 +5271,13 @@ static NSString *hotspot_name(void) {
         return nil;
     }
 
+    /* RootHide's tar sees the jbroot as "/"; real paths go through /rootfs. */
+    char tarArchive[PATH_MAX], tarWork[PATH_MAX];
     char *tarArgv[] = {
-        (char*)"tar", (char*)"-cf", (char*)[archive UTF8String],
-        (char*)"-C", (char*)[work UTF8String], (char*)".", NULL
+        (char*)"tar", (char*)"-cf",
+        (char*)jb_tool_path_buf([archive UTF8String], tarArchive, sizeof(tarArchive)),
+        (char*)"-C", (char*)jb_tool_path_buf([work UTF8String], tarWork, sizeof(tarWork)),
+        (char*)".", NULL
     };
     int rc = run_blocking(tarPath, tarArgv);
     ip_log("diagnostics tar rc=%d path=%s", rc, [archive UTF8String]);

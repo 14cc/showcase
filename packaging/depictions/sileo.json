@@ -87,6 +87,14 @@
       "views": [
         {
           "class": "DepictionHeaderView",
+          "title": "a5 · Beta 5.1.7 — 2026-10-19"
+        },
+        {
+          "class": "DepictionMarkdownView",
+          "markdown": "修复：隐根版「发送日志」打包失败（日志里 tar rc=2），用户只能手动压缩日志。原因和 5.1.4 同一类：隐根的命令行工具把隐根目录当成根目录，传给打包工具的路径要加 /rootfs。诊断里的 ls 结果也改成看真实的 /tmp。⚠️ 未在隐根真机上验证。\n\n5.1.6 的蓝牙修复已在隐根真机（iPhone 14 Pro · iOS 16.2）上确认有效：蓝牙和苹果认证都能通过。\n\n有根版、无根版、Taurine 版不受影响，本次只是一起升级版本号。"
+        },
+        {
+          "class": "DepictionHeaderView",
           "title": "a5 · Beta 5.1.6 — 2026-10-19"
         },
         {
