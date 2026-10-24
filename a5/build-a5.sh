@@ -35,10 +35,18 @@ echo "源地址: $REPO_URL"
 # 测试构建自动加 +dev时间戳，同一个版本号不会对应两份不同的包；正式发布用 RELEASE=1 ./build-a5.sh
 DEV=""
 if [ "${RELEASE:-0}" != 1 ]; then DEV="+dev$(date +%Y%m%d%H%M)"; PACKAGE_VERSION="$PACKAGE_VERSION$DEV"; fi
-echo "版本: $PACKAGE_VERSION ($DISPLAY_VERSION)"
+# App 里显示的版本（错误报告、设置页）带上我们的发布号：1.0~beta5.1-8 -> "1.0 Beta 5.1.8"
+APP_DISPLAY_VERSION="$DISPLAY_VERSION.${PACKAGE_VERSION##*-}"
+echo "版本: $PACKAGE_VERSION ($APP_DISPLAY_VERSION)"
 
 rm -rf "$WORK"; mkdir -p "$WORK/bin" "$OUT/debs"
-rm -f "$OUT/debs/"*.deb
+if [ "${KEEP_SHOWCASE:-0}" = 1 ]; then
+  ls "$OUT/debs/"com.rostane.showcase*.deb >/dev/null 2>&1 || die "KEEP_SHOWCASE=1 但 repo/debs 里没有 Showcase 包"
+  echo "沿用已有 Showcase 包: $(cd "$OUT/debs" && ls com.rostane.showcase*.deb | tr '\n' ' ')"
+  rm -f "$OUT/debs/"com.rostane.share_*.deb
+else
+  rm -f "$OUT/debs/"*.deb
+fi
 
 
 # 新版 Xcode 会把 CoreMedia 链到 @rpath/libswiftCoreMedia.dylib（老系统没有，启动即闪退），改回系统框架
@@ -46,6 +54,9 @@ fix_links(){ for b in "$@"; do
   install_name_tool -change @rpath/libswiftCoreMedia.dylib /System/Library/Frameworks/CoreMedia.framework/CoreMedia "$b" 2>/dev/null || true
   if otool -L "$b" | grep -q '@rpath/libswift'; then die "$b 仍依赖 Swift 运行库：$(otool -L "$b" | grep @rpath)"; fi
 done; }
+
+# KEEP_SHOWCASE=1：只重打 share，沿用 repo/debs 里已发布的 Showcase 包（避免同一版本号对应两份不同的包）
+if [ "${KEEP_SHOWCASE:-0}" != 1 ]; then
 
 # ---------- 1. 内置证书（构建完自动还原空壳，绝不入库） ----------
 step "烤入内置证书"
@@ -100,7 +111,7 @@ BTSRC=("$BT/src/btstack_linked_list.c" "$BT/src/btstack_run_loop.c" "$BT/src/hci
 step "编译 Showcase"
 S="$SC/source"
 OBJC=(-fobjc-arc -DSHOWCASE_ROOTLESS=1)
-"${CC[@]}" "${OBJC[@]}" -DAPP_VERSION="\"$DISPLAY_VERSION\"" -o "$WORK/bin/Showcase" "$S/Showcase.m" \
+"${CC[@]}" "${OBJC[@]}" -DAPP_VERSION="\"$APP_DISPLAY_VERSION\"" -o "$WORK/bin/Showcase" "$S/Showcase.m" \
   -framework UIKit -framework AVFoundation -framework AudioToolbox -framework CoreMedia \
   -framework Foundation -framework Security -Wl,-undefined,dynamic_lookup
 "${CC[@]}" "${OBJC[@]}" -I"$S" -o "$WORK/bin/CarDisplaySim" "$S/carplay_bt.m" "$WORK/bin/libBTstack.dylib" \
@@ -143,7 +154,7 @@ if [ "${ROOTFUL:-1}" = 1 ]; then
   [ -f "$RF/bin/ch.ringwald.BTstack.plist" ] || cp "$BT/port/ios/layout/Library/LaunchDaemons/ch.ringwald.BTstack.plist" "$RF/bin/"
 
   step "编译 rootful 版 Showcase"
-  "${CC[@]}" -fobjc-arc -DAPP_VERSION="\"$DISPLAY_VERSION\"" -o "$RF/bin/Showcase" "$S/Showcase.m" \
+  "${CC[@]}" -fobjc-arc -DAPP_VERSION="\"$APP_DISPLAY_VERSION\"" -o "$RF/bin/Showcase" "$S/Showcase.m" \
     -framework UIKit -framework AVFoundation -framework AudioToolbox -framework CoreMedia \
     -framework Foundation -framework Security -Wl,-undefined,dynamic_lookup
   "${CC[@]}" -fobjc-arc -I"$S" -o "$RF/bin/carplay_bt" "$S/carplay_bt.m" "$RF/bin/libBTstack.dylib" \
@@ -166,7 +177,7 @@ if [ "${ROOTHIDE:-1}" = 1 ]; then
   done
   xcrun --sdk iphoneos libtool -static -o "$RH/libBTstack.a" "$RH/obj/"*.o
   RHF=(-fobjc-arc -DSHOWCASE_ROOTLESS=1 -DSHOWCASE_ROOTHIDE=1)
-  "${CC[@]}" "${RHF[@]}" -I"$S" -DAPP_VERSION="\"$DISPLAY_VERSION\"" -o "$RH/bin/Showcase" "$S/Showcase.m" \
+  "${CC[@]}" "${RHF[@]}" -I"$S" -DAPP_VERSION="\"$APP_DISPLAY_VERSION\"" -o "$RH/bin/Showcase" "$S/Showcase.m" \
     -framework UIKit -framework AVFoundation -framework AudioToolbox -framework CoreMedia \
     -framework Foundation -framework Security -Wl,-undefined,dynamic_lookup
   "${CC[@]}" "${RHF[@]}" -I"$S" -o "$RH/bin/CarDisplaySim" "$S/carplay_bt.m" "$RH/libBTstack.a" "${BTALIAS[@]}" \
@@ -186,7 +197,7 @@ fi
 if [ "${TAURINE:-1}" = 1 ] && [ "${ROOTFUL:-1}" = 1 ]; then
   step "编译 Taurine 版 Showcase"
   TA="$WORK/taurine"; mkdir -p "$TA/bin"
-  "${CC[@]}" -fobjc-arc -DSHOWCASE_TAURINE -DAPP_VERSION="\"$DISPLAY_VERSION\"" -o "$TA/bin/Showcase" "$S/Showcase.m" \
+  "${CC[@]}" -fobjc-arc -DSHOWCASE_TAURINE -DAPP_VERSION="\"$APP_DISPLAY_VERSION\"" -o "$TA/bin/Showcase" "$S/Showcase.m" \
     -framework UIKit -framework AVFoundation -framework AudioToolbox -framework CoreMedia \
     -framework Foundation -framework Security -Wl,-undefined,dynamic_lookup
   fix_links "$TA/bin/Showcase"
@@ -358,6 +369,8 @@ if [ "${TAURINE:-1}" = 1 ] && [ "${ROOTFUL:-1}" = 1 ]; then
     "$OUT/debs/com.rostane.showcase-taurine_${PACKAGE_VERSION}_iphoneos-arm.deb"
 fi
 
+fi  # KEEP_SHOWCASE
+
 # ---------- 5. 打 share deb（程序未改动；比上游多一个隐根包，用它自带 build.sh） ----------
 step "打包 share deb"
 (cd "$SH" && SDK="$SDK" VERSION_SUFFIX="$DEV" ./build.sh)
@@ -376,6 +389,8 @@ mkdir -p "$WORK/scripts"; mv "$WORK/gen.py" "$WORK/scripts/gen.py"
 python3 "$WORK/scripts/gen.py" "$OUT"
 # 源 logo 用 a5 自己的图（site/logo.png），替换上游作者的头像
 cp "$TOP/site/logo.png" "$OUT/CydiaIcon.png"; cp "$TOP/site/logo.png" "$OUT/icon.png"; cp "$TOP/site/logo.png" "$OUT/icons/profile.png"
+# 包图标用压缩过的小图（上游 1024x1024 原图 1.1MB，Sileo 每次刷新都要下载）
+if [ -f "$TOP/site/showcase-icon.png" ]; then cp "$TOP/site/showcase-icon.png" "$OUT/icons/showcase.png"; fi
 # 源主页（手机优先）
 { printf '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><style>body{margin:0}</style></head><body>\n'
   sed "s#https://&lt;部署后填入你的地址&gt;/#${REPO_URL}#" "$TOP/site/index.src.html"

@@ -136,6 +136,7 @@ static NSString *L(NSString *english) {
 #define VIDEO_HEIGHT_KEY        @"videoHeight"
 #define VIDEO_FPS_KEY           @"videoFramesPerSecond"
 #define AUTO_START_KEY          @"startCarPlayOnLaunch"
+#define SETUP_TIPS_KEY          @"showSetupTips"
 #define DEDICATED_RADIO_KEY     @"leaveOtherWiFiDuringCarPlay"
 #define HELD_WIFI_NETWORK_KEY   @"heldWiFiNetworkSSID"
 #define HOTSPOT_OWNED_KEY       @"hotspotStartedByShowcase"
@@ -3061,6 +3062,182 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 
 @end
 
+/* The setup tip that shows what happens between the user's iPhone and this
+ * device: Bluetooth while the iPhone picks the car, then the hotspot while it
+ * joins. Drawn on a 540x272 artboard scaled to the view's width, with numbered
+ * instructions underneath. */
+@interface PhoneLinkView : UIView
+@property (nonatomic, assign) BOOL wifi;
+@property (nonatomic, copy) NSString *phoneTitle;
+@property (nonatomic, copy) NSString *phoneRow;
+@property (nonatomic, copy) NSArray<NSString *> *instructions;
+- (CGFloat)preferredHeightForWidth:(CGFloat)width;
+@end
+
+@implementation PhoneLinkView {
+    CAShapeLayer *_link;
+}
+
+static const CGFloat kLinkArtW = 540.0, kLinkArtH = 272.0;
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.opaque = NO;
+        self.backgroundColor = [UIColor clearColor];
+        self.contentMode = UIViewContentModeRedraw;
+        _link = [CAShapeLayer layer];
+        _link.lineWidth = 3;
+        _link.lineDashPattern = @[@8, @4];
+        _link.fillColor = nil;
+        [self.layer addSublayer:_link];
+    }
+    return self;
+}
+
+- (void)didMoveToWindow {
+    [super didMoveToWindow];
+    [_link removeAllAnimations];
+    if (!self.window || UIAccessibilityIsReduceMotionEnabled()) return;
+    CABasicAnimation *flow = [CABasicAnimation animationWithKeyPath:@"lineDashPhase"];
+    flow.fromValue = @0;
+    flow.toValue = @(-24);
+    flow.duration = 1.4;
+    flow.repeatCount = HUGE_VALF;
+    [_link addAnimation:flow forKey:@"flow"];
+}
+
+- (UIFont *)instructionFont { return [UIFont systemFontOfSize:16]; }
+
+- (CGFloat)textHeight:(NSString *)text width:(CGFloat)width {
+    CGRect r = [text boundingRectWithSize:CGSizeMake(width, CGFLOAT_MAX)
+        options:NSStringDrawingUsesLineFragmentOrigin
+        attributes:@{NSFontAttributeName: [self instructionFont]} context:nil];
+    return MAX(22.0, ceil(r.size.height));
+}
+
+- (CGFloat)preferredHeightForWidth:(CGFloat)width {
+    CGFloat h = width * kLinkArtH / kLinkArtW + 12;
+    for (NSString *line in self.instructions)
+        h += [self textHeight:line width:width - 34] + 10;
+    return ceil(h);
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat k = self.bounds.size.width / kLinkArtW;
+    UIBezierPath *line = [UIBezierPath bezierPath];
+    [line moveToPoint:CGPointMake(165 * k, 125 * k)];
+    [line addLineToPoint:CGPointMake(355 * k, 125 * k)];
+    _link.frame = self.bounds;
+    _link.path = line.CGPath;
+    _link.strokeColor = (self.wifi
+        ? [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:1]
+        : [UIColor colorWithRed:0.04 green:0.52 blue:1.0 alpha:1]).CGColor;
+    [self setNeedsDisplay];
+}
+
+static void link_text(NSString *text, CGFloat cx, CGFloat baseline, CGFloat k,
+                      CGFloat size, UIFontWeight weight, CGFloat alpha, CGFloat maxW) {
+    if (!text.length) return;
+    UIFont *font = [UIFont systemFontOfSize:MAX(11.0, size * k) weight:weight];
+    NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
+    para.alignment = NSTextAlignmentCenter;
+    para.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSDictionary *attrs = @{NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:alpha],
+        NSParagraphStyleAttributeName: para};
+    CGFloat w = maxW * k;
+    [text drawInRect:CGRectMake(cx * k - w / 2.0, baseline * k - font.ascender, w, font.lineHeight)
+      withAttributes:attrs];
+}
+
+static UIBezierPath *link_rect(CGFloat x, CGFloat y, CGFloat w, CGFloat h, CGFloat r, CGFloat k) {
+    return [UIBezierPath bezierPathWithRoundedRect:CGRectMake(x * k, y * k, w * k, h * k)
+                                      cornerRadius:r * k];
+}
+
+- (void)drawRect:(CGRect)rect {
+    CGFloat k = self.bounds.size.width / kLinkArtW;
+    UIColor *blue = [UIColor colorWithRed:0.04 green:0.52 blue:1.0 alpha:1];
+    UIColor *green = [UIColor colorWithRed:0.19 green:0.82 blue:0.35 alpha:1];
+    UIColor *frameStroke = [UIColor colorWithWhite:1 alpha:0.55];
+    UIColor *body = [UIColor colorWithWhite:0.11 alpha:1];
+
+    /* The user's iPhone, portrait */
+    UIBezierPath *phone = link_rect(20, 10, 130, 230, 22, k);
+    [body setFill]; [phone fill];
+    phone.lineWidth = 2; [frameStroke setStroke]; [phone stroke];
+    [[UIColor colorWithWhite:0.04 alpha:1] setFill]; [link_rect(30, 22, 110, 206, 14, k) fill];
+    link_text(self.phoneTitle, 85, 58, k, 12, UIFontWeightSemibold, 1, 104);
+    UIBezierPath *row = link_rect(38, 74, 94, 28, 6, k);
+    [(self.wifi ? [UIColor colorWithWhite:1 alpha:0.10] : blue) setFill]; [row fill];
+    link_text(self.phoneRow, 85, 93, k, 11, UIFontWeightMedium, 1, 88);
+    [[UIColor colorWithWhite:1 alpha:0.06] setFill];
+    [link_rect(38, 108, 94, 22, 6, k) fill];
+    [link_rect(38, 134, 94, 22, 6, k) fill];
+    link_text(L(@"Your iPhone"), 85, 264, k, 12, UIFontWeightRegular, 0.7, 170);
+
+    /* Middle: Bluetooth badge or hotspot waves */
+    if (!self.wifi) {
+        UIBezierPath *badge = [UIBezierPath bezierPathWithArcCenter:CGPointMake(260 * k, 125 * k)
+            radius:17 * k startAngle:0 endAngle:2 * M_PI clockwise:YES];
+        [[UIColor blackColor] setFill]; [badge fill];
+        badge.lineWidth = 2; [blue setStroke]; [badge stroke];
+        UIBezierPath *rune = [UIBezierPath bezierPath];
+        [rune moveToPoint:CGPointMake(254 * k, 119 * k)];
+        [rune addLineToPoint:CGPointMake(266 * k, 131 * k)];
+        [rune addLineToPoint:CGPointMake(260 * k, 137 * k)];
+        [rune addLineToPoint:CGPointMake(260 * k, 113 * k)];
+        [rune addLineToPoint:CGPointMake(266 * k, 119 * k)];
+        [rune addLineToPoint:CGPointMake(254 * k, 131 * k)];
+        rune.lineWidth = 2; rune.lineJoinStyle = kCGLineJoinRound; rune.lineCapStyle = kCGLineCapRound;
+        [[UIColor whiteColor] setStroke]; [rune stroke];
+        link_text(L(@"Bluetooth"), 260, 166, k, 11, UIFontWeightRegular, 0.7, 180);
+    } else {
+        [green setStroke];
+        for (int i = 0; i < 3; i++) {
+            UIBezierPath *wave = [UIBezierPath bezierPathWithArcCenter:CGPointMake(318 * k, 125 * k)
+                radius:(22 + i * 14) * k startAngle:M_PI * 0.78 endAngle:M_PI * 1.22 clockwise:YES];
+            wave.lineWidth = 3; wave.lineCapStyle = kCGLineCapRound;
+            [wave stroke];
+        }
+        link_text(L(@"Personal Hotspot Wi-Fi"), 260, 196, k, 11, UIFontWeightRegular, 0.7, 200);
+    }
+
+    /* This device, landscape */
+    UIBezierPath *receiver = link_rect(370, 70, 150, 100, 16, k);
+    [body setFill]; [receiver fill];
+    receiver.lineWidth = 2; [frameStroke setStroke]; [receiver stroke];
+    [[UIColor blackColor] setFill]; [link_rect(380, 80, 130, 80, 9, k) fill];
+    link_text(@APP_NAME, 445, 124, k, 13, UIFontWeightUltraLight, 1, 120);
+    link_text(L(@"This device"), 445, 196, k, 12, UIFontWeightRegular, 0.7, 170);
+
+    /* Numbered instructions */
+    UIFont *font = [self instructionFont];
+    CGFloat W = self.bounds.size.width;
+    CGFloat y = W * kLinkArtH / kLinkArtW + 12;
+    NSDictionary *textAttrs = @{NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.82]};
+    NSMutableParagraphStyle *center = [[NSMutableParagraphStyle alloc] init];
+    center.alignment = NSTextAlignmentCenter;
+    NSDictionary *numberAttrs = @{NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightBold],
+        NSForegroundColorAttributeName: [UIColor blackColor], NSParagraphStyleAttributeName: center};
+    for (NSUInteger i = 0; i < self.instructions.count; i++) {
+        NSString *line = self.instructions[i];
+        CGFloat h = [self textHeight:line width:W - 34];
+        if (self.instructions.count > 1) {
+            [[UIColor whiteColor] setFill];
+            [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, y + 1, 22, 22)] fill];
+            NSString *n = [NSString stringWithFormat:@"%lu", (unsigned long)i + 1];
+            [n drawInRect:CGRectMake(0, y + 3.5, 22, 18) withAttributes:numberAttrs];
+        }
+        [line drawInRect:CGRectMake(34, y, W - 34, h) withAttributes:textAttrs];
+        y += h + 10;
+    }
+}
+
+@end
+
 /* ═══════════════════════════════════════════════════════════════
  * AppDelegate — state machine, UI, IPC
  * ═══════════════════════════════════════════════════════════════ */
@@ -3081,6 +3258,10 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
 @property (nonatomic, strong) UIButton *secondaryButton;   /* Cancel */
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 @property (nonatomic, strong) ConnectStepsView *stepsView;
+@property (nonatomic, strong) UILabel  *tipLabel;          /* setup tip under the headline */
+@property (nonatomic, strong) PhoneLinkView *linkView;     /* iPhone <-> this device tip */
+@property (nonatomic, strong) NSTimer *wifiTipTimer;
+@property (nonatomic, assign) BOOL wifiTipExpired;         /* iPhone slow to join the hotspot */
 
 /* Connection progress shown while the iPhone connects */
 @property (nonatomic, assign) NSInteger connectCompleted;
@@ -3196,7 +3377,8 @@ typedef NS_ENUM(NSInteger, ConnectStep) {
     /* Opening Showcase is turning the car on: start and page the iPhone. */
     [[NSUserDefaults standardUserDefaults] registerDefaults:@{
         DEDICATED_RADIO_KEY: @YES,
-        AUTO_START_KEY: @YES
+        AUTO_START_KEY: @YES,
+        SETUP_TIPS_KEY: @YES
     }];
     _diagnosticsEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:DIAGNOSTICS_ENABLED_KEY];
     /* Settings reads the display hardware; probe the Wi-Fi bus off the main thread now. */
@@ -3484,6 +3666,18 @@ static pid_t reusable_baa_broker(void) {
     self.spinner.hidesWhenStopped = YES;
     [self.setupOverlay addSubview:self.spinner];
 
+    /* Setup tip */
+    self.tipLabel = [[UILabel alloc] init];
+    self.tipLabel.numberOfLines = 0;
+    self.tipLabel.textAlignment = NSTextAlignmentCenter;
+    self.tipLabel.hidden = YES;
+    [self.setupOverlay addSubview:self.tipLabel];
+
+    self.linkView = [[PhoneLinkView alloc] init];
+    self.linkView.userInteractionEnabled = NO;
+    self.linkView.hidden = YES;
+    [self.setupOverlay addSubview:self.linkView];
+
     /* Connection checklist */
     self.stepsView = [[ConnectStepsView alloc] init];
     self.stepsView.userInteractionEnabled = NO;
@@ -3540,6 +3734,34 @@ static pid_t reusable_baa_broker(void) {
     self.stepsView.hidden = !connecting;
     self.stepsView.compact = shortScreen;
 
+    /* With the iPhone tip: headline on top, checklist left, tip right. */
+    if (connecting && !self.linkView.hidden) {
+        self.titleLabel.hidden = YES;
+        CGFloat margin = phone ? 40 : 48;
+        CGFloat top = phone ? 22 : 40;
+        self.headlineLabel.frame = CGRectMake(margin, top, W - margin * 2, phone ? 28 : 32);
+        CGFloat stepsW = MIN(240, floor(W * 0.26));
+        CGFloat linkW = MIN(W - stepsW - margin * 2 - 32, 620);
+        CGFloat linkH = [self.linkView preferredHeightForWidth:linkW];
+        CGFloat stepsH = [self.stepsView preferredHeightForWidth:stepsW];
+        CGFloat cancelH = phone ? 30 : 34;
+        CGFloat areaTop = top + (phone ? 28 : 32) + (phone ? 18 : 28);
+        CGFloat areaH = H - areaTop - cancelH - (phone ? 14 : 28) - 12;
+        self.stepsView.frame = CGRectMake(margin, areaTop + MAX(0, floor((areaH - stepsH) / 2.0)),
+                                          stepsW, stepsH);
+        self.linkView.frame = CGRectMake(W - margin - linkW, areaTop + MAX(0, floor((areaH - linkH) / 2.0)),
+                                         linkW, linkH);
+        self.secondaryButton.frame = CGRectMake(floor(cx - btnW / 2.0), H - cancelH - (phone ? 14 : 28),
+                                                btnW, cancelH);
+        [self.stepsView setNeedsLayout];
+        [self.linkView setNeedsLayout];
+        return;
+    }
+
+    CGFloat tipW = MIN(W - side * 2, 620);
+    CGFloat tipH = self.tipLabel.hidden ? 0
+        : ceil([self.tipLabel sizeThatFits:CGSizeMake(tipW, CGFLOAT_MAX)].height);
+
     NSMutableArray<NSArray *> *items = [NSMutableArray array];
     void (^add)(UIView *, CGFloat, CGFloat, CGFloat) =
         ^(UIView *view, CGFloat width, CGFloat height, CGFloat gapAfter) {
@@ -3550,7 +3772,9 @@ static pid_t reusable_baa_broker(void) {
     add(self.spinner, 36, 36, 20);
     add(self.headlineLabel, colW, phone ? 28 : 32,
         connecting ? (shortScreen ? 18 : 28) : (phone ? 26 : 36));
+    if (!connecting) add(self.tipLabel, tipW, tipH, phone ? 22 : 30);
     add(self.stepsView, colW, [self.stepsView preferredHeightForWidth:colW], shortScreen ? 14 : 28);
+    if (connecting) add(self.tipLabel, tipW, tipH, phone ? 18 : 24);
     add(self.primaryButton, btnW, btnH, phone ? 12 : 16);
     add(self.secondaryButton, btnW, phone ? 30 : 34, 10);
 
@@ -3665,6 +3889,74 @@ static pid_t reusable_baa_broker(void) {
 - (void)resetConnectProgress {
     self.connectCompleted = -1;
     self.firstTimePairing = NO;
+    [self.wifiTipTimer invalidate];
+    self.wifiTipTimer = nil;
+    self.wifiTipExpired = NO;
+}
+
+- (void)wifiTipTimedOut {
+    self.wifiTipTimer = nil;
+    self.wifiTipExpired = YES;
+    if (self.state == StateAwaitingPhone) [self renderState];
+}
+
+- (void)setTip:(NSString *)text detail:(NSString *)detail {
+    BOOL phone = [self isPhone];
+    NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
+    para.alignment = NSTextAlignmentCenter;
+    para.lineSpacing = 3;
+    NSMutableAttributedString *tip = [[NSMutableAttributedString alloc] initWithString:text
+        attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:(phone ? 15 : 16)],
+                     NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.72],
+                     NSParagraphStyleAttributeName: para}];
+    if (detail.length) {
+        NSMutableParagraphStyle *gap = [para mutableCopy];
+        gap.paragraphSpacingBefore = 10;
+        [tip appendAttributedString:[[NSAttributedString alloc] initWithString:[@"\n" stringByAppendingString:detail]
+            attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:(phone ? 14 : 15) weight:UIFontWeightMedium],
+                         NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.9],
+                         NSParagraphStyleAttributeName: gap}]];
+    }
+    self.tipLabel.attributedText = tip;
+    self.tipLabel.hidden = NO;
+}
+
+/* While CarPlay connects, show what the user does on the iPhone, then that
+ * the iPhone joins the hotspot by itself. Gone once Wi-Fi is up. */
+- (void)updateLinkTipForCar:(NSString *)carName {
+    if (self.connectCompleted >= ConnectStepJoinWiFi) {
+        [self.wifiTipTimer invalidate];
+        self.wifiTipTimer = nil;
+        return;
+    }
+    BOOL wifi = self.connectCompleted >= ConnectStepPhoneBluetooth;
+    NSString *ssid = self.cars.apSSID.length ? self.cars.apSSID : @"Wi-Fi";
+    self.linkView.wifi = wifi;
+    if (!wifi) {
+        self.linkView.phoneTitle = @"CarPlay";
+        self.linkView.phoneRow = carName;
+        self.linkView.instructions = @[
+            L(@"On your iPhone, turn on Bluetooth and Wi-Fi, and keep it near this device."),
+            L(@"Open Settings › General › CarPlay."),
+            [NSString stringWithFormat:L(@"Tap \u201c%@\u201d and allow pairing and CarPlay when asked. That's the last thing you do; the rest is automatic."), carName]
+        ];
+    } else {
+        if (!self.wifiTipTimer && !self.wifiTipExpired) {
+            self.wifiTipTimer = [NSTimer scheduledTimerWithTimeInterval:30.0
+                target:self selector:@selector(wifiTipTimedOut) userInfo:nil repeats:NO];
+        }
+        self.linkView.phoneTitle = @"Wi-Fi";
+        self.linkView.phoneRow = ssid;
+        NSMutableArray *lines = [NSMutableArray arrayWithObject:
+            [NSString stringWithFormat:L(@"Your iPhone joins \u201c%@\u201d by itself. You don't need to pick it in Wi-Fi settings."), ssid]];
+        if (self.wifiTipExpired)
+            [lines addObject:[NSString stringWithFormat:
+                L(@"Still here after 30 seconds? Check that Personal Hotspot is on and its name matches Wi-Fi Setup exactly, then join \u201c%@\u201d once by hand in Settings › Wi-Fi on your iPhone."), ssid]];
+        self.linkView.instructions = lines;
+    }
+    self.linkView.hidden = NO;
+    [self.linkView setNeedsLayout];
+    [self.linkView setNeedsDisplay];
 }
 
 - (void)completeConnectStep:(ConnectStep)step {
@@ -3736,6 +4028,9 @@ static pid_t reusable_baa_broker(void) {
     self.primaryButton.enabled = YES;
     self.primaryButton.alpha = 1.0;
     self.secondaryButton.hidden = YES;
+    self.tipLabel.hidden = YES;
+    self.linkView.hidden = YES;
+    BOOL tips = [[NSUserDefaults standardUserDefaults] boolForKey:SETUP_TIPS_KEY];
 
     Car *sel = self.cars.selected;
     NSString *carName = sel.name.length ? sel.name : L(@"your car");
@@ -3749,6 +4044,9 @@ static pid_t reusable_baa_broker(void) {
                 /* First run: Wi-Fi setup is the headline action. */
                 self.headlineLabel.text = L(@"Welcome");
                 [self.primaryButton setTitle:L(@"Set Up Wi-Fi") forState:UIControlStateNormal];
+                if (tips)
+                    [self setTip:L(@"You need two devices: this device is the receiver, and the iPhone you use every day shows CarPlay here. The first setup takes about 2 minutes.")
+                          detail:L(@"1 Rename this device  ›  2 Enter hotspot details  ›  3 Start CarPlay  ›  4 Choose the car on your iPhone")];
             } else {
                 if (self.baaLoading) {
                     self.headlineLabel.text = L(@"Preparing");
@@ -3786,6 +4084,9 @@ static pid_t reusable_baa_broker(void) {
         case StatePreparingNet:
             self.headlineLabel.text = L(@"Getting Ready");
             [self updateConnectSteps];
+            if (tips)
+                [self setTip:L(@"Showcase is taking over Bluetooth on this device, so its Bluetooth headphones and Apple Pencil disconnect for now. That's normal.")
+                      detail:nil];
             break;
 
         case StateAwaitingPhone:
@@ -3793,6 +4094,7 @@ static pid_t reusable_baa_broker(void) {
                 ? L(@"Connecting")
                 : [NSString stringWithFormat:L(@"Choose %@ in CarPlay on your iPhone"), carName];
             [self updateConnectSteps];
+            if (tips) [self updateLinkTipForCar:carName];
             [self.secondaryButton setTitle:L(@"Cancel") forState:UIControlStateNormal];
             self.secondaryButton.hidden = NO;
             break;
@@ -4758,7 +5060,9 @@ static NSString *hotspot_name(void) {
 
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:L(@"Hotspot Details")
-                         message:nil
+                         message:([[NSUserDefaults standardUserDefaults] boolForKey:SETUP_TIPS_KEY]
+                                  ? L(@"Enter this device's name exactly: capitals, spaces and \u2019 all count. The password is in Settings › Personal Hotspot.")
+                                  : nil)
                   preferredStyle:UIAlertControllerStyleAlert];
 
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
@@ -7060,6 +7364,12 @@ static BOOL g_settings_hardware_loading = NO;
             changed:^(BOOL on) { setter(AUTO_START_KEY, on); }];
         [card addRow:autoStart height:autoStart.bounds.size.height];
     }];
+    [b card:^(SettingsCard *card) {
+        UIView *tips = [self switchRow:L(@"Show Setup Tips") subtitle:nil
+            on:[d boolForKey:SETUP_TIPS_KEY] width:w
+            changed:^(BOOL on) { setter(SETUP_TIPS_KEY, on); }];
+        [card addRow:tips height:tips.bounds.size.height];
+    }];
 }
 
 - (void)buildResolution:(SettingsPageBuilder *)b {
@@ -7423,8 +7733,9 @@ static BOOL g_settings_hardware_loading = NO;
     [close addTarget:self action:@selector(closeTapped) forControlEvents:UIControlEventTouchUpInside];
     [root addSubview:close];
 
+    BOOL tips = [[NSUserDefaults standardUserDefaults] boolForKey:SETUP_TIPS_KEY];
     UIScrollView *scroll = nil;
-    if (phone) {
+    if (phone || tips) {
         scroll = [[UIScrollView alloc] initWithFrame:root.bounds];
         scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         scroll.backgroundColor = [UIColor blackColor];
@@ -7445,12 +7756,30 @@ static BOOL g_settings_hardware_loading = NO;
 
     CGFloat colW = phone ? MIN(560, W - 56) : MIN(620, W - 120);
     CGFloat colX = (W - colW) / 2.0;
-    CGFloat y = phone ? 104 : 168;
+    CGFloat y = phone ? 104 : (tips ? 150 : 168);
 
     /* Step 1: the hotspot is named after the device. */
-    [root addSubview:[self headlineLabel:[NSString stringWithFormat:L(@"1.  Rename This %@"), showcase_device_noun()]
+    [root addSubview:[self headlineLabel:(tips ? L(@"1.  Rename This Device")
+                                               : [NSString stringWithFormat:L(@"1.  Rename This %@"), showcase_device_noun()])
                                     rect:CGRectMake(colX, y, colW, 30)]];
     y += 46;
+    if (tips) {
+        NSMutableAttributedString *t = [self tipText:L(@"The hotspot name is this device's name. Use only letters, digits and -, like the name below.") warning:NO];
+        [t appendAttributedString:[self tipText:@" " warning:NO]];
+        [t appendAttributedString:[self tipText:L(@"Don't use apostrophes ('), quotes or emoji.") warning:YES]];
+        [t appendAttributedString:[self tipText:[@" " stringByAppendingString:
+            L(@"iOS turns ' into \u2019, the names stop matching, and your iPhone can't join the hotspot.")] warning:NO]];
+        NSString *name = hotspot_name();
+        if (name) {
+            [t appendAttributedString:[self tipText:[@"\n" stringByAppendingString:
+                [NSString stringWithFormat:L(@"This device is called \u201c%@\u201d."), name]] warning:NO]];
+            NSCharacterSet *quotes = [NSCharacterSet characterSetWithCharactersInString:@"'\u2018\u2019\"\u201c\u201d"];
+            if ([name rangeOfCharacterFromSet:quotes].location != NSNotFound)
+                [t appendAttributedString:[self tipText:[@" " stringByAppendingString:
+                    L(@"It has an apostrophe or quote; rename it first.")] warning:YES]];
+        }
+        y = [self addTipCard:t to:root x:colX y:y width:colW];
+    }
     [root addSubview:[self buildCopyPillWithText:@"Carplay-Receiver" rect:CGRectMake(colX, y, colW, 56)]];
     y += 72;
     [root addSubview:[self primaryButton:L(@"Open Settings") rect:CGRectMake(colX, y, colW, 50)
@@ -7460,6 +7789,12 @@ static BOOL g_settings_hardware_loading = NO;
     /* Step 2 */
     [root addSubview:[self headlineLabel:L(@"2.  Enter Hotspot Details") rect:CGRectMake(colX, y, colW, 30)]];
     y += 46;
+    if (tips) {
+        NSMutableAttributedString *t = [self tipText:L(@"After renaming, enter the name exactly as above. The password is the Wi-Fi Password in Settings › Personal Hotspot (at least 8 characters).") warning:NO];
+        [t appendAttributedString:[self tipText:[@" " stringByAppendingString:
+            L(@"If Settings has no Personal Hotspot, install Share from the a5 source, then do a soft reboot.")] warning:NO]];
+        y = [self addTipCard:t to:root x:colX y:y width:colW];
+    }
     [root addSubview:[self primaryButton:L(@"Enter Details") rect:CGRectMake(colX, y, colW, 50)
                                   action:@selector(credsTapped)]];
 
@@ -7469,6 +7804,35 @@ static BOOL g_settings_hardware_loading = NO;
 }
 
 /* ─── helpers ─── */
+
+- (NSMutableAttributedString *)tipText:(NSString *)text warning:(BOOL)warning {
+    NSMutableParagraphStyle *para = [[NSMutableParagraphStyle alloc] init];
+    para.lineSpacing = 3;
+    UIColor *color = warning ? [UIColor colorWithRed:1.0 green:0.70 blue:0.36 alpha:1]
+                             : [UIColor colorWithWhite:1 alpha:0.78];
+    return [[NSMutableAttributedString alloc] initWithString:text attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:15],
+        NSForegroundColorAttributeName: color,
+        NSParagraphStyleAttributeName: para}];
+}
+
+/* A quiet card with a setup tip; returns the y below it. */
+- (CGFloat)addTipCard:(NSAttributedString *)text to:(UIView *)root x:(CGFloat)x y:(CGFloat)y width:(CGFloat)w {
+    CGFloat pad = 16;
+    UILabel *label = [[UILabel alloc] init];
+    label.numberOfLines = 0;
+    label.attributedText = text;
+    CGFloat h = ceil([label sizeThatFits:CGSizeMake(w - pad * 2, CGFLOAT_MAX)].height);
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h + pad * 2 - 4)];
+    card.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    card.layer.cornerRadius = 14;
+    card.layer.borderWidth = 1;
+    card.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.10].CGColor;
+    label.frame = CGRectMake(pad, pad - 2, w - pad * 2, h);
+    [card addSubview:label];
+    [root addSubview:card];
+    return y + card.bounds.size.height + 14;
+}
 
 - (UILabel *)headlineLabel:(NSString *)text rect:(CGRect)rect {
     UILabel *l = [[UILabel alloc] initWithFrame:rect];

@@ -6,7 +6,16 @@
 "Copy Diagnostic" = "拷贝诊断信息";
 "Close" = "关闭";
 "Copied" = "已拷贝";
+"Your iPhone" = "你的主 iPhone";
+"Bluetooth" = "蓝牙";
+"Personal Hotspot Wi-Fi" = "个人热点 Wi-Fi（自动）";
+"This device" = "这台设备（接收端）";
 "Settings" = "设置";
+"On your iPhone, turn on Bluetooth and Wi-Fi, and keep it near this device." = "在主 iPhone 上打开蓝牙和 Wi-Fi，靠近这台设备。";
+"Open Settings › General › CarPlay." = "进入“设置 › 通用 › CarPlay 车载”。";
+"Tap “%@” and allow pairing and CarPlay when asked. That's the last thing you do; the rest is automatic." = "点“%@”，弹出配对或“使用 CarPlay”提示时点允许。这是你要做的最后一步，后面全部自动完成。";
+"Your iPhone joins “%@” by itself. You don't need to pick it in Wi-Fi settings." = "主 iPhone 会自动加入“%@”，不用去 Wi-Fi 里手动点。";
+"Still here after 30 seconds? Check that Personal Hotspot is on and its name matches Wi-Fi Setup exactly, then join “%@” once by hand in Settings › Wi-Fi on your iPhone." = "超过 30 秒还停在这一步：确认这台设备的个人热点开着，名称和 Wi-Fi 设置里填的一字不差，然后在主 iPhone 的“设置 › 无线局域网”里手动连一次“%@”。";
 "CarPlay services" = "CarPlay 服务";
 "Verification" = "验证";
 "Hotspot details" = "热点信息";
@@ -15,6 +24,8 @@
 "your car" = "你的车辆";
 "Welcome" = "欢迎";
 "Set Up Wi-Fi" = "设置 Wi-Fi";
+"You need two devices: this device is the receiver, and the iPhone you use every day shows CarPlay here. The first setup takes about 2 minutes." = "需要两台设备：这台设备当接收端，你平时用的 iPhone 把 CarPlay 投到这里。第一次设置大约 2 分钟。";
+"1 Rename this device  ›  2 Enter hotspot details  ›  3 Start CarPlay  ›  4 Choose the car on your iPhone" = "1 改本机名称  ›  2 填热点信息  ›  3 启动 CarPlay  ›  4 主 iPhone 上选车";
 "Preparing" = "正在准备";
 "Preparing…" = "正在准备…";
 "Connect to the Internet" = "请连接互联网";
@@ -26,6 +37,7 @@
 "Open Settings" = "打开设置";
 "Cancel" = "取消";
 "Getting Ready" = "正在准备";
+"Showcase is taking over Bluetooth on this device, so its Bluetooth headphones and Apple Pencil disconnect for now. That's normal." = "Showcase 正在接管本机蓝牙。这段时间本机的蓝牙耳机、Apple Pencil 会断开，属于正常现象。";
 "Connecting" = "正在连接";
 "Choose %@ in CarPlay on your iPhone" = "在 iPhone 的 CarPlay 中选择“%@”";
 "Stopping" = "正在停止";
@@ -36,6 +48,7 @@
 "Install Showcase for Taurine" = "请安装 Showcase for Taurine";
 "This device runs Taurine, which needs a different Bluetooth setup. Install Showcase for Taurine from the same repository; it replaces this package." = "此设备使用 Taurine，需要不同的蓝牙设置。请从同一软件源安装 Showcase for Taurine，它会替换此软件包。";
 "Hotspot Details" = "热点信息";
+"Enter this device's name exactly: capitals, spaces and ’ all count. The password is in Settings › Personal Hotspot." = "名称要和本机名称完全一样（大小写、空格、’ 都算）。密码见“设置 › 个人热点”。";
 "Name" = "名称";
 "Password" = "密码";
 "Save" = "存储";
@@ -95,6 +108,7 @@
 "Frame Rate" = "帧率";
 "Dedicate Wi-Fi to CarPlay" = "Wi-Fi 专用于 CarPlay";
 "Start CarPlay Automatically" = "自动启动 CarPlay";
+"Show Setup Tips" = "显示新手引导";
 "Default" = "默认";
 "Device Language" = "设备语言";
 "Detailed Logging" = "详细日志";
@@ -127,7 +141,15 @@
 "Wi-Fi Bus" = "Wi-Fi 总线";
 "CarPlay Video" = "CarPlay 视频";
 "Wi-Fi Setup" = "Wi-Fi 设置";
+"1.  Rename This Device" = "1.  重命名这台设备";
 "1.  Rename This %@" = "1.  重命名这台 %@";
+"The hotspot name is this device's name. Use only letters, digits and -, like the name below." = "热点名称就是本机名称。建议只用英文字母、数字和 -，比如下面这个。";
+"Don't use apostrophes ('), quotes or emoji." = "不要用撇号 '、引号、emoji。";
+"iOS turns ' into ’, the names stop matching, and your iPhone can't join the hotspot." = "iOS 会把 ' 自动改成 ’，两边对不上，你的主 iPhone 就连不上热点。";
+"This device is called “%@”." = "本机现在叫“%@”。";
+"It has an apostrophe or quote; rename it first." = "含撇号或引号，建议先改名。";
 "2.  Enter Hotspot Details" = "2.  输入热点信息";
+"After renaming, enter the name exactly as above. The password is the Wi-Fi Password in Settings › Personal Hotspot (at least 8 characters)." = "改完名后填写：名称要和上面一字不差，密码是“设置 › 个人热点”里的无线局域网密码（至少 8 位）。";
+"If Settings has no Personal Hotspot, install Share from the a5 source, then do a soft reboot." = "如果你的设置里没有“个人热点”，请到 a5 源安装 Share，然后软重启。";
 "Enter Details" = "输入信息";
 "Copy" = "拷贝";

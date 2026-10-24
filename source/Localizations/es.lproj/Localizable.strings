@@ -6,7 +6,16 @@
 "Copy Diagnostic" = "Copiar diagnóstico";
 "Close" = "Cerrar";
 "Copied" = "Copiado";
+"Your iPhone" = "Tu iPhone";
+"Bluetooth" = "Bluetooth";
+"Personal Hotspot Wi-Fi" = "Wi-Fi del punto de acceso";
+"This device" = "Este dispositivo";
 "Settings" = "Ajustes";
+"On your iPhone, turn on Bluetooth and Wi-Fi, and keep it near this device." = "En tu iPhone, activa el Bluetooth y la Wi-Fi, y mantenlo cerca de este dispositivo.";
+"Open Settings › General › CarPlay." = "Abre Ajustes › General › CarPlay.";
+"Tap “%@” and allow pairing and CarPlay when asked. That's the last thing you do; the rest is automatic." = "Toca “%@” y permite el enlace y CarPlay cuando se te pida. Es lo último que haces; el resto es automático.";
+"Your iPhone joins “%@” by itself. You don't need to pick it in Wi-Fi settings." = "Tu iPhone se une a “%@” solo. No hace falta elegirla en los ajustes de Wi-Fi.";
+"Still here after 30 seconds? Check that Personal Hotspot is on and its name matches Wi-Fi Setup exactly, then join “%@” once by hand in Settings › Wi-Fi on your iPhone." = "¿Sigue aquí tras 30 segundos? Comprueba que el punto de acceso personal está activado y que su nombre coincide exactamente con la configuración de Wi-Fi; luego únete a “%@” una vez a mano en Ajustes › Wi-Fi en tu iPhone.";
 "CarPlay services" = "Servicios de CarPlay";
 "Verification" = "Verificación";
 "Hotspot details" = "Datos del punto de acceso";
@@ -15,6 +24,8 @@
 "your car" = "tu vehículo";
 "Welcome" = "Te damos la bienvenida";
 "Set Up Wi-Fi" = "Configurar Wi-Fi";
+"You need two devices: this device is the receiver, and the iPhone you use every day shows CarPlay here. The first setup takes about 2 minutes." = "Necesitas dos dispositivos: este hace de receptor y el iPhone que usas a diario muestra CarPlay aquí. La primera configuración tarda unos 2 minutos.";
+"1 Rename this device  ›  2 Enter hotspot details  ›  3 Start CarPlay  ›  4 Choose the car on your iPhone" = "1 Cambiar el nombre  ›  2 Datos del punto de acceso  ›  3 Iniciar CarPlay  ›  4 Elegir el coche en el iPhone";
 "Preparing" = "Preparando";
 "Preparing…" = "Preparando…";
 "Connect to the Internet" = "Conéctate a Internet";
@@ -26,6 +37,7 @@
 "Open Settings" = "Abrir Ajustes";
 "Cancel" = "Cancelar";
 "Getting Ready" = "Preparando";
+"Showcase is taking over Bluetooth on this device, so its Bluetooth headphones and Apple Pencil disconnect for now. That's normal." = "Showcase está tomando el control del Bluetooth de este dispositivo, así que sus auriculares Bluetooth y el Apple Pencil se desconectan por ahora. Es normal.";
 "Connecting" = "Conectando";
 "Choose %@ in CarPlay on your iPhone" = "Elige %@ en CarPlay en tu iPhone";
 "Stopping" = "Deteniendo";
@@ -36,6 +48,7 @@
 "Install Showcase for Taurine" = "Instala Showcase for Taurine";
 "This device runs Taurine, which needs a different Bluetooth setup. Install Showcase for Taurine from the same repository; it replaces this package." = "Este dispositivo usa Taurine, que necesita otra configuración de Bluetooth. Instala Showcase for Taurine desde el mismo repositorio; sustituye a este paquete.";
 "Hotspot Details" = "Datos del punto de acceso";
+"Enter this device's name exactly: capitals, spaces and ’ all count. The password is in Settings › Personal Hotspot." = "Introduce el nombre exacto de este dispositivo: cuentan las mayúsculas, los espacios y ’. La contraseña está en Ajustes › Punto de acceso personal.";
 "Name" = "Nombre";
 "Password" = "Contraseña";
 "Save" = "Guardar";
@@ -95,6 +108,7 @@
 "Frame Rate" = "Frecuencia de fotogramas";
 "Dedicate Wi-Fi to CarPlay" = "Dedicar el Wi-Fi a CarPlay";
 "Start CarPlay Automatically" = "Iniciar CarPlay automáticamente";
+"Show Setup Tips" = "Mostrar consejos de configuración";
 "Default" = "Predeterminada";
 "Device Language" = "Idioma del dispositivo";
 "Detailed Logging" = "Registro detallado";
@@ -127,7 +141,15 @@
 "Wi-Fi Bus" = "Bus Wi-Fi";
 "CarPlay Video" = "Vídeo de CarPlay";
 "Wi-Fi Setup" = "Configuración de Wi-Fi";
+"1.  Rename This Device" = "1.  Cambia el nombre de este dispositivo";
 "1.  Rename This %@" = "1.  Cambia el nombre de este %@";
+"The hotspot name is this device's name. Use only letters, digits and -, like the name below." = "El nombre del punto de acceso es el nombre de este dispositivo. Usa solo letras, números y -, como el nombre de abajo.";
+"Don't use apostrophes ('), quotes or emoji." = "No uses apóstrofos ('), comillas ni emojis.";
+"iOS turns ' into ’, the names stop matching, and your iPhone can't join the hotspot." = "iOS cambia ' por ’, los nombres dejan de coincidir y tu iPhone no puede unirse al punto de acceso.";
+"This device is called “%@”." = "Este dispositivo se llama “%@”.";
+"It has an apostrophe or quote; rename it first." = "Tiene un apóstrofo o comillas; cámbialo primero.";
 "2.  Enter Hotspot Details" = "2.  Introduce los datos del punto de acceso";
+"After renaming, enter the name exactly as above. The password is the Wi-Fi Password in Settings › Personal Hotspot (at least 8 characters)." = "Después de cambiar el nombre, introdúcelo exactamente igual que arriba. La contraseña es la Contraseña Wi-Fi de Ajustes › Punto de acceso personal (mínimo 8 caracteres).";
+"If Settings has no Personal Hotspot, install Share from the a5 source, then do a soft reboot." = "Si Ajustes no muestra Punto de acceso personal, instala Share desde la fuente a5 y haz un reinicio suave.";
 "Enter Details" = "Introducir datos";
 "Copy" = "Copiar";

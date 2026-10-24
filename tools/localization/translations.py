@@ -308,4 +308,94 @@ T = {
         "Guardado. Revisa el apóstrofo: iOS lo escribe como ’ en los nombres de dispositivo y has introducido uno recto '. Los nombres deben coincidir exactamente.",
         "已存储。请检查撇号：iOS 在设备名称里写的是弯撇号 ’，你输入的是直撇号 '。两个名称必须完全一致。",
         "保存しました。アポストロフィを確認してください：iOSはデバイス名で ’ と書きますが、入力されたのはまっすぐな ' です。名前は完全に一致する必要があります。"),
+    'Your iPhone': ('Votre iPhone', 'Tu iPhone', '你的主 iPhone', 'お使いのiPhone'),
+    'Bluetooth': ('Bluetooth', 'Bluetooth', '蓝牙', 'Bluetooth'),
+    'Personal Hotspot Wi-Fi': ('Wi-Fi du partage de connexion', 'Wi-Fi del punto de acceso', '个人热点 Wi-Fi（自动）', 'インターネット共有のWi-Fi'),
+    'This device': ('Cet appareil', 'Este dispositivo', '这台设备（接收端）', 'このデバイス'),
+    'On your iPhone, turn on Bluetooth and Wi-Fi, and keep it near this device.': (
+        'Sur votre iPhone, activez le Bluetooth et le Wi-Fi, et gardez-le près de cet appareil.',
+        'En tu iPhone, activa el Bluetooth y la Wi-Fi, y mantenlo cerca de este dispositivo.',
+        '在主 iPhone 上打开蓝牙和 Wi-Fi，靠近这台设备。',
+        'iPhoneでBluetoothとWi-Fiをオンにして、このデバイスの近くに置いてください。'),
+    'Open Settings › General › CarPlay.': (
+        'Ouvrez Réglages › Général › CarPlay.',
+        'Abre Ajustes › General › CarPlay.',
+        '进入“设置 › 通用 › CarPlay 车载”。',
+        '「設定 › 一般 › CarPlay」を開きます。'),
+    "Tap “%@” and allow pairing and CarPlay when asked. That's the last thing you do; the rest is automatic.": (
+        "Touchez « %@ » et acceptez le jumelage et CarPlay si on vous le demande. C’est la dernière étape à faire ; le reste est automatique.",
+        "Toca “%@” y permite el enlace y CarPlay cuando se te pida. Es lo último que haces; el resto es automático.",
+        "点“%@”，弹出配对或“使用 CarPlay”提示时点允许。这是你要做的最后一步，后面全部自动完成。",
+        "「%@」をタップし、ペアリングとCarPlayを求められたら許可します。操作はこれで終わりで、残りは自動です。"),
+    "Your iPhone joins “%@” by itself. You don't need to pick it in Wi-Fi settings.": (
+        "Votre iPhone rejoint « %@ » tout seul. Inutile de le choisir dans les réglages Wi-Fi.",
+        "Tu iPhone se une a “%@” solo. No hace falta elegirla en los ajustes de Wi-Fi.",
+        "主 iPhone 会自动加入“%@”，不用去 Wi-Fi 里手动点。",
+        "iPhoneは「%@」に自動で接続します。Wi-Fi設定で選ぶ必要はありません。"),
+    'Still here after 30 seconds? Check that Personal Hotspot is on and its name matches Wi-Fi Setup exactly, then join “%@” once by hand in Settings › Wi-Fi on your iPhone.': (
+        "Toujours bloqué après 30 secondes ? Vérifiez que le partage de connexion est activé et que son nom correspond exactement à la configuration Wi-Fi, puis rejoignez « %@ » une fois à la main dans Réglages › Wi-Fi sur votre iPhone.",
+        "¿Sigue aquí tras 30 segundos? Comprueba que el punto de acceso personal está activado y que su nombre coincide exactamente con la configuración de Wi-Fi; luego únete a “%@” una vez a mano en Ajustes › Wi-Fi en tu iPhone.",
+        "超过 30 秒还停在这一步：确认这台设备的个人热点开着，名称和 Wi-Fi 设置里填的一字不差，然后在主 iPhone 的“设置 › 无线局域网”里手动连一次“%@”。",
+        "30秒たっても進まない場合：インターネット共有がオンで、名前がWi-Fi設定と完全に一致しているか確認し、iPhoneの「設定 › Wi-Fi」で「%@」に一度手動で接続してください。"),
+    'You need two devices: this device is the receiver, and the iPhone you use every day shows CarPlay here. The first setup takes about 2 minutes.': (
+        "Il faut deux appareils : celui-ci sert de récepteur, et l’iPhone que vous utilisez tous les jours affiche CarPlay ici. La première configuration prend environ 2 minutes.",
+        "Necesitas dos dispositivos: este hace de receptor y el iPhone que usas a diario muestra CarPlay aquí. La primera configuración tarda unos 2 minutos.",
+        "需要两台设备：这台设备当接收端，你平时用的 iPhone 把 CarPlay 投到这里。第一次设置大约 2 分钟。",
+        "2台のデバイスが必要です。このデバイスが受信側になり、普段使っているiPhoneのCarPlayがここに表示されます。初回の設定は約2分です。"),
+    '1 Rename this device  ›  2 Enter hotspot details  ›  3 Start CarPlay  ›  4 Choose the car on your iPhone': (
+        '1 Renommer cet appareil  ›  2 Infos du point d’accès  ›  3 Démarrer CarPlay  ›  4 Choisir la voiture sur l’iPhone',
+        '1 Cambiar el nombre  ›  2 Datos del punto de acceso  ›  3 Iniciar CarPlay  ›  4 Elegir el coche en el iPhone',
+        '1 改本机名称  ›  2 填热点信息  ›  3 启动 CarPlay  ›  4 主 iPhone 上选车',
+        '1 名前を変更  ›  2 ホットスポット情報を入力  ›  3 CarPlayを開始  ›  4 iPhoneで車を選択'),
+    "Showcase is taking over Bluetooth on this device, so its Bluetooth headphones and Apple Pencil disconnect for now. That's normal.": (
+        "Showcase prend le contrôle du Bluetooth de cet appareil : ses écouteurs Bluetooth et son Apple Pencil se déconnectent pour l’instant. C’est normal.",
+        "Showcase está tomando el control del Bluetooth de este dispositivo, así que sus auriculares Bluetooth y el Apple Pencil se desconectan por ahora. Es normal.",
+        "Showcase 正在接管本机蓝牙。这段时间本机的蓝牙耳机、Apple Pencil 会断开，属于正常现象。",
+        "Showcaseがこのデバイスの Bluetooth を使用するため、Bluetoothヘッドフォンや Apple Pencil はしばらく切断されます。これは正常です。"),
+    "Enter this device's name exactly: capitals, spaces and ’ all count. The password is in Settings › Personal Hotspot.": (
+        "Saisissez exactement le nom de cet appareil : majuscules, espaces et ’ comptent. Le mot de passe se trouve dans Réglages › Partage de connexion.",
+        "Introduce el nombre exacto de este dispositivo: cuentan las mayúsculas, los espacios y ’. La contraseña está en Ajustes › Punto de acceso personal.",
+        "名称要和本机名称完全一样（大小写、空格、’ 都算）。密码见“设置 › 个人热点”。",
+        "このデバイスの名前を正確に入力してください。大文字、スペース、’ も区別されます。パスワードは「設定 › インターネット共有」にあります。"),
+    'Show Setup Tips': ('Afficher les conseils de configuration', 'Mostrar consejos de configuración', '显示新手引导', '設定のヒントを表示'),
+    '1.  Rename This Device': (
+        '1.  Renommer cet appareil',
+        '1.  Cambia el nombre de este dispositivo',
+        '1.  重命名这台设备',
+        '1.  このデバイスの名前を変更'),
+    "The hotspot name is this device's name. Use only letters, digits and -, like the name below.": (
+        "Le nom du point d’accès est le nom de cet appareil. Utilisez seulement des lettres, des chiffres et -, comme le nom ci-dessous.",
+        "El nombre del punto de acceso es el nombre de este dispositivo. Usa solo letras, números y -, como el nombre de abajo.",
+        "热点名称就是本机名称。建议只用英文字母、数字和 -，比如下面这个。",
+        "ホットスポット名はこのデバイスの名前です。下の名前のように、英字、数字、- だけを使ってください。"),
+    "Don't use apostrophes ('), quotes or emoji.": (
+        "N’utilisez ni apostrophe ('), ni guillemets, ni emoji.",
+        "No uses apóstrofos ('), comillas ni emojis.",
+        "不要用撇号 '、引号、emoji。",
+        "アポストロフィ（'）、引用符、絵文字は使わないでください。"),
+    "iOS turns ' into ’, the names stop matching, and your iPhone can't join the hotspot.": (
+        "iOS transforme ' en ’, les noms ne correspondent plus et votre iPhone ne peut pas rejoindre le point d’accès.",
+        "iOS cambia ' por ’, los nombres dejan de coincidir y tu iPhone no puede unirse al punto de acceso.",
+        "iOS 会把 ' 自动改成 ’，两边对不上，你的主 iPhone 就连不上热点。",
+        "iOSは ' を ’ に変えるため、名前が一致せず、iPhoneがホットスポットに接続できなくなります。"),
+    'This device is called “%@”.': (
+        'Cet appareil s’appelle « %@ ».',
+        'Este dispositivo se llama “%@”.',
+        '本机现在叫“%@”。',
+        'このデバイスの名前は「%@」です。'),
+    'It has an apostrophe or quote; rename it first.': (
+        'Il contient une apostrophe ou des guillemets : renommez-le d’abord.',
+        'Tiene un apóstrofo o comillas; cámbialo primero.',
+        '含撇号或引号，建议先改名。',
+        'アポストロフィか引用符が含まれています。先に名前を変更してください。'),
+    'After renaming, enter the name exactly as above. The password is the Wi-Fi Password in Settings › Personal Hotspot (at least 8 characters).': (
+        "Après le renommage, saisissez le nom exactement comme ci-dessus. Le mot de passe est le Mot de passe Wi-Fi dans Réglages › Partage de connexion (8 caractères minimum).",
+        "Después de cambiar el nombre, introdúcelo exactamente igual que arriba. La contraseña es la Contraseña Wi-Fi de Ajustes › Punto de acceso personal (mínimo 8 caracteres).",
+        "改完名后填写：名称要和上面一字不差，密码是“设置 › 个人热点”里的无线局域网密码（至少 8 位）。",
+        "名前を変更したら、上と完全に同じ名前を入力します。パスワードは「設定 › インターネット共有」の“Wi-Fi”のパスワード（8文字以上）です。"),
+    'If Settings has no Personal Hotspot, install Share from the a5 source, then do a soft reboot.': (
+        "Si Réglages n’affiche pas le Partage de connexion, installez Share depuis la source a5, puis faites un redémarrage logiciel.",
+        "Si Ajustes no muestra Punto de acceso personal, instala Share desde la fuente a5 y haz un reinicio suave.",
+        "如果你的设置里没有“个人热点”，请到 a5 源安装 Share，然后软重启。",
+        "設定にインターネット共有がない場合は、a5ソースからShareをインストールしてからソフトリブートしてください。"),
 }

@@ -6,7 +6,16 @@
 "Copy Diagnostic" = "診断情報をコピー";
 "Close" = "閉じる";
 "Copied" = "コピーしました";
+"Your iPhone" = "お使いのiPhone";
+"Bluetooth" = "Bluetooth";
+"Personal Hotspot Wi-Fi" = "インターネット共有のWi-Fi";
+"This device" = "このデバイス";
 "Settings" = "設定";
+"On your iPhone, turn on Bluetooth and Wi-Fi, and keep it near this device." = "iPhoneでBluetoothとWi-Fiをオンにして、このデバイスの近くに置いてください。";
+"Open Settings › General › CarPlay." = "「設定 › 一般 › CarPlay」を開きます。";
+"Tap “%@” and allow pairing and CarPlay when asked. That's the last thing you do; the rest is automatic." = "「%@」をタップし、ペアリングとCarPlayを求められたら許可します。操作はこれで終わりで、残りは自動です。";
+"Your iPhone joins “%@” by itself. You don't need to pick it in Wi-Fi settings." = "iPhoneは「%@」に自動で接続します。Wi-Fi設定で選ぶ必要はありません。";
+"Still here after 30 seconds? Check that Personal Hotspot is on and its name matches Wi-Fi Setup exactly, then join “%@” once by hand in Settings › Wi-Fi on your iPhone." = "30秒たっても進まない場合：インターネット共有がオンで、名前がWi-Fi設定と完全に一致しているか確認し、iPhoneの「設定 › Wi-Fi」で「%@」に一度手動で接続してください。";
 "CarPlay services" = "CarPlayサービス";
 "Verification" = "認証";
 "Hotspot details" = "ホットスポット情報";
@@ -15,6 +24,8 @@
 "your car" = "お使いの車";
 "Welcome" = "ようこそ";
 "Set Up Wi-Fi" = "Wi-Fiを設定";
+"You need two devices: this device is the receiver, and the iPhone you use every day shows CarPlay here. The first setup takes about 2 minutes." = "2台のデバイスが必要です。このデバイスが受信側になり、普段使っているiPhoneのCarPlayがここに表示されます。初回の設定は約2分です。";
+"1 Rename this device  ›  2 Enter hotspot details  ›  3 Start CarPlay  ›  4 Choose the car on your iPhone" = "1 名前を変更  ›  2 ホットスポット情報を入力  ›  3 CarPlayを開始  ›  4 iPhoneで車を選択";
 "Preparing" = "準備中";
 "Preparing…" = "準備中…";
 "Connect to the Internet" = "インターネットに接続してください";
@@ -26,6 +37,7 @@
 "Open Settings" = "設定を開く";
 "Cancel" = "キャンセル";
 "Getting Ready" = "準備中";
+"Showcase is taking over Bluetooth on this device, so its Bluetooth headphones and Apple Pencil disconnect for now. That's normal." = "Showcaseがこのデバイスの Bluetooth を使用するため、Bluetoothヘッドフォンや Apple Pencil はしばらく切断されます。これは正常です。";
 "Connecting" = "接続中";
 "Choose %@ in CarPlay on your iPhone" = "iPhoneのCarPlayで「%@」を選択してください";
 "Stopping" = "停止中";
@@ -36,6 +48,7 @@
 "Install Showcase for Taurine" = "Showcase for Taurineをインストールしてください";
 "This device runs Taurine, which needs a different Bluetooth setup. Install Showcase for Taurine from the same repository; it replaces this package." = "このデバイスはTaurineを使用しており、別のBluetooth設定が必要です。同じリポジトリからShowcase for Taurineをインストールしてください。このパッケージと置き換わります。";
 "Hotspot Details" = "ホットスポット情報";
+"Enter this device's name exactly: capitals, spaces and ’ all count. The password is in Settings › Personal Hotspot." = "このデバイスの名前を正確に入力してください。大文字、スペース、’ も区別されます。パスワードは「設定 › インターネット共有」にあります。";
 "Name" = "名前";
 "Password" = "パスワード";
 "Save" = "保存";
@@ -95,6 +108,7 @@
 "Frame Rate" = "フレームレート";
 "Dedicate Wi-Fi to CarPlay" = "Wi-FiをCarPlay専用にする";
 "Start CarPlay Automatically" = "CarPlayを自動的に開始";
+"Show Setup Tips" = "設定のヒントを表示";
 "Default" = "デフォルト";
 "Device Language" = "デバイスの言語";
 "Detailed Logging" = "詳細なログ";
@@ -127,7 +141,15 @@
 "Wi-Fi Bus" = "Wi-Fiバス";
 "CarPlay Video" = "CarPlayビデオ";
 "Wi-Fi Setup" = "Wi-Fi設定";
+"1.  Rename This Device" = "1.  このデバイスの名前を変更";
 "1.  Rename This %@" = "1.  この%@の名前を変更";
+"The hotspot name is this device's name. Use only letters, digits and -, like the name below." = "ホットスポット名はこのデバイスの名前です。下の名前のように、英字、数字、- だけを使ってください。";
+"Don't use apostrophes ('), quotes or emoji." = "アポストロフィ（'）、引用符、絵文字は使わないでください。";
+"iOS turns ' into ’, the names stop matching, and your iPhone can't join the hotspot." = "iOSは ' を ’ に変えるため、名前が一致せず、iPhoneがホットスポットに接続できなくなります。";
+"This device is called “%@”." = "このデバイスの名前は「%@」です。";
+"It has an apostrophe or quote; rename it first." = "アポストロフィか引用符が含まれています。先に名前を変更してください。";
 "2.  Enter Hotspot Details" = "2.  ホットスポット情報を入力";
+"After renaming, enter the name exactly as above. The password is the Wi-Fi Password in Settings › Personal Hotspot (at least 8 characters)." = "名前を変更したら、上と完全に同じ名前を入力します。パスワードは「設定 › インターネット共有」の“Wi-Fi”のパスワード（8文字以上）です。";
+"If Settings has no Personal Hotspot, install Share from the a5 source, then do a soft reboot." = "設定にインターネット共有がない場合は、a5ソースからShareをインストールしてからソフトリブートしてください。";
 "Enter Details" = "情報を入力";
 "Copy" = "コピー";
